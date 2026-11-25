@@ -12,8 +12,9 @@ use agnoperiph::backend::{
 use agnoperiph::game_profiles::{DetectedGame, GameSource};
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, Route, device_element_id};
 use agnoperiph_core::{
-    CoreError, CoreResult, DeviceId, KeyCode, KeyIndex, MacroActionKind, PollingRateHz,
-    ProfileSlot, RgbEffect, TravelHundredthsMm,
+    CoreError, CoreResult, DeviceId, KeyCode, KeyIndex, MacroActionKind, ModTapBinding,
+    PollingRateHz, ProfileSlot, RapidSwitchPair, RgbColor, RgbEffect, ToggleKeyBinding,
+    TravelHundredthsMm,
 };
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::test::TestWindowExt;
@@ -163,7 +164,8 @@ fn dry_run_is_default_and_writes_are_traced(cx: &mut TestAppContext) {
         let pointer = mouse.pointer.as_ref().unwrap();
         assert_eq!(pointer.snapshot.polling_rate, PollingRateHz::Hz1000);
     });
-    assert!(exists(cx, handle, "live-writes"));
+    // The persistent yellow live-writes warning banner was removed by user request.
+    assert!(!exists(cx, handle, "live-writes"));
 
     click(cx, handle, ("polling-rate", 500u64));
     cx.update(|cx| {
@@ -198,6 +200,8 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
     });
 
     // Enabling Rapid Trigger on a key that reports 0 mm clamps to the device minimum.
+    // Clear first: clicks accumulate, and this covers the single-key write.
+    click(cx, handle, "clear-keys");
     click(cx, handle, key_id(KEY_Q));
     click(cx, handle, "rapid-trigger");
     click(cx, handle, "press-sensitivity-inc");
@@ -229,6 +233,8 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
     // before erasing and rewriting the onboard flash actuation table.
     click(cx, handle, "dry-run");
     click(cx, handle, "ok");
+    // Clicks accumulate, so start a fresh selection before picking Q alone.
+    click(cx, handle, "clear-keys");
     click(cx, handle, key_id(KEY_Q));
     click(cx, handle, "actuation-inc");
     click(cx, handle, "apply-actuation-all");
@@ -505,17 +511,34 @@ fn triggers_select_many_keys_and_restore_defaults(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
 
+    cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
+
+    // Plain clicks accumulate, as in ATK HUB; no modifier is needed.
     click(cx, handle, key_id(KEY_W));
-    cx.update_window(handle, |_, window, cx| {
-        window.click_with_modifiers(key_id(KEY_Q), gpui_kit::Modifiers::control(), cx);
-    })
-    .unwrap();
-    settle(cx, handle);
+    click(cx, handle, key_id(KEY_Q));
     cx.update(|cx| {
-        let selected = app.read(cx).selected_keys().clone();
-        assert!(selected.contains(&KeyIndex::new(KEY_W)));
-        assert!(selected.contains(&KeyIndex::new(KEY_Q)));
+        let app = app.read(cx);
+        assert_eq!(
+            app.selected_keys().clone(),
+            [KeyIndex::new(KEY_Q), KeyIndex::new(KEY_W)].into()
+        );
+        assert_eq!(app.selected_key(), KeyIndex::new(KEY_Q));
     });
+
+    // Clicking a selected key removes it; the editor follows a remaining key.
+    click(cx, handle, key_id(KEY_Q));
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert_eq!(app.selected_keys().clone(), [KeyIndex::new(KEY_W)].into());
+        assert_eq!(app.selected_key(), KeyIndex::new(KEY_W));
+    });
+    click(cx, handle, key_id(KEY_W));
+    cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
+    assert!(is_disabled(cx, handle, "apply-actuation-all"));
+    assert!(is_disabled(cx, handle, "restore-default-keys"));
+
+    click(cx, handle, key_id(KEY_W));
+    click(cx, handle, key_id(KEY_Q));
 
     click(cx, handle, "restore-default-keys");
     let snapshot = keyboard_snapshot(cx, &app);
@@ -897,4 +920,306 @@ fn reopened_window_rebinds_controls(cx: &mut TestAppContext) {
             .preset_name(&keyboard(), ProfileSlot::new(0));
         assert_eq!(name, "Tray return");
     });
+}
+
+/// A on the RS7 matrix (row 3, column 1); the mock pairs it with D in SOCD.
+const KEY_A: u16 = 3 * 16 + 1;
+/// D on the RS7 matrix (row 3, column 3).
+const KEY_D: u16 = 3 * 16 + 3;
+
+fn is_disabled(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) -> bool {
+    cx.update_window(handle, |_, window, _| window.find(id).disabled())
+        .unwrap()
+        == Some(true)
+}
+
+#[gpui_kit::test]
+fn advanced_keys_refuse_keys_owned_by_another_function(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+    let socd = keyboard_snapshot(cx, &app)
+        .hall_effect
+        .unwrap()
+        .snapshot
+        .socd_pairs;
+    assert_eq!(socd.len(), 1);
+    assert_eq!(
+        (socd[0].key_a, socd[0].key_b),
+        (KeyIndex::new(KEY_A), KeyIndex::new(KEY_D))
+    );
+
+    for mode in [
+        "paired-mode-rs",
+        "paired-mode-mt",
+        "paired-mode-tgl",
+        "paired-mode-dks",
+    ] {
+        click(cx, handle, mode);
+        click(cx, handle, "paired-pick-first");
+        assert!(exists(cx, handle, "paired-pick-hint"), "{mode} arms a pick");
+
+        // A and D belong to SOCD: the pick is refused and stays armed.
+        for taken in [KEY_A, KEY_D] {
+            click(cx, handle, key_id(taken));
+            assert!(
+                exists(cx, handle, "paired-conflict"),
+                "{mode} refuses {taken}"
+            );
+            assert!(exists(cx, handle, "paired-pick-hint"), "{mode} stays armed");
+            assert!(is_disabled(cx, handle, "paired-add"), "{mode} cannot add");
+            cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
+        }
+
+        // A free key is accepted and clears the note.
+        click(cx, handle, key_id(KEY_Q));
+        assert!(!exists(cx, handle, "paired-conflict"));
+        click(cx, handle, "paired-cancel");
+    }
+
+    // The backend refuses the same cross-function reuse, whatever the UI does.
+    let service = MockPeripheralService::new();
+    service.refresh().unwrap();
+    let pair = RapidSwitchPair::new(KeyIndex::new(KEY_A), KeyIndex::new(KEY_Q)).unwrap();
+    let err = service
+        .apply(&keyboard(), SettingChange::RapidSwitch(vec![pair]))
+        .expect_err("SOCD key reused by RS");
+    assert!(err.rejected_before_send, "{}", err.error);
+    assert!(err.error.to_string().contains("SOCD"), "{}", err.error);
+    for change in [
+        SettingChange::ModTap(ModTapBinding::new(
+            0,
+            KeyIndex::new(KEY_D),
+            (0, 0x2C),
+            (0, 0xE1),
+            200,
+        )),
+        SettingChange::ToggleKey(ToggleKeyBinding::new(
+            0,
+            KeyIndex::new(KEY_A),
+            (0, 0x2C),
+            200,
+        )),
+    ] {
+        let err = service
+            .apply(&keyboard(), change)
+            .expect_err("SOCD key reused by MT or TGL");
+        assert!(err.error.to_string().contains("SOCD"), "{}", err.error);
+    }
+}
+
+#[gpui_kit::test]
+fn lighting_deck_picks_colors_and_toggles_entry_format(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+    open_tab(cx, handle, KeyboardTab::Lighting);
+    let color = |cx: &mut TestAppContext| match zone_effect(&keyboard_snapshot(cx, &app), 0) {
+        RgbEffect::Preset { color, .. } => color,
+        other => panic!("expected a preset, got {other:?}"),
+    };
+
+    // Back Lamp: a single-color preset, then a swatch.
+    click(cx, handle, "rgb-0-preset-2");
+    click(cx, handle, "rgb-swatch-Blue");
+    assert_eq!(color(cx), RgbColor::new(0, 90, 255));
+
+    // The pad's center is half saturation, half value of the same hue.
+    click(cx, handle, "rgb-sv-pad");
+    let picked = color(cx);
+    assert!(picked.b > picked.g && picked.g > picked.r, "{picked}");
+    assert!((120..=135).contains(&picked.b), "{picked}");
+
+    // The strip's center is cyan; saturation and value are kept.
+    click(cx, handle, "rgb-hue-strip");
+    let cyan = color(cx);
+    assert!(cyan.g.abs_diff(cyan.b) <= 6 && cyan.r < cyan.g, "{cyan}");
+
+    // HEX is the default entry; RGB swaps in channel steppers that write.
+    assert!(exists(cx, handle, "rgb-format-hex"));
+    assert!(!exists(cx, handle, ("rgb-channel-inc", 0u64)));
+    click(cx, handle, "rgb-format-rgb");
+    let before = color(cx);
+    click(cx, handle, ("rgb-channel-inc", 0u64));
+    assert_eq!(color(cx).r, before.r + 5);
+
+    // Logo Light: full color mode lives in the color column.
+    click(cx, handle, ("rgb-zone", 1u64));
+    click(cx, handle, "rgb-1-preset-1");
+    assert!(!is_disabled(cx, handle, "rgb-colorful"));
+    click(cx, handle, "rgb-colorful");
+    assert!(matches!(
+        zone_effect(&keyboard_snapshot(cx, &app), 1),
+        RgbEffect::Preset {
+            id: 1,
+            colorful: true,
+            ..
+        }
+    ));
+    assert!(is_disabled(cx, handle, "rgb-swatch-Red"));
+}
+
+#[gpui_kit::test]
+fn keybinds_offer_verified_extra_keys(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+    open_tab(cx, handle, KeyboardTab::Keybinds);
+    let code_of = |cx: &mut TestAppContext| {
+        keyboard_snapshot(cx, &app)
+            .keymap
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .layers[0][usize::from(KEY_Q)]
+    };
+
+    click(cx, handle, ("keymap-key", u64::from(KEY_Q)));
+    click(cx, handle, "keymap-picker-extra");
+    // Media & audio, Windows system keys, Backlight control, Logo light control.
+    for id in [0x00A8u64, 0x00A9, 0x00B1, 0x7820, 0x7E1F] {
+        assert!(exists(cx, handle, ("extra-key", id)), "extra key {id:#06X}");
+    }
+    click(cx, handle, ("extra-key", 0x00A8u64));
+    assert_eq!(code_of(cx), KeyCode::new(0x00, 0xA8));
+    click(cx, handle, ("extra-key", 0x00A9u64));
+    assert_eq!(code_of(cx), KeyCode::new(0x00, 0xA9));
+    click(cx, handle, ("extra-key", 0x7820u64));
+    assert_eq!(code_of(cx), KeyCode::new(0x78, 0x20));
+}
+
+#[gpui_kit::test]
+fn release_build_options_hide_developer_tools(cx: &mut TestAppContext) {
+    let (handle, _app) = open_app_with(
+        cx,
+        MockPeripheralService::new(),
+        AppOptions::default().with_dev_tools(false),
+    );
+    assert!(exists(cx, handle, "refresh"));
+    assert!(!exists(cx, handle, "dry-run"));
+    assert!(!exists(cx, handle, "inspector-toggle"));
+    assert!(!exists(cx, handle, "inspector-clear"));
+}
+
+#[gpui_kit::test]
+fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let service: Arc<dyn PeripheralService> = Arc::new(MockPeripheralService::new());
+    let (handle, _app) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Point::default(),
+                    size(px(1240.), px(820.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                AgnoPeriphApp::build(
+                    service,
+                    AppOptions::default().with_dev_tools(false),
+                    window,
+                    cx,
+                )
+            },
+        )
+        .expect("open test window")
+    });
+    settle(cx, handle);
+    click(cx, handle, device_element_id(&keyboard()));
+    // `visible()` is true for a partly clipped element, so check whole bounds too.
+    let on_screen = |cx: &mut TestAppContext, id: ElementId| {
+        let found = cx
+            .update_window(handle, |_, window, _| window.find(id.clone()))
+            .unwrap();
+        let bounds = found.bounds();
+        assert!(found.visible(), "{id:?} is visible");
+        assert!(
+            bounds.bottom() <= px(820.) && bounds.right() <= px(1240.),
+            "{id:?} lies fully inside the window: {bounds:?}"
+        );
+    };
+
+    // The matrix, its selection tools and the whole trigger deck share one screen.
+    for id in [
+        ElementId::from(key_id(KEY_W)),
+        "restore-default-keys".into(),
+        "apply-deadzones".into(),
+        "deadzone-bottom-inc".into(),
+        "release-sensitivity-inc".into(),
+        "apply-rapid-trigger".into(),
+    ] {
+        on_screen(cx, id);
+    }
+
+    open_tab(cx, handle, KeyboardTab::Lighting);
+    for id in [
+        ElementId::from("rgb-0-preset-39"),
+        "rgb-swatch-White".into(),
+        "rgb-format-rgb".into(),
+        "rgb-colorful".into(),
+        "rgb-preview".into(),
+    ] {
+        on_screen(cx, id);
+    }
+
+    // RGB entry fits its column: the last stepper stays clear of the preview and
+    // inside the column the full color switch closes.
+    click(cx, handle, "rgb-0-preset-2");
+    click(cx, handle, "rgb-format-rgb");
+    let bounds = |cx: &mut TestAppContext, id: ElementId| {
+        cx.update_window(handle, |_, window, _| window.find(id).bounds())
+            .unwrap()
+    };
+    let last = bounds(cx, ("rgb-channel-inc", 2u64).into());
+    let preview = bounds(cx, "rgb-preview".into());
+    let switch = bounds(cx, "rgb-colorful".into());
+    assert!(!last.intersects(&preview), "{last:?} overlaps {preview:?}");
+    assert!(last.right() <= switch.right(), "{last:?} past {switch:?}");
+}
+
+#[gpui_kit::test]
+fn configured_socd_entry_keeps_remove_clear_of_its_modes(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let service: Arc<dyn PeripheralService> = Arc::new(MockPeripheralService::new());
+    let (handle, _app) = cx.update(|cx| {
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    Point::default(),
+                    size(px(1240.), px(2400.)),
+                ))),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                AgnoPeriphApp::build(
+                    service,
+                    AppOptions::default().with_dev_tools(false),
+                    window,
+                    cx,
+                )
+            },
+        )
+        .expect("open test window")
+    });
+    settle(cx, handle);
+    click(cx, handle, device_element_id(&keyboard()));
+    let bounds = |cx: &mut TestAppContext, id: &str| {
+        let id = ElementId::Name(id.to_owned().into());
+        cx.update_window(handle, |_, window, _| window.find(id).bounds())
+            .unwrap()
+    };
+    let remove = bounds(cx, "socd-remove-49-51-x");
+    let card = bounds(cx, "paired-configured");
+    for label in ["Last input", "Neutral", "First key", "Second key"] {
+        let mode = bounds(cx, &format!("socd-mode-49-51-{label}"));
+        assert!(
+            !mode.intersects(&remove),
+            "{label} {mode:?} overlaps Remove"
+        );
+        assert!(
+            mode.right() <= card.right(),
+            "{label} {mode:?} leaves the card"
+        );
+    }
+    assert!(remove.right() <= card.right());
 }

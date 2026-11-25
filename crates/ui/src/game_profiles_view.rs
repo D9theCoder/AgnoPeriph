@@ -24,7 +24,7 @@ use crate::game_profiles::{
 use crate::keycodes::matches_search;
 
 /// Scan results shown at once; the search narrows the rest.
-const MAX_SCAN_RESULTS: usize = 40;
+const MAX_SCAN_RESULTS: usize = 200;
 
 /// What the shared rename dialog renames.
 #[derive(Debug, Clone, PartialEq, Eq)]

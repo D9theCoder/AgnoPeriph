@@ -376,6 +376,124 @@ fn require<T>(value: Option<T>, capability: &'static str) -> CoreResult<T> {
     value.ok_or(CoreError::UnsupportedCapability(capability))
 }
 
+/// Returns every key currently claimed by any paired or advanced key binding (RS, SOCD,
+/// DKS, MT, or TGL) along with the short label of the binding that owns it.
+///
+/// Enforced across both UI pickers and [`validate_change`] so one physical key cannot be
+/// double-bound to conflicting advanced triggers.
+pub fn occupied_advanced_keys(
+    snapshot: &DeviceSnapshot,
+) -> std::collections::BTreeMap<KeyIndex, &'static str> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(he) = snapshot.hall_effect.as_ref() else {
+        return map;
+    };
+    for pair in &he.snapshot.rapid_switch_pairs {
+        map.insert(pair.key_a, "RS");
+        map.insert(pair.key_b, "RS");
+    }
+    for pair in &he.snapshot.socd_pairs {
+        map.insert(pair.key_a, "SOCD");
+        map.insert(pair.key_b, "SOCD");
+    }
+    if let Some(layer0) = snapshot
+        .keymap
+        .as_ref()
+        .and_then(|km| km.snapshot.layers.first())
+    {
+        for binding in &he.snapshot.dks_bindings {
+            if let Ok(slot_u8) = u8::try_from(binding.key.value()) {
+                let code_id = 5u8.saturating_add(slot_u8);
+                if let Some(ix) = layer0
+                    .iter()
+                    .position(|c| c.class == 0x7E && c.id == code_id)
+                    && let Ok(key_ix) = u16::try_from(ix)
+                {
+                    map.insert(KeyIndex::new(key_ix), "DKS");
+                }
+            }
+        }
+    }
+    for binding in &he.snapshot.mod_tap_bindings {
+        map.insert(binding.key, "MT");
+    }
+    for binding in &he.snapshot.toggle_bindings {
+        map.insert(binding.key, "TGL");
+    }
+    map
+}
+
+fn check_key_exclusive(
+    snapshot: &DeviceSnapshot,
+    key: KeyIndex,
+    ignore_kind: &'static str,
+    ignore_slot: Option<u8>,
+) -> CoreResult<()> {
+    let Some(he) = snapshot.hall_effect.as_ref() else {
+        return Ok(());
+    };
+    let conflict = |owner: &'static str| {
+        Err(CoreError::Validation(format!(
+            "key #{} is already assigned to {owner}; remove it there first",
+            key.value()
+        )))
+    };
+    if ignore_kind != "RS"
+        && he
+            .snapshot
+            .rapid_switch_pairs
+            .iter()
+            .any(|p| p.key_a == key || p.key_b == key)
+    {
+        return conflict("RS");
+    }
+    if ignore_kind != "SOCD"
+        && he
+            .snapshot
+            .socd_pairs
+            .iter()
+            .any(|p| p.key_a == key || p.key_b == key)
+    {
+        return conflict("SOCD");
+    }
+    if let Some(layer0) = snapshot
+        .keymap
+        .as_ref()
+        .and_then(|km| km.snapshot.layers.first())
+    {
+        for binding in &he.snapshot.dks_bindings {
+            if let Ok(slot_u8) = u8::try_from(binding.key.value()) {
+                if ignore_kind == "DKS" && ignore_slot == Some(slot_u8) {
+                    continue;
+                }
+                if layer0
+                    .get(usize::from(key.value()))
+                    .is_some_and(|c| c.class == 0x7E && c.id == 5u8.saturating_add(slot_u8))
+                {
+                    return conflict("DKS");
+                }
+            }
+        }
+    }
+    if he
+        .snapshot
+        .mod_tap_bindings
+        .iter()
+        .any(|b| b.key == key && !(ignore_kind == "MT" && ignore_slot == Some(b.slot)))
+    {
+        return conflict("MT");
+    }
+    if he
+        .snapshot
+        .toggle_bindings
+        .iter()
+        .any(|b| b.key == key && !(ignore_kind == "TGL" && ignore_slot == Some(b.slot)))
+    {
+        return conflict("TGL");
+    }
+    Ok(())
+}
+
 /// Validates a change against the capability limits reported in `snapshot`.
 ///
 /// Drivers validate again before encoding; validating here keeps dry-run previews
@@ -447,19 +565,39 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
         }
         SettingChange::Socd(pairs) => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
-            he.capabilities.validate_socd_pairs(pairs)
+            he.capabilities.validate_socd_pairs(pairs)?;
+            let mut seen = std::collections::BTreeSet::new();
+            for pair in pairs {
+                if !seen.insert(pair.key_a) || !seen.insert(pair.key_b) {
+                    return Err(CoreError::Validation(
+                        "a key cannot appear in more than one SOCD pair".to_owned(),
+                    ));
+                }
+                check_key_exclusive(snapshot, pair.key_a, "SOCD", None)?;
+                check_key_exclusive(snapshot, pair.key_b, "SOCD", None)?;
+            }
+            Ok(())
         }
         SettingChange::RapidSwitch(pairs) => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            let mut seen = std::collections::BTreeSet::new();
             for pair in pairs {
                 he.capabilities.validate_key(pair.key_a)?;
                 he.capabilities.validate_key(pair.key_b)?;
+                if !seen.insert(pair.key_a) || !seen.insert(pair.key_b) {
+                    return Err(CoreError::Validation(
+                        "a key cannot appear in more than one RS pair".to_owned(),
+                    ));
+                }
+                check_key_exclusive(snapshot, pair.key_a, "RS", None)?;
+                check_key_exclusive(snapshot, pair.key_b, "RS", None)?;
             }
             Ok(())
         }
         SettingChange::ModTap(binding) => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
-            he.capabilities.validate_key(binding.key)
+            he.capabilities.validate_key(binding.key)?;
+            check_key_exclusive(snapshot, binding.key, "MT", Some(binding.slot))
         }
         SettingChange::ClearModTap { key, .. } | SettingChange::ClearToggleKey { key, .. } => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
@@ -467,9 +605,10 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
         }
         SettingChange::ToggleKey(binding) => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
-            he.capabilities.validate_key(binding.key)
+            he.capabilities.validate_key(binding.key)?;
+            check_key_exclusive(snapshot, binding.key, "TGL", Some(binding.slot))
         }
-        SettingChange::KeyBinding { layer, key, .. } => {
+        SettingChange::KeyBinding { layer, key, code } => {
             let km = require(snapshot.keymap.as_ref(), "keymap")?;
             km.capabilities.validate_layer(*layer)?;
             let max_keys = u16::from(km.capabilities.rows) * u16::from(km.capabilities.cols);
@@ -479,6 +618,9 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
                     actual: key.value().to_string(),
                     expected: format!("0..{max_keys}"),
                 });
+            }
+            if *layer == 0 && code.class == 0x7E && (5..25).contains(&code.id) {
+                check_key_exclusive(snapshot, *key, "DKS", Some(code.id - 5))?;
             }
             Ok(())
         }
@@ -1025,21 +1167,86 @@ impl Default for LiveHidService {
 
 impl LiveHidService {
     pub fn new() -> Self {
-        Self::with_enumerator(Arc::new(HidapiEnumerator::new()))
+        Self::new_with_dry_run(true)
+    }
+
+    /// Creates a [`LiveHidService`] starting in the requested dry-run mode.
+    pub fn new_with_dry_run(dry_run: bool) -> Self {
+        Self::with_enumerator_and_mode(Arc::new(HidapiEnumerator::new()), dry_run)
     }
 
     /// Creates a [`LiveHidService`] backed by a custom [`HidEnumerator`] (used by real-driver
     /// integration tests with scripted `MockHidTransport` replies).
     pub fn with_enumerator(enumerator: Arc<dyn HidEnumerator>) -> Self {
+        Self::with_enumerator_and_mode(enumerator, true)
+    }
+
+    fn with_enumerator_and_mode(enumerator: Arc<dyn HidEnumerator>, dry_run: bool) -> Self {
         Self {
             enumerator,
             state: Mutex::new(LiveState {
-                dry_run: true,
+                dry_run,
                 devices: Vec::new(),
             }),
             sink: Arc::new(SequencedSink::new()),
         }
     }
+
+    /// Re-enumerates and reopens `device_id` after a brief USB reset (such as changing
+    /// polling rate on an ATK RS7 keyboard). Retries with short backoff so the OS HID
+    /// interface has time to come back online.
+    fn reopen_device(&self, device_id: &DeviceId, dry_run: bool) -> Option<LiveDevice> {
+        let registry = build_registry();
+        let sink: Arc<dyn PacketSink> = self.sink.clone();
+        for delay_ms in [350u64, 450, 550, 650, 750, 850] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            let Ok(descriptors) = self.enumerator.enumerate() else {
+                continue;
+            };
+            for descriptor in &descriptors {
+                let Some(matched) = registry.match_interface(&descriptor.to_match_descriptor())
+                else {
+                    continue;
+                };
+                let Ok(transport) = self.enumerator.open_path(descriptor) else {
+                    continue;
+                };
+                let Ok(mut peripheral) =
+                    open_driver(&matched.driver_id, transport, dry_run, sink.clone())
+                else {
+                    continue;
+                };
+                if peripheral.info().id == *device_id {
+                    let snapshot = collect_snapshot(peripheral.as_mut());
+                    if !has_disconnect_warning(&snapshot) {
+                        return Some(LiveDevice {
+                            peripheral,
+                            snapshot,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Returns `true` when an error message indicates the USB HID handle disconnected
+/// (for example Windows `ERROR_DEVICE_NOT_CONNECTED` `0x0000048F` during a polling-rate reset).
+pub fn is_disconnect_message(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("0x0000048f")
+        || lower.contains("not connected")
+        || lower.contains("disconnected")
+        || lower.contains("writefile")
+        || lower.contains("getoverlappedresult")
+}
+
+fn has_disconnect_warning(snapshot: &DeviceSnapshot) -> bool {
+    snapshot
+        .warnings
+        .iter()
+        .any(|w| is_disconnect_message(&w.message))
 }
 
 impl PeripheralService for LiveHidService {
@@ -1099,17 +1306,24 @@ impl PeripheralService for LiveHidService {
     ) -> Result<DeviceSnapshot, ApplyError> {
         let mut state = lock(&self.state);
         let dry_run = state.dry_run;
-        let target = state
+        let target_ix = state
             .devices
-            .iter_mut()
-            .find(|d| d.snapshot.info.id == *device)
+            .iter()
+            .position(|d| d.snapshot.info.id == *device)
             .ok_or_else(|| ApplyError::rejected(CoreError::DeviceNotFound(device.to_string())))?;
 
-        if let Err(err) = validate_change(&target.snapshot, &change) {
+        if let Err(err) = validate_change(&state.devices[target_ix].snapshot, &change) {
             return Err(ApplyError::rejected(err));
         }
 
+        let is_polling_rate_change = matches!(
+            (&change, &state.devices[target_ix].snapshot.keyboard_config),
+            (SettingChange::KeyboardConfig(next), Some(current))
+                if next.polling_rate != current.snapshot.polling_rate
+        );
+
         if matches!(change, SettingChange::PollCalibrationProgress) {
+            let target = &mut state.devices[target_ix];
             let flags = require(target.peripheral.as_hall_effect_mut(), "hall_effect")
                 .map_err(ApplyError::rejected)?
                 .read_calibration_key_progress()
@@ -1120,24 +1334,56 @@ impl PeripheralService for LiveHidService {
             return Ok(target.snapshot.clone());
         }
 
-        if let Err(err) = apply_to_peripheral(target.peripheral.as_mut(), &change) {
+        if let Err(err) = apply_to_peripheral(state.devices[target_ix].peripheral.as_mut(), &change)
+        {
             if dry_run {
                 return Err(ApplyError::rejected(err));
             }
+            // Changing USB polling rate resets the keyboard's USB interface immediately; drop the
+            // stale handle and reopen it automatically once Windows re-enumerates the device.
+            if is_polling_rate_change && is_disconnect_message(&err.to_string()) {
+                let dropped_device = state.devices.remove(target_ix);
+                drop(dropped_device);
+                if let Some(reopened) = self.reopen_device(device, dry_run) {
+                    let snap = reopened.snapshot.clone();
+                    state.devices.insert(target_ix, reopened);
+                    return Ok(snap);
+                }
+                return Err(ApplyError::failed_after_send(err, None));
+            }
             // Frames may have already reached hardware before the failure (e.g. a timeout
             // mid-chunk during a global actuation write); re-read best-effort live state.
-            let refreshed = collect_snapshot(target.peripheral.as_mut());
-            target.snapshot = refreshed.clone();
+            let refreshed = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+            state.devices[target_ix].snapshot = refreshed.clone();
             return Err(ApplyError::failed_after_send(err, Some(refreshed)));
         }
 
         if dry_run {
+            let target = &mut state.devices[target_ix];
             apply_change_to_snapshot(&mut target.snapshot, &change);
             target.snapshot.is_preview = true;
-        } else {
-            target.snapshot = collect_snapshot(target.peripheral.as_mut());
+            return Ok(target.snapshot.clone());
         }
-        Ok(target.snapshot.clone())
+
+        let snapshot = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+        if is_polling_rate_change || has_disconnect_warning(&snapshot) {
+            // Device briefly disconnected / re-enumerated (e.g. polling rate change): close the
+            // stale HID handle and reopen cleanly so the UI never shows disconnect errors.
+            let dropped_device = state.devices.remove(target_ix);
+            drop(dropped_device);
+            if let Some(reopened) = self.reopen_device(device, dry_run) {
+                let snap = reopened.snapshot.clone();
+                state.devices.insert(target_ix, reopened);
+                return Ok(snap);
+            }
+            return Err(ApplyError::failed_after_send(
+                CoreError::NotConnected(device.to_string()),
+                Some(snapshot),
+            ));
+        }
+
+        state.devices[target_ix].snapshot = snapshot.clone();
+        Ok(snapshot)
     }
 
     fn packet_log(&self) -> Vec<PacketTraceEntry> {

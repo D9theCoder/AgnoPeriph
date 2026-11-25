@@ -15,7 +15,9 @@ use gpui_kit::*;
 use crate::app::{AgnoPeriphApp, group, muted_note, section};
 use crate::backend::{DeviceSnapshot, KeymapState, SettingChange};
 use crate::key_matrix::{self, KeyFace, KeyTone};
-use crate::keycodes::{HID_KEYS, KeyGroup, keycode_name, matches_search};
+use crate::keycodes::{
+    EXTRA_KEYS, ExtraKeyGroup, HID_KEYS, KeyGroup, keycode_name, matches_search,
+};
 use crate::keymap::KeyLayout;
 
 /// One remap, kept so it can be undone and redone.
@@ -52,14 +54,8 @@ impl KeymapUi {
     }
 }
 
-/// Extra-key groups whose ATK key ids are not documented. They are listed so the
-/// layout matches the vendor app, but never sent.
-const UNVERIFIED_GROUPS: [(&str, &str); 4] = [
-    ("Windows system keys", "keymap-extra-windows"),
-    ("Mac system keys", "keymap-extra-mac"),
-    ("Backlight control", "keymap-extra-backlight"),
-    ("Logo light control", "keymap-extra-logo"),
-];
+/// Mac system keys are intentionally deferred on Windows.
+const DEFERRED_MAC_GROUP: (&str, &str) = ("Mac system keys", "keymap-extra-mac");
 
 impl AgnoPeriphApp {
     fn keymap_state(&self) -> Option<&KeymapState> {
@@ -282,6 +278,7 @@ pub(crate) fn render(
                 detail: code.filter(|_| !is_default).map(|c| keycode_name(c).into()),
                 fill: None,
                 marker: false,
+                badge: None,
                 tone: if cap.index == selected {
                     KeyTone::Selected
                 } else {
@@ -370,7 +367,7 @@ fn render_picker(
     let mut groups: Vec<AnyElement> = Vec::new();
     match tab {
         PickerTab::Keyboard => {
-            for group_kind in KeyGroup::ALL.into_iter().filter(|g| *g != KeyGroup::Media) {
+            for group_kind in KeyGroup::ALL {
                 let keys: Vec<AnyElement> = HID_KEYS
                     .iter()
                     .filter(|k| k.group == group_kind && matches_search(k.name, &query))
@@ -403,35 +400,38 @@ fn render_picker(
             if !macros.is_empty() {
                 groups.push(picker_group("Quick commands (macros)", macros, cx.theme()));
             }
-            let media: Vec<AnyElement> = HID_KEYS
-                .iter()
-                .filter(|k| k.group == KeyGroup::Media && matches_search(k.name, &query))
-                .map(|k| {
-                    key_button(
-                        ("hid-key", u64::from(k.usage)),
-                        k.name.into(),
-                        KeyCode::standard(k.usage),
-                        cx,
-                    )
-                })
-                .collect();
-            if !media.is_empty() {
-                groups.push(picker_group("Media & audio", media, cx.theme()));
-            }
-            for (title, id) in UNVERIFIED_GROUPS {
-                if !matches_search(title, &query) {
-                    continue;
+            for extra_group in ExtraKeyGroup::ALL {
+                let keys: Vec<AnyElement> = EXTRA_KEYS
+                    .iter()
+                    .filter(|k| {
+                        k.group == extra_group
+                            && (matches_search(k.name, &query)
+                                || matches_search(k.short_name, &query))
+                    })
+                    .map(|k| {
+                        let id_num = (u64::from(k.class) << 8) | u64::from(k.id);
+                        key_button(("extra-key", id_num), k.name.into(), k.code(), cx)
+                    })
+                    .collect();
+                if !keys.is_empty() {
+                    groups.push(picker_group(extra_group.label(), keys, cx.theme()));
                 }
+            }
+            let (title, id) = DEFERRED_MAC_GROUP;
+            if matches_search(title, &query) {
                 let theme = cx.theme();
                 groups.push(
                     v_flex()
                         .id(id)
                         .gap_1()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(theme.muted_foreground).child(title))
-                        .child(muted_note(
-                            "Not available yet. ATK’s key codes for this group haven’t been verified, so AgnoPeriph won’t send them.",
-                            theme,
-                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.muted_foreground)
+                                .child(title),
+                        )
+                        .child(muted_note("Deferred for a later release.", theme))
                         .into_any_element(),
                 );
             }

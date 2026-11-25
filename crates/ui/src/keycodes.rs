@@ -1,12 +1,11 @@
-//! Standard USB HID keyboard-page usages offered by the keybind, macro and paired-key pickers.
+//! Verified USB HID and ATK DuckBread keycodes offered by the keybind, macro, and paired-key pickers.
 //!
-//! Only class `0x00` (standard HID usage) and class `0x77` (macro slot) codes are sent;
-//! both are documented in `docs/protocols/atk-rs7.md`. Vendor classes whose ids are not
-//! documented are never offered.
+//! Every class/id pair below is documented and backed by recovered ATK HUB JS evidence in
+//! `docs/protocols/atk-rs7.md` (`Ah`, `Ph`, `Ch`, `Rh` tables and `rs7.json`).
 
 use agnoperiph_core::KeyCode;
 
-/// Picker group for a key, in display order.
+/// Picker group for standard keyboard keys, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyGroup {
     Letters,
@@ -17,11 +16,10 @@ pub enum KeyGroup {
     Symbols,
     Modifiers,
     Numpad,
-    Media,
 }
 
 impl KeyGroup {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::Letters,
         Self::Numbers,
         Self::Function,
@@ -30,7 +28,6 @@ impl KeyGroup {
         Self::Symbols,
         Self::Modifiers,
         Self::Numpad,
-        Self::Media,
     ];
 
     pub fn label(self) -> &'static str {
@@ -43,12 +40,33 @@ impl KeyGroup {
             Self::Symbols => "Symbols",
             Self::Modifiers => "Modifiers",
             Self::Numpad => "Numpad",
-            Self::Media => "Volume",
         }
     }
 }
 
-/// One selectable HID keyboard-page usage.
+/// Picker group for ATK RS7 / DuckBread extra keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtraKeyGroup {
+    Media,
+    Windows,
+    Backlight,
+    LogoLight,
+}
+
+impl ExtraKeyGroup {
+    pub const ALL: [Self; 4] = [Self::Media, Self::Windows, Self::Backlight, Self::LogoLight];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Media => "Media & audio",
+            Self::Windows => "Windows system keys",
+            Self::Backlight => "Backlight control",
+            Self::LogoLight => "Logo light control",
+        }
+    }
+}
+
+/// One selectable standard HID keyboard-page usage (`class = 0x00`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HidKey {
@@ -57,15 +75,47 @@ pub struct HidKey {
     pub group: KeyGroup,
 }
 
+/// One verified ATK DuckBread extra key binding (`[class, id]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExtraKey {
+    pub class: u8,
+    pub id: u8,
+    pub name: &'static str,
+    pub short_name: &'static str,
+    pub group: ExtraKeyGroup,
+}
+
+impl ExtraKey {
+    pub const fn code(self) -> KeyCode {
+        KeyCode::new(self.class, self.id)
+    }
+}
+
 const fn k(usage: u8, name: &'static str, group: KeyGroup) -> HidKey {
     HidKey { usage, name, group }
 }
 
-use KeyGroup::{
-    Editing, Function, Letters, Media, Modifiers, Navigation, Numbers, Numpad, Symbols,
-};
+const fn ek(
+    class: u8,
+    id: u8,
+    name: &'static str,
+    short_name: &'static str,
+    group: ExtraKeyGroup,
+) -> ExtraKey {
+    ExtraKey {
+        class,
+        id,
+        name,
+        short_name,
+        group,
+    }
+}
 
-/// Every usage offered by the pickers, grouped and ordered for display.
+use ExtraKeyGroup::{Backlight, LogoLight, Media, Windows};
+use KeyGroup::{Editing, Function, Letters, Modifiers, Navigation, Numbers, Numpad, Symbols};
+
+/// Every standard keyboard usage offered by the pickers, grouped and ordered for display.
 pub const HID_KEYS: &[HidKey] = &[
     k(0x04, "A", Letters),
     k(0x05, "B", Letters),
@@ -183,9 +233,48 @@ pub const HID_KEYS: &[HidKey] = &[
     k(0x61, "Num 9", Numpad),
     k(0x62, "Num 0", Numpad),
     k(0x63, "Num .", Numpad),
-    k(0x7F, "Mute", Media),
-    k(0x80, "Volume Up", Media),
-    k(0x81, "Volume Down", Media),
+];
+
+/// Verified ATK RS7 / DuckBread extra keys (`Ah`, `Ph`, `Ch`, `Rh` in `useRemoteConfig`).
+pub const EXTRA_KEYS: &[ExtraKey] = &[
+    // Media & Audio (class 0x00, QMK consumer-mapped codes: 168..=174)
+    ek(0x00, 0xAA, "Volume Down", "Vol-", Media),
+    ek(0x00, 0xA9, "Volume Up", "Vol+", Media),
+    ek(0x00, 0xA8, "Mute", "Mute", Media),
+    ek(0x00, 0xAE, "Play / Pause", "Play", Media),
+    ek(0x00, 0xAD, "Stop", "Stop", Media),
+    ek(0x00, 0xAC, "Previous Track", "Prev", Media),
+    ek(0x00, 0xAB, "Next Track", "Next", Media),
+    // Windows System Keys (class 0x00, QMK system/browser/brightness codes)
+    ek(0x00, 0xB1, "Mail", "Mail", Windows),
+    ek(0x00, 0xB2, "Calculator", "Calc", Windows),
+    ek(0x00, 0xAF, "Media Player", "Media", Windows),
+    ek(0x00, 0xB3, "My Computer", "PC", Windows),
+    ek(0x00, 0xB4, "Search", "Search", Windows),
+    ek(0x00, 0xB5, "Browser Home", "Home", Windows),
+    ek(0x00, 0xB6, "Browser Back", "Back", Windows),
+    ek(0x00, 0xB7, "Browser Forward", "Fwd", Windows),
+    ek(0x00, 0xB8, "Browser Stop", "Stop", Windows),
+    ek(0x00, 0xB9, "Browser Refresh", "Refresh", Windows),
+    ek(0x00, 0xBA, "Bookmarks", "Fav", Windows),
+    ek(0x00, 0xBE, "Screen Brightness −", "Scr-", Windows),
+    ek(0x00, 0xBD, "Screen Brightness +", "Scr+", Windows),
+    // Backlight Control (class 0x78 light + 0x7E/0x00 switch)
+    ek(0x78, 0x20, "Mode Cycle", "BL Cyc", Backlight),
+    ek(0x78, 0x21, "Mode +", "BL+", Backlight),
+    ek(0x78, 0x22, "Mode −", "BL-", Backlight),
+    ek(0x78, 0x23, "Hue +", "Hue+", Backlight),
+    ek(0x78, 0x24, "Hue −", "Hue-", Backlight),
+    ek(0x78, 0x27, "Brightness +", "Bri+", Backlight),
+    ek(0x78, 0x28, "Brightness −", "Bri-", Backlight),
+    ek(0x78, 0x29, "Speed +", "Spd+", Backlight),
+    ek(0x78, 0x2A, "Speed −", "Spd-", Backlight),
+    ek(0x7E, 0x00, "Backlight On / Off", "BL Tog", Backlight),
+    // Logo Light Control (class 0x7E kbAndUser)
+    ek(0x7E, 0x1E, "Logo Mode −", "LG-", LogoLight),
+    ek(0x7E, 0x1F, "Logo Mode +", "LG+", LogoLight),
+    ek(0x7E, 0x1A, "Logo Brightness +", "LG Bri+", LogoLight),
+    ek(0x7E, 0x1B, "Logo Brightness −", "LG Bri-", LogoLight),
 ];
 
 /// Looks up the picker entry for a standard HID usage.
@@ -193,12 +282,24 @@ pub fn hid_key(usage: u8) -> Option<&'static HidKey> {
     HID_KEYS.iter().find(|key| key.usage == usage)
 }
 
+/// Looks up a verified extra key by `[class, id]`.
+pub fn extra_key(code: KeyCode) -> Option<&'static ExtraKey> {
+    EXTRA_KEYS
+        .iter()
+        .find(|key| key.class == code.class && key.id == code.id)
+}
+
 /// Short display name of a standard HID usage, or its hex value.
 pub fn hid_name(usage: u16) -> String {
-    u8::try_from(usage)
-        .ok()
-        .and_then(hid_key)
-        .map_or_else(|| format!("0x{usage:02X}"), |key| key.name.to_owned())
+    if let Ok(u) = u8::try_from(usage) {
+        if let Some(key) = hid_key(u) {
+            return key.name.to_owned();
+        }
+        if let Some(key) = extra_key(KeyCode::standard(u)) {
+            return key.short_name.to_owned();
+        }
+    }
+    format!("0x{usage:02X}")
 }
 
 /// Macro slot key class (`0x77`, ids `0..=15` = M1..M16).
@@ -206,6 +307,9 @@ pub const MACRO_CLASS: u8 = 0x77;
 
 /// Human-readable name of any keymap action the keybind view may show.
 pub fn keycode_name(code: KeyCode) -> String {
+    if let Some(extra) = extra_key(code) {
+        return extra.short_name.to_owned();
+    }
     match code.class {
         0x00 if code == KeyCode::TRANSPARENT => "Default".to_owned(),
         0x00 if code.id == 0 => "None".to_owned(),
@@ -238,7 +342,22 @@ mod tests {
             assert!(seen.insert(key.usage), "duplicate usage {:02X}", key.usage);
             assert_ne!(key.name, "");
         }
+        let mut seen_extra = HashSet::new();
+        for key in EXTRA_KEYS {
+            assert!(
+                seen_extra.insert((key.class, key.id)),
+                "duplicate extra key {:02X}:{:02X}",
+                key.class,
+                key.id
+            );
+            assert_ne!(key.name, "");
+            assert_ne!(key.short_name, "");
+        }
         assert_eq!(hid_name(0x1A), "W");
+        assert_eq!(keycode_name(KeyCode::standard(0xA8)), "Mute");
+        assert_eq!(keycode_name(KeyCode::standard(0xA9)), "Vol+");
+        assert_eq!(keycode_name(KeyCode::new(0x78, 0x27)), "Bri+");
+        assert_eq!(keycode_name(KeyCode::new(0x7E, 0x1F)), "LG+");
         assert_eq!(keycode_name(KeyCode::macro_slot(3)), "M4");
         assert_eq!(keycode_name(KeyCode::new(0x7E, 5)), "DKS 1");
         assert_eq!(keycode_name(KeyCode::TRANSPARENT), "Default");

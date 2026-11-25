@@ -22,6 +22,10 @@ pub enum GameSource {
     Steam,
     Epic,
     Riot,
+    HoyoPlay,
+    Gog,
+    Xbox,
+    GameBar,
     Installed,
     Manual,
 }
@@ -32,6 +36,10 @@ impl fmt::Display for GameSource {
             Self::Steam => f.write_str("Steam"),
             Self::Epic => f.write_str("Epic Games"),
             Self::Riot => f.write_str("Riot Games"),
+            Self::HoyoPlay => f.write_str("HoYoPlay"),
+            Self::Gog => f.write_str("GOG"),
+            Self::Xbox => f.write_str("Xbox"),
+            Self::GameBar => f.write_str("Detected"),
             Self::Installed => f.write_str("Windows"),
             Self::Manual => f.write_str("Manual"),
         }
@@ -410,10 +418,11 @@ impl ActiveProcessWatcher {
     }
 }
 
-/// Discovers installed Windows games across Steam, Epic Games, Riot Games, and Uninstall registry.
+/// Discovers installed Windows games across Steam, Epic Games, Riot Games, HoYoPlay /
+/// HoYoverse, GOG, Xbox, Windows GameConfigStore, Uninstall registry, and common game folders.
 ///
-/// Mirrors the local manifest/registry discovery strategy used by NVIDIA App / Playnite
-/// without requiring administrator elevation.
+/// Mirrors the multi-source local discovery strategy used by NVIDIA App without requiring
+/// administrator elevation.
 pub fn discover_installed_games() -> Vec<DetectedGame> {
     let mut found: Vec<DetectedGame> = Vec::new();
     let mut seen_exes: HashSet<String> = HashSet::new();
@@ -423,7 +432,7 @@ pub fn discover_installed_games() -> Vec<DetectedGame> {
         let is_exe = Path::new(&key)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
-        if !key.is_empty() && is_exe && seen_exes.insert(key) {
+        if !key.is_empty() && is_exe && !is_helper_exe(&key) && seen_exes.insert(key) {
             found.push(game);
         }
     };
@@ -437,7 +446,22 @@ pub fn discover_installed_games() -> Vec<DetectedGame> {
     for game in discover_riot_games() {
         push_unique(game);
     }
+    for game in discover_hoyoplay_games() {
+        push_unique(game);
+    }
+    for game in discover_gog_games() {
+        push_unique(game);
+    }
+    for game in discover_xbox_games() {
+        push_unique(game);
+    }
+    for game in discover_game_config_store_games() {
+        push_unique(game);
+    }
     for game in discover_registry_games() {
+        push_unique(game);
+    }
+    for game in discover_common_game_folders() {
         push_unique(game);
     }
 
@@ -466,10 +490,433 @@ fn is_helper_exe(file_name_lower: &str) -> bool {
         "ueprereq",
         "touchup",
         "activation",
+        "launcher",
+        "zfgamebrowser",
+        "hyp_",
+        "unitycrashhandler",
+        "qtwebengine",
+        "bootstrapper",
+        "benchmark",
+        "configtool",
+        "settings",
+        "helper",
+        "service",
+        "agent",
+        "daemon",
+        "overlay",
     ];
-    IGNORED_SUBSTRINGS
-        .iter()
-        .any(|needle| file_name_lower.contains(needle))
+    const IGNORED_EXACT: &[&str] = &[
+        "explorer.exe",
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "conhost.exe",
+        "chrome.exe",
+        "msedge.exe",
+        "firefox.exe",
+        "brave.exe",
+        "opera.exe",
+        "discord.exe",
+        "spotify.exe",
+        "steam.exe",
+        "epicgameslauncher.exe",
+        "riotclientservices.exe",
+        "riotclientux.exe",
+        "hyp.exe",
+        "agnoperiph.exe",
+        "obs64.exe",
+        "code.exe",
+        "notepad.exe",
+        "taskmgr.exe",
+    ];
+    IGNORED_EXACT.contains(&file_name_lower)
+        || IGNORED_SUBSTRINGS
+            .iter()
+            .any(|needle| file_name_lower.contains(needle))
+}
+
+fn present_drive_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for letter in b'C'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        if root.exists() {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Maps well-known game executable names or install paths to clean display titles.
+pub fn friendly_game_name(exe_path: &Path) -> String {
+    let exe_lower = exe_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let full_lower = exe_path.to_string_lossy().to_ascii_lowercase();
+
+    match exe_lower.as_str() {
+        "genshinimpact.exe" | "yuanshen.exe" => return "Genshin Impact".to_owned(),
+        "starrail.exe" => return "Honkai: Star Rail".to_owned(),
+        "zenlesszonezero.exe" => return "Zenless Zone Zero".to_owned(),
+        "bh3.exe" => return "Honkai Impact 3rd".to_owned(),
+        "valorant-win64-shipping.exe" => return "VALORANT".to_owned(),
+        "league of legends.exe" => return "League of Legends".to_owned(),
+        "cs2.exe" => return "Counter-Strike 2".to_owned(),
+        "r5apex.exe" | "r5apex_dx12.exe" => return "Apex Legends".to_owned(),
+        "overwatch.exe" => return "Overwatch 2".to_owned(),
+        "fortniteclient-win64-shipping.exe" => return "Fortnite".to_owned(),
+        "minecraft.windows.exe" => return "Minecraft".to_owned(),
+        "eldenring.exe" => return "ELDEN RING".to_owned(),
+        "cyberpunk2077.exe" => return "Cyberpunk 2077".to_owned(),
+        "osu!.exe" => return "osu!".to_owned(),
+        _ => {}
+    }
+
+    if full_lower.contains("wuthering waves") {
+        return "Wuthering Waves".to_owned();
+    }
+    if full_lower.contains("genshin impact") {
+        return "Genshin Impact".to_owned();
+    }
+    if full_lower.contains("star rail") {
+        return "Honkai: Star Rail".to_owned();
+    }
+    if full_lower.contains("zenless") {
+        return "Zenless Zone Zero".to_owned();
+    }
+
+    // For Unreal Engine binaries (`*-Win64-Shipping.exe`) or generic `game.exe`/`client.exe`,
+    // climb past `Win64`/`Binaries`/`Client`/`Games` to find the real game folder name.
+    let generic_exe = exe_lower.ends_with("-win64-shipping.exe")
+        || exe_lower.ends_with("-win64-test.exe")
+        || matches!(
+            exe_lower.as_str(),
+            "client.exe" | "game.exe" | "main.exe" | "start.exe" | "app.exe" | "shipping.exe"
+        );
+    if generic_exe {
+        for ancestor in exe_path.ancestors().skip(1) {
+            let Some(dir_name) = ancestor.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let lower = dir_name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "win64"
+                    | "win32"
+                    | "binaries"
+                    | "bin"
+                    | "client"
+                    | "game"
+                    | "games"
+                    | "live"
+                    | "shipping"
+                    | "x64"
+                    | "x86"
+                    | "program files"
+                    | "program files (x86)"
+                    | "steamapps"
+                    | "common"
+                    | "epic games"
+                    | "riot games"
+                    | "xboxgames"
+                    | "content"
+            ) {
+                continue;
+            }
+            if !dir_name.trim().is_empty() {
+                return dir_name.trim().to_owned();
+            }
+        }
+    }
+
+    exe_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Game")
+        .replace(['_', '-'], " ")
+        .trim()
+        .to_owned()
+}
+
+fn discover_hoyoplay_games() -> Vec<DetectedGame> {
+    let mut games = Vec::new();
+    let known: &[(&str, &str, &[&str])] = &[
+        (
+            "Genshin Impact",
+            "GenshinImpact.exe",
+            &[
+                r"Program Files\Genshin Impact\Genshin Impact game\GenshinImpact.exe",
+                r"Program Files\HoYoPlay\games\Genshin Impact game\GenshinImpact.exe",
+                r"HoYoPlay\games\Genshin Impact game\GenshinImpact.exe",
+                r"Games\Genshin Impact\Genshin Impact game\GenshinImpact.exe",
+                r"Genshin Impact\Genshin Impact game\GenshinImpact.exe",
+            ],
+        ),
+        (
+            "Honkai: Star Rail",
+            "StarRail.exe",
+            &[
+                r"Program Files\Star Rail\Games\StarRail.exe",
+                r"Program Files\Star Rail\Game\StarRail.exe",
+                r"Program Files\HoYoPlay\games\Star Rail Games\StarRail.exe",
+                r"HoYoPlay\games\Star Rail Games\StarRail.exe",
+                r"Games\Star Rail\Games\StarRail.exe",
+                r"Star Rail\Games\StarRail.exe",
+            ],
+        ),
+        (
+            "Zenless Zone Zero",
+            "ZenlessZoneZero.exe",
+            &[
+                r"Program Files\ZenlessZoneZero Game\ZenlessZoneZero.exe",
+                r"Program Files\HoYoPlay\games\ZenlessZoneZero Game\ZenlessZoneZero.exe",
+                r"HoYoPlay\games\ZenlessZoneZero Game\ZenlessZoneZero.exe",
+                r"Games\ZenlessZoneZero Game\ZenlessZoneZero.exe",
+                r"ZenlessZoneZero Game\ZenlessZoneZero.exe",
+            ],
+        ),
+        (
+            "Honkai Impact 3rd",
+            "BH3.exe",
+            &[
+                r"Program Files\Honkai Impact 3rd\Games\BH3.exe",
+                r"Program Files\HoYoPlay\games\Honkai Impact 3rd\Games\BH3.exe",
+                r"HoYoPlay\games\Honkai Impact 3rd\Games\BH3.exe",
+                r"Games\Honkai Impact 3rd\Games\BH3.exe",
+            ],
+        ),
+    ];
+
+    let roots = present_drive_roots();
+    for &(name, exe_name, rel_paths) in known {
+        'next_game: for root in &roots {
+            for rel in rel_paths {
+                let candidate = root.join(rel);
+                if candidate.is_file() {
+                    games.push(DetectedGame::new(
+                        name,
+                        exe_name,
+                        candidate.to_string_lossy().into_owned(),
+                        GameSource::HoyoPlay,
+                    ));
+                    break 'next_game;
+                }
+            }
+        }
+    }
+
+    // Also scan any `HoYoPlay\games` directory across drives for additional titles/custom folders.
+    for root in &roots {
+        for sub in [r"Program Files\HoYoPlay\games", r"HoYoPlay\games"] {
+            let dir = root.join(sub);
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && let Some(exe) = find_primary_exe(&path)
+                    && let Some(exe_name) = exe.file_name().and_then(|s| s.to_str())
+                {
+                    games.push(DetectedGame::new(
+                        friendly_game_name(&exe),
+                        exe_name,
+                        exe.to_string_lossy().into_owned(),
+                        GameSource::HoyoPlay,
+                    ));
+                }
+            }
+        }
+    }
+
+    games
+}
+
+fn discover_gog_games() -> Vec<DetectedGame> {
+    let mut games = Vec::new();
+    #[cfg(windows)]
+    {
+        use winreg::RegKey;
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        for path in [
+            r"SOFTWARE\WOW6432Node\GOG.com\Games",
+            r"SOFTWARE\GOG.com\Games",
+        ] {
+            let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(path) else {
+                continue;
+            };
+            for key_name in root.enum_keys().flatten() {
+                let Ok(sub) = root.open_subkey(&key_name) else {
+                    continue;
+                };
+                let name = sub
+                    .get_value::<String, _>("gameName")
+                    .or_else(|_| sub.get_value::<String, _>("GAMENAME"));
+                let exe = sub.get_value::<String, _>("exe");
+                if let (Ok(name), Ok(exe)) = (name, exe) {
+                    let p = PathBuf::from(&exe);
+                    if p.is_file()
+                        && let Some(exe_name) = p.file_name().and_then(|s| s.to_str())
+                    {
+                        games.push(DetectedGame::new(name, exe_name, exe, GameSource::Gog));
+                    }
+                }
+            }
+        }
+    }
+    games
+}
+
+fn discover_xbox_games() -> Vec<DetectedGame> {
+    let mut games = Vec::new();
+    for root in present_drive_roots() {
+        let xbox_dir = root.join("XboxGames");
+        let Ok(entries) = fs::read_dir(&xbox_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let name = dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Xbox Game")
+                .to_owned();
+            let content = dir.join("Content");
+            let search_root = if content.is_dir() { content } else { dir };
+            if let Some(exe) = find_primary_exe(&search_root)
+                && let Some(exe_name) = exe.file_name().and_then(|s| s.to_str())
+            {
+                games.push(DetectedGame::new(
+                    name,
+                    exe_name,
+                    exe.to_string_lossy().into_owned(),
+                    GameSource::Xbox,
+                ));
+            }
+        }
+    }
+    games
+}
+
+/// Reads Windows' `GameConfigStore` (`HKCU\System\GameConfigStore\Children`), which automatically
+/// records every DirectX/Vulkan game executable launched on the machine (including HoYoverse,
+/// Kuro Games, indie, and standalone installs that don't register through Steam/Epic).
+fn discover_game_config_store_games() -> Vec<DetectedGame> {
+    let mut games = Vec::new();
+    #[cfg(windows)]
+    {
+        use winreg::RegKey;
+        use winreg::enums::HKEY_CURRENT_USER;
+
+        let Ok(root) =
+            RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"System\GameConfigStore\Children")
+        else {
+            return games;
+        };
+        for key_name in root.enum_keys().flatten() {
+            let Ok(sub) = root.open_subkey(&key_name) else {
+                continue;
+            };
+            let Ok(raw_path) = sub.get_value::<String, _>("MatchedExeFullPath") else {
+                continue;
+            };
+            let clean = raw_path.trim().trim_matches('"');
+            let path = Path::new(clean);
+            if !path.is_file() {
+                continue;
+            }
+            let lower = clean.to_ascii_lowercase();
+            // Skip Windows system binaries and standard desktop app directories.
+            if lower.contains("\\windows\\")
+                || lower.contains("\\appdata\\")
+                || lower.contains("\\programdata\\")
+                || lower.contains("\\nvidia corporation\\")
+                || lower.contains("\\amd\\")
+                || lower.contains("\\microsoft ")
+            {
+                continue;
+            }
+            let Some(exe_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if is_helper_exe(&exe_name.to_ascii_lowercase()) {
+                continue;
+            }
+            let source = if lower.contains("genshin")
+                || lower.contains("star rail")
+                || lower.contains("zenless")
+                || lower.contains("hoyoplay")
+                || lower.contains("mihoyo")
+            {
+                GameSource::HoyoPlay
+            } else {
+                GameSource::GameBar
+            };
+            games.push(DetectedGame::new(
+                friendly_game_name(path),
+                exe_name,
+                clean,
+                source,
+            ));
+        }
+    }
+    games
+}
+
+/// Scans standard NVIDIA-App-style game library folders across all fixed drives.
+fn discover_common_game_folders() -> Vec<DetectedGame> {
+    let mut games = Vec::new();
+    let library_subs = [
+        "Games",
+        "Epic Games",
+        "Riot Games",
+        r"GOG Galaxy\Games",
+        r"Ubisoft\Ubisoft Game Launcher\games",
+        "EA Games",
+        "Origin Games",
+    ];
+    for root in present_drive_roots() {
+        for sub in library_subs {
+            let dir = root.join(sub);
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let game_dir = entry.path();
+                if !game_dir.is_dir() {
+                    continue;
+                }
+                let Some(folder_name) = game_dir.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let folder_lower = folder_name.to_ascii_lowercase();
+                if folder_lower.contains("riot client") || folder_lower.contains("launcher") {
+                    continue;
+                }
+                if let Some(exe) = find_primary_exe(&game_dir)
+                    && let Some(exe_name) = exe.file_name().and_then(|s| s.to_str())
+                {
+                    let name = friendly_game_name(&exe);
+                    let display = if name.eq_ignore_ascii_case("client") || name.is_empty() {
+                        folder_name.to_owned()
+                    } else {
+                        name
+                    };
+                    games.push(DetectedGame::new(
+                        display,
+                        exe_name,
+                        exe.to_string_lossy().into_owned(),
+                        GameSource::Installed,
+                    ));
+                }
+            }
+        }
+    }
+    games
 }
 
 fn find_primary_exe(dir: &Path) -> Option<PathBuf> {
@@ -682,32 +1129,27 @@ fn discover_epic_games() -> Vec<DetectedGame> {
 
 fn discover_riot_games() -> Vec<DetectedGame> {
     let mut games = Vec::new();
-    let known = [
+    let roots = present_drive_roots();
+    let known: &[(&str, &str, &str)] = &[
         (
             "VALORANT",
             "VALORANT-Win64-Shipping.exe",
-            [
-                r"C:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe",
-                r"D:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe",
-            ],
+            r"Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe",
         ),
         (
             "League of Legends",
             "League of Legends.exe",
-            [
-                r"C:\Riot Games\League of Legends\Game\League of Legends.exe",
-                r"D:\Riot Games\League of Legends\Game\League of Legends.exe",
-            ],
+            r"Riot Games\League of Legends\Game\League of Legends.exe",
         ),
     ];
-    for (name, exe_name, paths) in known {
-        for candidate in paths {
-            let p = Path::new(candidate);
-            if p.exists() {
+    for &(name, exe_name, rel) in known {
+        for root in &roots {
+            let p = root.join(rel);
+            if p.is_file() {
                 games.push(DetectedGame::new(
                     name,
                     exe_name,
-                    candidate,
+                    p.to_string_lossy().into_owned(),
                     GameSource::Riot,
                 ));
                 break;

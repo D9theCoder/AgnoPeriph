@@ -3,25 +3,41 @@
 //! Precise (trackpad) deltas already arrive per frame and pass through untouched. Line
 //! wheel notches move a target offset instead, and each frame closes a fixed fraction of
 //! the remaining distance, scaled by the real frame time, so motion stays smooth at 60 Hz
-//! and 165 Hz alike. Only the scroll offset changes, so no layout is recomputed while
-//! easing. Reduced motion falls back to GPUI's immediate scrolling.
+//! and 165 Hz alike. Reduced motion falls back to GPUI's immediate scrolling.
+//!
+//! Each easing frame only moves the scroll offset and notifies the owning view, the same
+//! contract as GPUI's own wheel listener (set the offset, then notify the view that holds
+//! the container). gpui-fast counts that pairing as a scroll, which lets it composite a
+//! scroll layer instead of rebuilding the view when the container qualifies for one.
+//! `window.refresh()` must not be used here: it marks the whole window dirty and forces a
+//! full render and layout on every animation frame.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Instant;
 
-use gpui_kit::component::scroll::Scrollbar;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarAxis};
 use gpui_kit::*;
 
 /// Fraction of the remaining distance closed per second (exponential approach rate).
-const APPROACH_RATE: f32 = 22.0;
+const APPROACH_RATE: f32 = 26.0;
 /// Pixels per wheel line; GPUI's default line height feels sluggish for long panels.
 const LINE_BOOST: f32 = 1.6;
+/// Distance under which the animation snaps to its target and stops.
+const SNAP_DISTANCE: Pixels = px(0.75);
 
 #[derive(Debug, Default)]
 struct Easing {
     target: Option<Pixels>,
     last_frame: Option<Instant>,
+}
+
+/// Element ids for one scrolling viewport; static so rendering allocates nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollIds {
+    pub(crate) root: &'static str,
+    pub(crate) viewport: &'static str,
+    pub(crate) scrollbar: &'static str,
 }
 
 /// Scroll owner for one viewport. The handle survives re-renders, keeping position.
@@ -47,13 +63,14 @@ impl SmoothScroll {
     /// Wraps `content` in a vertically scrolling viewport that fills its flex parent.
     pub(crate) fn wrap<V: 'static>(
         &self,
-        id: &'static str,
+        ids: ScrollIds,
         content: Div,
         background: Hsla,
-        _cx: &mut Context<V>,
+        cx: &mut Context<V>,
     ) -> Stateful<Div> {
         let handle = self.handle.clone();
         let easing = self.easing.clone();
+        let view = cx.entity_id();
         let content = content
             .w_full()
             .on_scroll(move |event: &ScrollEvent, window, cx| {
@@ -61,12 +78,20 @@ impl SmoothScroll {
                     easing.borrow_mut().target = None;
                     return;
                 }
-                let delta = event.delta.pixel_delta(window.line_height()).y * LINE_BOOST;
                 let max = handle.max_offset().y;
+                if max <= px(0.) {
+                    return;
+                }
+                let delta = event.delta.pixel_delta(window.line_height()).y * LINE_BOOST;
                 let start_ticking = {
                     let mut state = easing.borrow_mut();
-                    let from = state.target.unwrap_or(handle.offset().y);
+                    let current = handle.offset().y;
+                    let from = state.target.unwrap_or(current);
                     let target = (from + delta).clamp(-max, px(0.));
+                    if state.target.is_none() && target == current {
+                        // Already at the edge in this direction; let outer scrollers act.
+                        return;
+                    }
                     let was_idle = state.target.is_none();
                     state.target = Some(target);
                     if was_idle {
@@ -76,12 +101,12 @@ impl SmoothScroll {
                 };
                 cx.stop_propagation();
                 if start_ticking {
-                    schedule_frame(handle.clone(), easing.clone(), window);
+                    schedule_frame(handle.clone(), easing.clone(), view, window);
                 }
             });
 
         div()
-            .id(id)
+            .id(ids.root)
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -89,7 +114,7 @@ impl SmoothScroll {
             .bg(background)
             .child(
                 div()
-                    .id(SharedString::from(format!("{id}-viewport")))
+                    .id(ids.viewport)
                     .size_full()
                     .flex()
                     .flex_col()
@@ -100,42 +125,62 @@ impl SmoothScroll {
             .child(
                 div().absolute().inset_0().child(
                     Scrollbar::new(&self.handle)
-                        .id(SharedString::from(format!("{id}-scrollbar")))
-                        .axis(gpui_kit::component::scroll::ScrollbarAxis::Vertical)
+                        .id(ids.scrollbar)
+                        .axis(ScrollbarAxis::Vertical)
                         .viewport_from_layout(),
                 ),
             )
     }
 }
 
-fn schedule_frame(handle: ScrollHandle, easing: Rc<RefCell<Easing>>, window: &Window) {
-    window.on_next_frame(move |window, _| step(&handle, &easing, window));
+fn schedule_frame(
+    handle: ScrollHandle,
+    easing: Rc<RefCell<Easing>>,
+    view: EntityId,
+    window: &Window,
+) {
+    window.on_next_frame(move |window, cx| step(&handle, &easing, view, window, cx));
 }
 
-fn step(handle: &ScrollHandle, easing: &Rc<RefCell<Easing>>, window: &mut Window) {
+fn step(
+    handle: &ScrollHandle,
+    easing: &Rc<RefCell<Easing>>,
+    view: EntityId,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let now = Instant::now();
-    let next_frame = {
+    let (moved, next_frame) = {
         let mut state = easing.borrow_mut();
         let Some(target) = state.target else {
             return;
         };
         let elapsed = state
             .last_frame
-            .map_or(1.0 / 120.0, |last| now.duration_since(last).as_secs_f32())
-            .min(0.1);
+            .map_or(1.0 / 165.0, |last| now.duration_since(last).as_secs_f32())
+            .min(0.05);
         state.last_frame = Some(now);
+        // The content may have shrunk since the notch (tab switch, collapsed section).
+        let target = target.clamp(-handle.max_offset().y.max(px(0.)), px(0.));
         let current = handle.offset();
         let alpha = 1.0 - (-APPROACH_RATE * elapsed).exp();
         let mut next = current.y + (target - current.y) * alpha;
-        if (target - next).abs() < px(0.5) {
+        if (target - next).abs() < SNAP_DISTANCE {
             next = target;
             state.target = None;
+        } else {
+            state.target = Some(target);
         }
-        handle.set_offset(point(current.x, next));
-        state.target.is_some()
+        let moved = next != current.y;
+        if moved {
+            handle.set_offset(point(current.x, next));
+        }
+        (moved, state.target.is_some())
     };
-    window.refresh();
+    if moved {
+        cx.notify(view);
+    }
     if next_frame {
-        schedule_frame(handle.clone(), easing.clone(), window);
+        schedule_frame(handle.clone(), easing.clone(), view, window);
     }
 }

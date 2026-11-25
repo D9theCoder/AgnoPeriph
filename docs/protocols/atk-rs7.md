@@ -189,3 +189,10 @@ TRAVEL_INFO_MAP["ATK RS7"] = {
 // Backlight RGB (Ys): p[0]=8|7, p[1]=65, p[2]=effect, p[4]=speed, p[5..8]=r,g,b, p[8]=brightness
 // Logo Light (Js): p[0]=2|3, p[1]=150, p[2]=33, p[3]=mode, p[4]=colorful, p[5]=brightness, p[6]=speed, p[7..10]=r,g,b
 ```
+
+### Verified DuckBread Extra Keycodes (`useRemoteConfig-DYQXy-Fo.js` `Ah`/`Ph`/`Ch`/`Rh` + `rs7.json`)
+Sent via `id_dynamic_keymap_set_keycode (0x05)` as 2-byte `[keyClass, keyId]`:
+- **Media & Audio (`class = 0x00`, `Ah`):** `0xAA` Vol−, `0xA9` Vol+, `0xA8` Mute, `0xAE` Play/Pause, `0xAD` Stop, `0xAC` Prev Track, `0xAB` Next Track. *(RS7 uses QMK consumer-mapped codes, NOT HID keyboard page `0x7F/0x80/0x81`.)*
+- **Windows System Keys (`class = 0x00`, `Ph`):** `0xB1` Mail, `0xB2` Calculator, `0xAF` Media Player, `0xB3` My Computer, `0xB4` Search, `0xB5` Browser Home, `0xB6` Browser Back, `0xB7` Browser Forward, `0xB8` Browser Stop, `0xB9` Browser Refresh, `0xBA` Bookmarks, `0xBE` Screen Brightness−, `0xBD` Screen Brightness+.
+- **Backlight Control (`class = 0x78` / `0x7E`, `Ch`):** `[0x78, 0x20]` Mode Cycle, `[0x78, 0x21]` Mode+, `[0x78, 0x22]` Mode−, `[0x78, 0x23]` Hue+, `[0x78, 0x24]` Hue−, `[0x78, 0x27]` Brightness+, `[0x78, 0x28]` Brightness−, `[0x78, 0x29]` Speed+, `[0x78, 0x2A]` Speed−, `[0x7E, 0x00]` Backlight On/Off.
+- **Logo Light Control (`class = 0x7E`, `Rh`):** `[0x7E, 0x1E]` Logo Mode−, `[0x7E, 0x1F]` Logo Mode+, `[0x7E, 0x1A]` Logo Brightness+, `[0x7E, 0x1B]` Logo Brightness−.

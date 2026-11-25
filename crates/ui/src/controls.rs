@@ -20,9 +20,6 @@ pub(crate) enum SliderRole {
     DeadzoneBottom,
     Brightness,
     Speed,
-    Hue,
-    Saturation,
-    Value,
 }
 
 /// Which text field emitted an event.
@@ -95,9 +92,6 @@ pub(crate) struct Controls {
     pub(crate) deadzone_bottom: Entity<SliderState>,
     pub(crate) brightness: Entity<SliderState>,
     pub(crate) speed: Entity<SliderState>,
-    pub(crate) hue: Entity<SliderState>,
-    pub(crate) saturation: Entity<SliderState>,
-    pub(crate) value: Entity<SliderState>,
     pub(crate) hex: Entity<InputState>,
     pub(crate) rename: Entity<InputState>,
     pub(crate) game_search: Entity<InputState>,
@@ -151,9 +145,6 @@ impl Controls {
                 0.0,
                 cx,
             ),
-            hue: slider(SliderRange::new(0u16, 359u16, 1u16), 0.0, cx),
-            saturation: slider(percent, 0.0, cx),
-            value: slider(percent, 100.0, cx),
             hex: cx.new(|cx| InputState::new(window, cx).placeholder("#RRGGBB")),
             rename: cx.new(|cx| InputState::new(window, cx).placeholder("Name")),
             game_search: cx.new(|cx| InputState::new(window, cx).placeholder("Search games…")),
@@ -179,9 +170,6 @@ impl Controls {
             (&self.deadzone_bottom, SliderRole::DeadzoneBottom),
             (&self.brightness, SliderRole::Brightness),
             (&self.speed, SliderRole::Speed),
-            (&self.hue, SliderRole::Hue),
-            (&self.saturation, SliderRole::Saturation),
-            (&self.value, SliderRole::Value),
         ];
         let inputs = [
             (&self.hex, InputRole::Hex),

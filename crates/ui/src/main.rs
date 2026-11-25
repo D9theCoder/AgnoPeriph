@@ -29,10 +29,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let use_mock = args.iter().any(|arg| arg == "--mock");
     let start_minimized = args.iter().any(|arg| arg == MINIMIZED_FLAG);
+    let dev_tools = cfg!(debug_assertions) || args.iter().any(|arg| arg == "--dev-tools");
+    let start_dry_run =
+        cfg!(debug_assertions) || use_mock || args.iter().any(|arg| arg == "--dry-run");
     let service: Arc<dyn PeripheralService> = if use_mock {
         Arc::new(MockPeripheralService::new())
     } else {
-        Arc::new(LiveHidService::new())
+        Arc::new(LiveHidService::new_with_dry_run(start_dry_run))
     };
     let config_path = AppConfig::default_path();
     let config = AppConfig::load_or_default(config_path.as_deref());
@@ -44,7 +47,7 @@ fn main() {
             gpui_kit::init(cx);
             // The process outlives its window while it sits in the notification area.
             cx.set_quit_mode(QuitMode::Explicit);
-            let options = AppOptions::live(system, config);
+            let options = AppOptions::live(system, config).with_dev_tools(dev_tools);
             let app = cx.new(|cx| AgnoPeriphApp::with_options(service, options, cx));
             let shell = Rc::new(RefCell::new(Shell {
                 app,

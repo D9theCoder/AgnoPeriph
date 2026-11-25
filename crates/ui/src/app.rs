@@ -27,7 +27,7 @@ use gpui_kit::*;
 use crate::backend::{ApplyError, DeviceSnapshot, PeripheralService, PointerChange, SettingChange};
 use crate::controls::{Controls, InputRole, SliderRange, SliderRole};
 use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
-use crate::smooth_scroll::SmoothScroll;
+use crate::smooth_scroll::{ScrollIds, SmoothScroll};
 use crate::system::{DetachedSystem, SystemIntegration};
 use crate::{
     calibration, game_profiles_view, hall_effect_panel, inspector_drawer, keyboard_config_panel,
@@ -175,12 +175,14 @@ pub struct AppOptions {
     config: AppConfig,
     discover_games: GameDiscovery,
     watch_processes: bool,
+    show_dev_tools: bool,
 }
 
 impl std::fmt::Debug for AppOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppOptions")
             .field("watch_processes", &self.watch_processes)
+            .field("show_dev_tools", &self.show_dev_tools)
             .finish_non_exhaustive()
     }
 }
@@ -192,6 +194,7 @@ impl Default for AppOptions {
             config: AppConfig::default(),
             discover_games: Arc::new(Vec::new),
             watch_processes: false,
+            show_dev_tools: true,
         }
     }
 }
@@ -204,7 +207,13 @@ impl AppOptions {
             config,
             discover_games: Arc::new(crate::game_profiles::discover_installed_games),
             watch_processes: true,
+            show_dev_tools: cfg!(debug_assertions),
         }
+    }
+
+    pub fn with_dev_tools(mut self, enabled: bool) -> Self {
+        self.show_dev_tools = enabled;
+        self
     }
 
     pub fn with_system(mut self, system: Arc<dyn SystemIntegration>) -> Self {
@@ -252,7 +261,9 @@ pub struct AgnoPeriphApp {
     /// because a superseded write has still reached the device.
     in_flight: Option<JobOrigin>,
     dry_run: bool,
+    show_dev_tools: bool,
     is_inspector_open: bool,
+    reconnect_attempts: u8,
     banner: Option<Banner>,
     packets: Vec<PacketTraceEntry>,
     formatted_packets: Arc<Vec<inspector_drawer::FormattedPacket>>,
@@ -327,14 +338,16 @@ impl AgnoPeriphApp {
             queue: VecDeque::new(),
             in_flight: None,
             dry_run,
-            is_inspector_open: true,
+            show_dev_tools: options.show_dev_tools,
+            is_inspector_open: options.show_dev_tools,
+            reconnect_attempts: 0,
             banner: None,
             packets: Vec::new(),
             formatted_packets: Arc::new(Vec::new()),
             suppressed_packets: 0,
             cleared_through_sequence: 0,
             selected_key: KeyIndex::new(0),
-            selected_keys: BTreeSet::from([KeyIndex::new(0)]),
+            selected_keys: BTreeSet::new(),
             key_draft: KeyDraft::default(),
             deadzone_draft: DeadzoneDraft::default(),
             dpi_draft: None,
@@ -645,6 +658,11 @@ impl AgnoPeriphApp {
         match devices {
             Ok(devices) => {
                 let previous = self.selected.clone();
+                let needs_reconnect = devices.iter().any(|d| {
+                    d.warnings
+                        .iter()
+                        .any(|w| crate::backend::is_disconnect_message(&w.message))
+                });
                 self.devices = devices;
                 self.banner = None;
                 let still_present = self
@@ -662,6 +680,11 @@ impl AgnoPeriphApp {
                     if device.profiles.is_none() && device.capabilities.has_hall_effect() {
                         self.config.ensure_software_profiles(device.id());
                     }
+                }
+                if needs_reconnect {
+                    self.schedule_auto_reconnect(cx);
+                } else {
+                    self.reconnect_attempts = 0;
                 }
             }
             Err(err) => {
@@ -682,9 +705,11 @@ impl AgnoPeriphApp {
         cx.notify();
     }
 
+    /// Clears the Triggers selection. `selected_key` keeps pointing at a real key so the
+    /// editors can show values, but nothing is applied until a key is clicked.
     fn reset_key_selection(&mut self) {
         self.selected_key = KeyIndex::new(0);
-        self.selected_keys = BTreeSet::from([KeyIndex::new(0)]);
+        self.selected_keys = BTreeSet::new();
     }
 
     /// Validates and applies one change to the selected device.
@@ -781,7 +806,16 @@ impl AgnoPeriphApp {
         self.in_flight = None;
         self.set_packets(packets);
         if let Some(snapshot) = last {
+            let needs_reconnect = snapshot
+                .warnings
+                .iter()
+                .any(|w| crate::backend::is_disconnect_message(&w.message));
             self.store_snapshot(snapshot);
+            if needs_reconnect {
+                self.schedule_auto_reconnect(cx);
+            } else {
+                self.reconnect_attempts = 0;
+            }
         }
         match failure {
             None => {
@@ -791,7 +825,7 @@ impl AgnoPeriphApp {
                 self.finish_origin(device, origin);
             }
             Some((step, total, failure)) => {
-                self.report_failure(device, origin, step, total, failure);
+                self.report_failure(device, origin, step, total, failure, cx);
             }
         }
         if let JobOrigin::ProfileSwitch {
@@ -803,6 +837,25 @@ impl AgnoPeriphApp {
         self.request_sync(cx);
         self.pump_queue(cx);
         cx.notify();
+    }
+
+    fn schedule_auto_reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.reconnect_attempts >= 4 || self.is_loading {
+            return;
+        }
+        self.reconnect_attempts += 1;
+        let expected_rev = self.revision;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.revision == expected_rev && !this.has_pending_writes() && !this.is_loading {
+                    this.refresh(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn store_snapshot(&mut self, snapshot: DeviceSnapshot) {
@@ -851,6 +904,7 @@ impl AgnoPeriphApp {
         step: usize,
         total: usize,
         failure: ApplyError,
+        cx: &mut Context<Self>,
     ) {
         self.paired.cancel_pick();
         if matches!(origin, JobOrigin::CalibrationStart) {
@@ -858,8 +912,17 @@ impl AgnoPeriphApp {
             self.calibration.is_active = false;
         }
         let refreshed = failure.refreshed_snapshot.is_some();
+        let disconnect_failed = crate::backend::is_disconnect_message(&failure.error.to_string())
+            || failure.refreshed_snapshot.as_ref().is_some_and(|s| {
+                s.warnings
+                    .iter()
+                    .any(|w| crate::backend::is_disconnect_message(&w.message))
+            });
         if let Some(snapshot) = failure.refreshed_snapshot {
             self.store_snapshot(*snapshot);
+        }
+        if disconnect_failed && !self.dry_run {
+            self.schedule_auto_reconnect(cx);
         }
         let device_name = self
             .device(device)
@@ -953,10 +1016,63 @@ impl AgnoPeriphApp {
         }
     }
 
+    /// Feeds `key` to a pending paired-key pick. Returns `false` when no pick is armed.
+    ///
+    /// A key already bound to an advanced function (RS, SOCD, DKS, MT, TGL) is refused
+    /// with an inline note and the pick stays armed, so the user can choose another key.
+    fn route_pick(&mut self, key: KeyIndex, cx: &mut Context<Self>) -> bool {
+        if self.paired.pick.is_none() {
+            return false;
+        }
+        let owner = self.selected_device().and_then(|device| {
+            crate::backend::occupied_advanced_keys(device)
+                .get(&key)
+                .copied()
+        });
+        if let Some(owner) = owner {
+            let label = self
+                .selected_device()
+                .and_then(|d| {
+                    d.hall_effect
+                        .as_ref()
+                        .map(|he| crate::keymap::KeyLayout::for_device(&d.info, &he.capabilities))
+                })
+                .map_or_else(|| format!("Key {}", key.value()).into(), |l| l.label(key));
+            self.paired.conflict =
+                Some(format!("{label} is already used by {owner}. Remove it there first.").into());
+        } else {
+            self.paired.conflict = None;
+            self.paired.accept_pick(key);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Triggers matrix click: adds an unselected key, removes a selected one.
+    ///
+    /// Mirrors ATK HUB, where every click accumulates; the last key may be removed too.
+    pub fn toggle_key(&mut self, key: KeyIndex, cx: &mut Context<Self>) {
+        if self.route_pick(key, cx) {
+            return;
+        }
+        if self.selected_keys.remove(&key) {
+            if self.selected_key == key
+                && let Some(&next) = self.selected_keys.iter().next_back()
+            {
+                self.selected_key = next;
+            }
+        } else {
+            self.selected_keys.insert(key);
+            self.selected_key = key;
+        }
+        self.key_draft = KeyDraft::default();
+        self.request_sync(cx);
+        cx.notify();
+    }
+
     /// Selects `key` alone, or toggles it in a multi-key selection when `extend` is set.
     pub fn select_key(&mut self, key: KeyIndex, extend: bool, cx: &mut Context<Self>) {
-        if self.paired.accept_pick(key) {
-            cx.notify();
+        if self.route_pick(key, cx) {
             return;
         }
         if extend {
@@ -1207,11 +1323,7 @@ impl AgnoPeriphApp {
             | SliderRole::DeadzoneBottom => {
                 hall_effect_panel::on_slider(self, role, value, cx);
             }
-            SliderRole::Brightness
-            | SliderRole::Speed
-            | SliderRole::Hue
-            | SliderRole::Saturation
-            | SliderRole::Value => {
+            SliderRole::Brightness | SliderRole::Speed => {
                 rgb_panel::on_slider(self, role, value, released, window, cx);
             }
         }
@@ -1340,18 +1452,20 @@ impl AgnoPeriphApp {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
-                        Switch::new("dry-run")
-                            .label("Dry run")
-                            .checked(self.dry_run)
-                            .disabled(locked)
-                            .tooltip("Validate and log writes without sending them to devices")
-                            .on_change(cx.listener(|this, checked: &bool, window, cx| {
-                                this.request_dry_run_change(*checked, window, cx);
-                            })),
-                    )
-                    .child(write_state)
-                    .child(div().w_px().h_5().bg(theme.border))
+                    .when(self.show_dev_tools, |this| {
+                        this.child(
+                            Switch::new("dry-run")
+                                .label("Dry run")
+                                .checked(self.dry_run)
+                                .disabled(locked)
+                                .tooltip("Validate and log writes without sending them to devices")
+                                .on_change(cx.listener(|this, checked: &bool, window, cx| {
+                                    this.request_dry_run_change(*checked, window, cx);
+                                })),
+                        )
+                        .child(write_state)
+                        .child(div().w_px().h_5().bg(theme.border))
+                    })
                     .child(
                         Button::new("refresh")
                             .outline()
@@ -1380,15 +1494,17 @@ impl AgnoPeriphApp {
                                 Self::toggle_theme(window, cx);
                             })),
                     )
-                    .child(
-                        Button::new("inspector-toggle")
-                            .ghost()
-                            .small()
-                            .icon(IconName::PanelBottom)
-                            .selected(self.is_inspector_open)
-                            .tooltip("HID packet inspector")
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
-                    ),
+                    .when(self.show_dev_tools, |this| {
+                        this.child(
+                            Button::new("inspector-toggle")
+                                .ghost()
+                                .small()
+                                .icon(IconName::PanelBottom)
+                                .selected(self.is_inspector_open)
+                                .tooltip("HID packet inspector")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
+                        )
+                    }),
             )
     }
 
@@ -1414,33 +1530,36 @@ impl AgnoPeriphApp {
                         ),
                 )
             })
-            .when(!self.dry_run, |this| {
-                this.child(
-                    div()
-                        .id("live-writes")
-                        .child(Alert::warning(
-                            "live-writes-alert",
-                            "Changes are written to the device. Fully exit G Hub, ATK HUB and Lamzu software, including tray icons, so they don’t block or overwrite them.",
-                        ))
-                        .test_support(),
-                )
-            })
     }
 
-    fn render_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let background = cx.theme().background;
         let notices = self.render_notices(cx);
         let body = match self.route {
             Route::GameProfiles => game_profiles_view::render(self, cx).into_any_element(),
-            Route::Device => match self.selected_device().cloned() {
-                Some(device) => self.render_device(&device, cx).into_any_element(),
+            Route::Device => match self.selected_device() {
+                Some(device) => self.render_device(device, cx).into_any_element(),
                 None if !self.has_loaded => loading_state(cx.theme()).into_any_element(),
                 None => self.render_empty_state(cx).into_any_element(),
             },
         };
-        let content = v_flex().p_6().gap_6().child(notices).child(body);
-        self.smooth_scroll
-            .wrap("workspace", content, background, cx)
+        let content = v_flex()
+            .px_5()
+            .pt_4()
+            .pb_6()
+            .gap_4()
+            .when(self.banner.is_some(), |this| this.child(notices))
+            .child(body);
+        self.smooth_scroll.wrap(
+            ScrollIds {
+                root: "workspace",
+                viewport: "workspace-viewport",
+                scrollbar: "workspace-scrollbar",
+            },
+            content,
+            background,
+            cx,
+        )
     }
 
     fn render_device(
@@ -1466,18 +1585,19 @@ impl AgnoPeriphApp {
 
         let header = h_flex()
             .gap_4()
-            .items_start()
             .justify_between()
             .child(
-                v_flex()
-                    .gap_1()
+                h_flex()
+                    .gap_x_4()
+                    .gap_y_1()
+                    .flex_wrap()
                     .min_w_0()
                     .child(
                         h_flex()
                             .gap_3()
                             .child(
                                 div()
-                                    .text_xl()
+                                    .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(info.model_name.clone()),
                             )
@@ -1491,8 +1611,8 @@ impl AgnoPeriphApp {
                     )
                     .child(
                         h_flex()
-                            .gap_4()
-                            .text_sm()
+                            .gap_3()
+                            .text_xs()
                             .text_color(theme.muted_foreground)
                             .children(facts),
                     ),
@@ -1515,7 +1635,7 @@ impl AgnoPeriphApp {
             );
 
         let mut body = v_flex()
-            .gap_6()
+            .gap_4()
             .child(header)
             .child(profile_bar::render(self, device, cx))
             .children(device.warnings.iter().map(|warning| {
@@ -1578,7 +1698,7 @@ impl AgnoPeriphApp {
                 keyboard_config_panel::render(self, device, cx).into_any_element()
             }
         };
-        v_flex().gap_6().child(bar).child(panel)
+        v_flex().gap_4().child(bar).child(panel)
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1617,12 +1737,12 @@ impl AgnoPeriphApp {
     }
 }
 
-/// Embedded AgnoPeriph brand mark, compiled into the binary so standalone executables
-/// always render the icon regardless of working directory.
+/// Embedded AgnoPeriph brand mark (`64×64` PNG), compiled into the binary so standalone
+/// executables render the header icon quickly regardless of working directory.
 static LOGO_IMAGE: LazyLock<Arc<Image>> = LazyLock::new(|| {
     Arc::new(Image::from_bytes(
         ImageFormat::Png,
-        include_bytes!("../assets/logo.png").to_vec(),
+        include_bytes!("../assets/logo_64.png").to_vec(),
     ))
 });
 
@@ -1678,7 +1798,7 @@ impl Render for AgnoPeriphApp {
                     .child(sidebar)
                     .child(workspace),
             )
-            .when(self.is_inspector_open, |this| {
+            .when(self.show_dev_tools && self.is_inspector_open, |this| {
                 this.child(inspector_drawer::render(self, cx))
             })
     }

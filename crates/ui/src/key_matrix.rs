@@ -1,10 +1,12 @@
 //! Physical keyboard renderer shared by the trigger, keybind and calibration views.
 //!
-//! Each view supplies a per-key [`KeyFace`]; the layout, keycap geometry and click
-//! semantics (plain click selects, Ctrl/Shift-click extends) stay identical everywhere.
+//! Each view supplies a per-key [`KeyFace`]; the layout and keycap geometry stay identical
+//! everywhere. Keycaps are plain interactive `div`s rather than `Button`s: a full board is
+//! ~85 caps, and the component's extra layers made every matrix frame several times more
+//! expensive than the caps themselves. Click semantics belong to each view's handler.
 
 use agnoperiph_core::KeyIndex;
-use gpui_kit::component::{ActiveTheme, Selectable, Theme, button::Button, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -12,7 +14,7 @@ use crate::app::AgnoPeriphApp;
 use crate::keymap::{KeyLayout, LayoutKey};
 
 /// Width of one key unit in rem; keycaps and gaps scale with the theme's base font.
-const KEY_UNIT_REM: f32 = 3.0;
+const KEY_UNIT_REM: f32 = 2.8;
 /// Space between neighbouring keycaps in rem (matches `gap_1`).
 const KEY_GAP_REM: f32 = 0.25;
 
@@ -26,6 +28,8 @@ pub(crate) enum KeyTone {
     Picked,
     /// A positive per-key state, such as calibrated.
     Done,
+    /// Unavailable for the current action, e.g. already bound to an advanced function.
+    Locked,
 }
 
 /// What a keycap shows.
@@ -36,6 +40,8 @@ pub(crate) struct KeyFace {
     pub(crate) fill: Option<f32>,
     /// Small dot in the top corner, e.g. Rapid Trigger on.
     pub(crate) marker: bool,
+    /// Short tag in the top corner naming what owns the key, e.g. `SOCD`.
+    pub(crate) badge: Option<&'static str>,
     pub(crate) tone: KeyTone,
 }
 
@@ -45,6 +51,7 @@ impl KeyFace {
             detail: None,
             fill: None,
             marker: false,
+            badge: None,
             tone,
         }
     }
@@ -54,7 +61,7 @@ type OnSelect = fn(&mut AgnoPeriphApp, KeyIndex, bool, &mut Window, &mut Context
 
 /// Renders `layout` as clickable keycaps with ids `(id_prefix, key)`.
 ///
-/// `on_select` receives the key and whether Ctrl or Shift extended the selection.
+/// `on_select` receives the key and whether Ctrl or Shift was held.
 pub(crate) fn render(
     id: &'static str,
     id_prefix: &'static str,
@@ -63,30 +70,26 @@ pub(crate) fn render(
     on_select: OnSelect,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> Stateful<Div> {
-    let rows: Vec<AnyElement> = layout
-        .rows
-        .iter()
-        .map(|row| {
-            h_flex()
-                .gap_1()
-                .children(row.iter().map(|cap| {
-                    let key = cap.index;
-                    let listener = cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        let modifiers = event.modifiers();
-                        on_select(this, key, modifiers.shift || modifiers.control, window, cx);
-                    });
-                    keycap(
-                        id_prefix,
-                        cap,
-                        &face(cap),
-                        Some(Box::new(listener)),
-                        cx.theme(),
-                    )
-                }))
-                .into_any_element()
-        })
-        .collect();
-    board(id, rows, cx.theme())
+    let mut board = board(id, cx.theme());
+    for row in &layout.rows {
+        let mut line = h_flex().gap_1();
+        for cap in row {
+            let key = cap.index;
+            let listener = cx.listener(move |this, event: &ClickEvent, window, cx| {
+                let modifiers = event.modifiers();
+                on_select(this, key, modifiers.shift || modifiers.control, window, cx);
+            });
+            line = line.child(keycap(
+                id_prefix,
+                cap,
+                &face(cap),
+                Some(Box::new(listener)),
+                cx.theme(),
+            ));
+        }
+        board = board.child(line);
+    }
+    board
 }
 
 /// Renders `layout` as read-only keycaps with ids `(id_prefix, key)`.
@@ -97,32 +100,28 @@ pub(crate) fn render_static(
     face: impl Fn(&LayoutKey) -> KeyFace,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let rows: Vec<AnyElement> = layout
-        .rows
-        .iter()
-        .map(|row| {
-            h_flex()
-                .gap_1()
-                .children(
-                    row.iter()
-                        .map(|cap| keycap(id_prefix, cap, &face(cap), None, theme)),
-                )
-                .into_any_element()
-        })
-        .collect();
-    board(id, rows, theme)
+    let mut board = board(id, theme);
+    for row in &layout.rows {
+        board = board.child(
+            h_flex().gap_1().children(
+                row.iter()
+                    .map(|cap| keycap(id_prefix, cap, &face(cap), None, theme)),
+            ),
+        );
+    }
+    board
 }
 
-fn board(id: &'static str, rows: Vec<AnyElement>, theme: &Theme) -> Stateful<Div> {
+fn board(id: &'static str, theme: &Theme) -> Stateful<Div> {
     v_flex()
         .id(id)
-        .p_3()
+        .flex_shrink_0()
+        .p_2()
         .gap_1()
         .rounded(theme.radius_lg)
         .bg(theme.group_box)
         .border_1()
         .border_color(theme.border)
-        .children(rows)
 }
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -134,93 +133,115 @@ fn keycap(
     on_click: Option<ClickHandler>,
     theme: &Theme,
 ) -> AnyElement {
-    let key = cap.index;
     let width = f32::from(cap.width) / 100.0 * KEY_UNIT_REM - KEY_GAP_REM;
     let gap = f32::from(cap.gap) / 100.0 * KEY_UNIT_REM;
-    let accent = match face.tone {
-        KeyTone::Done => theme.success,
-        KeyTone::Picked => theme.warning,
-        KeyTone::Normal | KeyTone::Selected => theme.primary,
+    let (accent, border, background, hover) = match face.tone {
+        KeyTone::Normal => (
+            theme.primary,
+            theme.border,
+            theme.background,
+            theme.secondary_hover,
+        ),
+        KeyTone::Selected => (
+            theme.primary,
+            theme.primary,
+            theme.primary.opacity(0.16),
+            theme.primary.opacity(0.24),
+        ),
+        KeyTone::Picked => (
+            theme.warning,
+            theme.warning,
+            theme.warning.opacity(0.18),
+            theme.warning.opacity(0.26),
+        ),
+        KeyTone::Done => (
+            theme.success,
+            theme.success,
+            theme.success.opacity(0.18),
+            theme.success.opacity(0.26),
+        ),
+        KeyTone::Locked => (
+            theme.muted_foreground,
+            theme.border,
+            theme.muted,
+            theme.muted,
+        ),
     };
     let label = match &face.detail {
         Some(detail) => format!("{} key, {detail}", cap.label),
         None => format!("{} key", cap.label),
     };
-    let content = v_flex()
-        .size_full()
-        .justify_between()
-        .child(
-            h_flex()
-                .w_full()
-                .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(cap.label.clone()),
-                )
-                .when(face.marker, |this| {
-                    this.child(div().size_1p5().rounded_full().bg(accent))
-                }),
-        )
-        .child(
-            v_flex()
-                .w_full()
-                .gap_0p5()
-                .when_some(face.detail.clone(), |this, detail| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .truncate()
-                            .font_family(theme.mono_font_family.clone())
-                            .opacity(0.8)
-                            .child(detail),
-                    )
-                })
-                .when_some(face.fill, |this, fill| {
-                    this.child(
-                        div().w_full().h_0p5().rounded_sm().bg(theme.border).child(
-                            div()
-                                .h_full()
-                                .rounded_sm()
-                                .w(relative(fill.clamp(0.0, 1.0)))
-                                .bg(accent),
-                        ),
-                    )
-                }),
-        );
+    let is_locked = face.tone == KeyTone::Locked;
 
-    let tinted = matches!(face.tone, KeyTone::Picked | KeyTone::Done);
-    let Some(on_click) = on_click else {
-        return div()
-            .id((id_prefix, u64::from(key.value())))
-            .ml(rems(gap))
-            .w(rems(width))
-            .h_12()
-            .p_1()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(if tinted { accent } else { theme.border })
-            .bg(if tinted {
-                accent.opacity(0.18)
-            } else {
-                theme.background
-            })
-            .child(content)
-            .into_any_element();
-    };
-    Button::new((id_prefix, u64::from(key.value())))
-        .selected(face.tone == KeyTone::Selected)
-        .accessibility_label(label)
+    let top = h_flex()
+        .w_full()
+        .justify_between()
+        .gap_0p5()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .truncate()
+                .child(cap.label.clone()),
+        )
+        .when_some(face.badge, |this, badge| {
+            this.child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(rems(0.55))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child(badge),
+            )
+        })
+        .when(face.marker && face.badge.is_none(), |this| {
+            this.child(div().flex_shrink_0().size_1p5().rounded_full().bg(accent))
+        });
+
+    div()
+        .id((id_prefix, u64::from(cap.index.value())))
+        .aria_label(label)
+        .aria_selected(face.tone == KeyTone::Selected)
         .ml(rems(gap))
         .w(rems(width))
-        .h_12()
+        .h_11()
         .px_1()
-        .py_1()
-        .when(tinted, |this| {
-            this.border_color(accent).bg(accent.opacity(0.18))
+        .py_0p5()
+        .flex()
+        .flex_col()
+        .justify_between()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .when(is_locked, |this| this.opacity(0.55))
+        .when_some(on_click, |this, on_click| {
+            this.cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .on_click(on_click)
         })
-        .child(content)
-        .on_click(on_click)
+        .child(top)
+        .when_some(face.detail.clone(), |this, detail| {
+            this.child(
+                div()
+                    .text_size(rems(0.65))
+                    .truncate()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+        })
+        .when_some(face.fill, |this, fill| {
+            this.child(
+                div().w_full().h_0p5().rounded_sm().bg(theme.border).child(
+                    div()
+                        .h_full()
+                        .rounded_sm()
+                        .w(relative(fill.clamp(0.0, 1.0)))
+                        .bg(accent),
+                ),
+            )
+        })
+        .test_support()
         .into_any_element()
 }

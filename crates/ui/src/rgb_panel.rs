@@ -1,5 +1,6 @@
-//! Lighting editor: zone switcher, firmware preset grid, brightness / speed, full-color mode
-//! and a color editor (HSV sliders, RGB steppers, hex entry and a curated palette).
+//! Lighting editor in ATK HUB's three-column deck: zone switch and effect grid, effect
+//! settings (brightness, speed), and a color picker (saturation/value pad, hue strip,
+//! swatches, HEX or RGB entry, full-color mode).
 
 use agnoperiph_core::{
     Brightness, RgbColor, RgbDirection, RgbEffect, RgbEffectKind, RgbPresetInfo, RgbZoneId,
@@ -7,7 +8,7 @@ use agnoperiph_core::{
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, Theme,
-    button::{Button, ButtonGroup},
+    button::{Button, ButtonGroup, ButtonVariants},
     h_flex,
     input::{Input, InputEvent},
     slider::Slider,
@@ -17,25 +18,28 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, group, muted_note, readout, section};
+use crate::app::{AgnoPeriphApp, muted_note, section};
 use crate::backend::{DeviceSnapshot, RgbState, SettingChange};
 use crate::controls::{SliderRole, sync_input, sync_slider, to_units};
 
-/// Curated swatches: the spectrum at full saturation plus white and two warm/cool whites.
-const PALETTE: [(&str, RgbColor); 12] = [
+/// Swatch column from ATK HUB, read in pairs: the spectrum plus white.
+const SWATCHES: [(&str, RgbColor); 12] = [
     ("Red", RgbColor::new(255, 0, 0)),
+    ("Blue", RgbColor::new(0, 90, 255)),
     ("Orange", RgbColor::new(255, 110, 0)),
-    ("Amber", RgbColor::new(255, 180, 0)),
-    ("Yellow", RgbColor::new(255, 235, 0)),
+    ("Indigo", RgbColor::new(60, 40, 255)),
+    ("Yellow", RgbColor::new(255, 220, 0)),
+    ("Purple", RgbColor::new(140, 0, 255)),
     ("Lime", RgbColor::new(130, 255, 0)),
-    ("Green", RgbColor::new(0, 255, 60)),
-    ("Cyan", RgbColor::new(0, 230, 255)),
-    ("Blue", RgbColor::new(0, 70, 255)),
-    ("Violet", RgbColor::new(140, 0, 255)),
     ("Magenta", RgbColor::new(255, 0, 200)),
-    ("Warm white", RgbColor::new(255, 200, 140)),
+    ("Green", RgbColor::new(0, 255, 60)),
+    ("Pink", RgbColor::new(255, 90, 140)),
+    ("Teal", RgbColor::new(0, 200, 190)),
     ("White", RgbColor::new(255, 255, 255)),
 ];
+
+/// Effect buttons per row in the effect grid.
+const EFFECT_COLUMNS: usize = 3;
 
 const DEFAULT_SPEED: u8 = 128;
 
@@ -100,14 +104,31 @@ pub fn hex_to_rgb(text: &str) -> Option<RgbColor> {
     Some(RgbColor::new(r, g, b))
 }
 
+/// How the color entry row shows the color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ColorFormat {
+    #[default]
+    Hex,
+    Rgb,
+}
+
+/// Which part of the color picker a pointer drag is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerPart {
+    SaturationValue,
+    Hue,
+}
+
 /// Lighting edits that have not been written yet.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LightingUi {
     pub(crate) zone: RgbZoneId,
-    /// HSV while a color slider is dragged, so hue survives zero saturation.
+    /// HSV while the picker is dragged, so hue survives zero saturation.
     hsv: Option<(f32, f32, f32)>,
     brightness: Option<u8>,
     speed: Option<u8>,
+    pub(crate) format: ColorFormat,
+    pub(crate) drag: Option<PickerPart>,
 }
 
 impl Default for LightingUi {
@@ -117,6 +138,8 @@ impl Default for LightingUi {
             hsv: None,
             brightness: None,
             speed: None,
+            format: ColorFormat::default(),
+            drag: None,
         }
     }
 }
@@ -126,6 +149,7 @@ impl LightingUi {
         self.hsv = None;
         self.brightness = None;
         self.speed = None;
+        self.drag = None;
     }
 }
 
@@ -280,6 +304,7 @@ impl AgnoPeriphApp {
         if self.lighting.zone != zone {
             self.lighting = LightingUi {
                 zone,
+                format: self.lighting.format,
                 ..LightingUi::default()
             };
             self.request_sync(cx);
@@ -306,6 +331,51 @@ impl AgnoPeriphApp {
         let next = (i16::from(rgb[channel]) + delta).clamp(0, 255);
         rgb[channel] = u8::try_from(next).unwrap_or(rgb[channel]);
         self.set_zone_color(RgbColor::new(rgb[0], rgb[1], rgb[2]), cx);
+    }
+
+    fn set_color_format(&mut self, format: ColorFormat, cx: &mut Context<Self>) {
+        if self.lighting.format != format {
+            self.lighting.format = format;
+            self.request_sync(cx);
+            cx.notify();
+        }
+    }
+
+    /// Moves the draft color to the pointer position `(x, y)`, each `0..=1`, on `part`.
+    fn pick_hsv(&mut self, part: PickerPart, across: f32, down: f32, cx: &mut Context<Self>) {
+        let Some((_, state)) = self.active_zone() else {
+            return;
+        };
+        let current = effect_color(state.effect).unwrap_or(RgbColor::WHITE);
+        let (mut hue, mut saturation, mut value) =
+            self.lighting.hsv.unwrap_or_else(|| rgb_to_hsv(current));
+        match part {
+            PickerPart::SaturationValue => {
+                saturation = across;
+                value = 1.0 - down;
+            }
+            PickerPart::Hue => {
+                hue = (across * 360.0).min(359.0);
+                // Picking a hue on a grey or black color would show no change.
+                if saturation < 0.05 || value < 0.05 {
+                    saturation = 1.0;
+                    value = 1.0;
+                }
+            }
+        }
+        self.lighting.hsv = Some((hue, saturation, value));
+        cx.notify();
+    }
+
+    /// Writes the dragged color once, when the pointer is released.
+    fn commit_hsv(&mut self, cx: &mut Context<Self>) {
+        let Some((h, s, v)) = self.lighting.hsv else {
+            return;
+        };
+        self.set_zone_color(hsv_to_rgb(h, s, v), cx);
+        self.lighting.hsv = Some((h, s, v));
+        self.request_sync(cx);
+        cx.notify();
     }
 
     fn set_colorful(&mut self, colorful: bool, cx: &mut Context<Self>) {
@@ -365,21 +435,6 @@ pub(crate) fn on_slider(
                 }
             }
         }
-        SliderRole::Hue | SliderRole::Saturation | SliderRole::Value => {
-            let current = effect_color(state.effect).unwrap_or(RgbColor::WHITE);
-            let (mut h, mut s, mut v) = app.lighting.hsv.unwrap_or_else(|| rgb_to_hsv(current));
-            match role {
-                SliderRole::Hue => h = value,
-                SliderRole::Saturation => s = value / 100.0,
-                _ => v = value / 100.0,
-            }
-            app.lighting.hsv = Some((h, s, v));
-            if released {
-                let color = hsv_to_rgb(h, s, v);
-                app.set_zone_color(color, cx);
-                app.lighting.hsv = Some((h, s, v));
-            }
-        }
         _ => {}
     }
     cx.notify();
@@ -416,28 +471,31 @@ pub(crate) fn sync_controls(
         .speed
         .unwrap_or_else(|| effect_speed(state.effect));
     let color = effect_color(state.effect).unwrap_or(RgbColor::WHITE);
-    let (hue, saturation, value) = app.lighting.hsv.unwrap_or_else(|| rgb_to_hsv(color));
     let shown = app
         .lighting
         .hsv
         .map_or(color, |(h, s, v)| hsv_to_rgb(h, s, v));
-    let (brightness_slider, speed_slider, hue_slider, saturation_slider, value_slider, hex) = (
+    let (brightness_slider, speed_slider, hex) = (
         controls.brightness.clone(),
         controls.speed.clone(),
-        controls.hue.clone(),
-        controls.saturation.clone(),
-        controls.value.clone(),
         controls.hex.clone(),
     );
     sync_slider(&brightness_slider, f32::from(brightness), window, cx);
     sync_slider(&speed_slider, f32::from(speed), window, cx);
-    sync_slider(&hue_slider, hue, window, cx);
-    sync_slider(&saturation_slider, saturation * 100.0, window, cx);
-    sync_slider(&value_slider, value * 100.0, window, cx);
     let is_typing = hex.read(cx).focus_handle(cx).is_focused(window);
     if !is_typing {
         sync_input(&hex, &rgb_to_hex(shown), window, cx);
     }
+}
+
+/// What the zone's current effect lets the user change.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct ZoneSupport {
+    color: bool,
+    speed: bool,
+    colorful: bool,
+    is_colorful: bool,
 }
 
 pub(crate) fn render(
@@ -445,79 +503,62 @@ pub(crate) fn render(
     device: &DeviceSnapshot,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let base = section(
-        "rgb-panel",
-        "Lighting",
-        "Effects, brightness and color for each lighting zone.",
-        cx.theme(),
-    );
     let (Some(rgb), Some((info, state))) = (device.rgb.as_ref(), app.active_zone()) else {
-        return base.child(muted_note(
+        return section(
+            "rgb-panel",
+            "Lighting",
             "The lighting state couldn’t be read.",
             cx.theme(),
-        ));
+        );
     };
     let busy = app.is_busy();
-    let zone_buttons = rgb
-        .snapshot
-        .zones
-        .iter()
-        .map(|zone| {
-            let id = zone.zone;
-            let name = rgb
-                .capabilities
-                .zones
-                .iter()
-                .find(|z| z.id == id)
-                .map_or_else(|| format!("Zone {}", id.value()), |z| z.name.clone());
-            Button::new(("rgb-zone", u64::from(id.value())))
-                .label(name)
-                .selected(id == state.zone)
-                .on_click(cx.listener(move |this, _, _, cx| this.select_zone(id, cx)))
-        })
-        .collect::<Vec<_>>();
     let preset = app.preset_info();
-    let supports_color = preset.as_ref().map_or_else(
-        || effect_color(state.effect).is_some(),
-        |p| p.supports_color,
-    );
-    let supports_speed = preset.as_ref().map_or_else(
-        || !matches!(state.effect, RgbEffect::Off | RgbEffect::Static { .. }),
-        |p| p.supports_speed,
-    );
-    let supports_colorful = preset.as_ref().is_some_and(|p| p.supports_colorful);
-    let colorful = matches!(state.effect, RgbEffect::Preset { colorful: true, .. });
+    let support = ZoneSupport {
+        color: preset.as_ref().map_or_else(
+            || effect_color(state.effect).is_some(),
+            |p| p.supports_color,
+        ),
+        speed: preset.as_ref().map_or_else(
+            || !matches!(state.effect, RgbEffect::Off | RgbEffect::Static { .. }),
+            |p| p.supports_speed,
+        ),
+        colorful: preset.as_ref().is_some_and(|p| p.supports_colorful),
+        is_colorful: matches!(state.effect, RgbEffect::Preset { colorful: true, .. }),
+    };
 
     let effects = render_effects(app, &info, state, rgb, busy, cx);
-    let adjust = render_adjustments(
-        app,
-        state,
-        supports_speed,
-        supports_colorful,
-        colorful,
-        busy,
-        cx,
-    );
-    let color = (supports_color && !colorful).then(|| render_color(app, state, busy, cx));
+    let settings = render_lamp_settings(app, &info, state, support, busy, cx);
+    let color = render_color(app, state, support, busy, cx);
+    let theme = cx.theme();
+    let divider = || div().w_px().flex_shrink_0().bg(theme.border);
 
-    base.when(rgb.snapshot.zones.len() > 1, |this| {
-        this.child(
-            ButtonGroup::new("rgb-zones")
-                .outline()
-                .small()
-                .children(zone_buttons),
-        )
-    })
-    .child(effects)
-    .child(
-        h_flex()
-            .items_start()
-            .gap_6()
-            .child(adjust)
-            .when_some(color, gpui_kit::ParentElement::child),
+    h_flex()
+        .id("rgb-panel")
+        .items_stretch()
+        .gap_5()
+        .p_4()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.group_box)
+        .child(effects)
+        .child(divider())
+        .child(settings)
+        .child(divider())
+        .child(color)
+}
+
+fn column_title(title: impl Into<SharedString>, theme: &Theme) -> Div {
+    h_flex().gap_2().justify_between().min_h_7().child(
+        div()
+            .text_base()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.foreground)
+            .child(title.into()),
     )
 }
 
+/// Left column: zone switch and the effect grid, three equal columns like ATK HUB.
 fn render_effects(
     app: &AgnoPeriphApp,
     info: &RgbZoneInfo,
@@ -531,25 +572,41 @@ fn render_effects(
     let current_speed = effect_speed(state.effect);
     let current_colorful = matches!(state.effect, RgbEffect::Preset { colorful: true, .. });
     let brightness = state.brightness;
+
+    let effect_button = |id: SharedString,
+                         name: SharedString,
+                         is_current: bool,
+                         next: RgbEffect,
+                         cx: &mut Context<AgnoPeriphApp>| {
+        Button::new(id)
+            .outline()
+            .small()
+            .flex_1()
+            .min_w_0()
+            .selected(is_current)
+            .disabled(busy)
+            .tooltip(name.clone())
+            .child(div().min_w_0().truncate().child(name))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !is_current {
+                    this.write_zone(next, brightness, cx);
+                }
+            }))
+            .into_any_element()
+    };
+
     let buttons: Vec<AnyElement> = if info.presets.is_empty() {
         rgb.capabilities
             .supported_effects
             .iter()
             .map(|&kind| {
-                let next = effect_of_kind(kind, current_color, current_speed);
-                let is_current = state.effect.kind() == kind;
-                Button::new(SharedString::from(format!("rgb-{zone}-effect-{kind:?}")))
-                    .outline()
-                    .small()
-                    .label(effect_label(kind))
-                    .selected(is_current)
-                    .disabled(busy)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !is_current {
-                            this.write_zone(next, brightness, cx);
-                        }
-                    }))
-                    .into_any_element()
+                effect_button(
+                    format!("rgb-{zone}-effect-{kind:?}").into(),
+                    effect_label(kind).into(),
+                    state.effect.kind() == kind,
+                    effect_of_kind(kind, current_color, current_speed),
+                    cx,
+                )
             })
             .collect()
     } else {
@@ -572,29 +629,76 @@ fn render_effects(
                         colorful: current_colorful && preset.supports_colorful,
                     }
                 };
-                Button::new(SharedString::from(format!("rgb-{zone}-preset-{id}")))
-                    .outline()
-                    .small()
-                    .label(preset.name.clone())
-                    .selected(is_current)
-                    .disabled(busy)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !is_current {
-                            this.write_zone(next, brightness, cx);
-                        }
-                    }))
-                    .into_any_element()
+                effect_button(
+                    format!("rgb-{zone}-preset-{id}").into(),
+                    preset.name.clone().into(),
+                    is_current,
+                    next,
+                    cx,
+                )
             })
             .collect()
     };
+
+    let zone_buttons: Vec<Button> = rgb
+        .snapshot
+        .zones
+        .iter()
+        .map(|zone_state| {
+            let id = zone_state.zone;
+            let name = rgb
+                .capabilities
+                .zones
+                .iter()
+                .find(|z| z.id == id)
+                .map_or_else(|| format!("Zone {}", id.value()), |z| z.name.clone());
+            Button::new(("rgb-zone", u64::from(id.value())))
+                .label(name)
+                .selected(id == state.zone)
+                .on_click(cx.listener(move |this, _, _, cx| this.select_zone(id, cx)))
+        })
+        .collect();
+    let has_zones = zone_buttons.len() > 1;
+
+    let mut grid = v_flex().gap_1p5();
+    let mut buttons = buttons.into_iter().peekable();
+    while buttons.peek().is_some() {
+        let mut row = h_flex().gap_1p5();
+        for _ in 0..EFFECT_COLUMNS {
+            row = match buttons.next() {
+                Some(button) => row.child(button),
+                // Keeps the last row's buttons the same width as the rows above.
+                None => row.child(div().flex_1().min_w_0()),
+            };
+        }
+        grid = grid.child(row);
+    }
+
     let _ = app;
     let theme = cx.theme();
-    group(
-        ("rgb-effects", u64::from(zone)),
-        format!("{} effects", info.name),
-        theme,
-    )
-    .child(h_flex().flex_wrap().gap_2().children(buttons))
+    v_flex()
+        .id(("rgb-effects", u64::from(zone)))
+        .flex_basis(relative(0.38))
+        .flex_grow(1.)
+        .min_w_0()
+        .gap_3()
+        .child(if has_zones {
+            h_flex().min_h_7().child(
+                ButtonGroup::new("rgb-zones")
+                    .outline()
+                    .small()
+                    .children(zone_buttons),
+            )
+        } else {
+            column_title(info.name.clone(), theme)
+        })
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("Lighting effect mode"),
+        )
+        .child(grid)
 }
 
 fn labelled_slider(
@@ -609,13 +713,18 @@ fn labelled_slider(
         .child(
             h_flex()
                 .justify_between()
+                .child(div().text_sm().child(label))
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(label),
-                )
-                .child(readout(value, theme)),
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(if disabled {
+                            theme.muted_foreground
+                        } else {
+                            theme.foreground
+                        })
+                        .child(value),
+                ),
         )
         .when_some(slider, |this, slider| {
             this.child(
@@ -626,13 +735,13 @@ fn labelled_slider(
         })
 }
 
-#[allow(clippy::fn_params_excessive_bools)]
-fn render_adjustments(
+/// Middle column: brightness and speed, always in the same place so the layout never
+/// jumps between effects; unsupported controls are disabled with a reason.
+fn render_lamp_settings(
     app: &AgnoPeriphApp,
+    info: &RgbZoneInfo,
     state: RgbZoneState,
-    supports_speed: bool,
-    supports_colorful: bool,
-    colorful: bool,
+    support: ZoneSupport,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
@@ -645,11 +754,23 @@ fn render_adjustments(
         .lighting
         .speed
         .unwrap_or_else(|| effect_speed(state.effect));
+    let speed_pct = speed_percent(speed, info.max_speed);
     let is_off = matches!(state.effect, RgbEffect::Off);
+    let note = if is_off {
+        Some("Choose an effect to turn this zone on.")
+    } else if !support.speed {
+        Some("This effect runs at a fixed speed.")
+    } else {
+        None
+    };
     let theme = cx.theme();
-    group("rgb-adjust", "Adjust", theme)
-        .w_80()
-        .flex_shrink_0()
+    v_flex()
+        .id("rgb-adjust")
+        .flex_basis(relative(0.24))
+        .flex_grow(1.)
+        .min_w_48()
+        .gap_4()
+        .child(column_title("Lamp effect settings", theme))
         .child(labelled_slider(
             "Brightness",
             format!("{brightness}%"),
@@ -657,67 +778,60 @@ fn render_adjustments(
             busy || is_off,
             theme,
         ))
-        .when(supports_speed, |this| {
-            this.child(labelled_slider(
-                "Speed",
-                speed.to_string(),
-                controls.map(|c| c.speed.clone()),
-                busy,
-                theme,
-            ))
-        })
-        .when(supports_colorful, |this| {
-            this.child(
-                Switch::new("rgb-colorful")
-                    .label("Full color")
-                    .checked(colorful)
-                    .disabled(busy)
-                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                        this.set_colorful(*checked, cx);
-                    })),
-            )
-        })
-        .when(is_off, |this| {
-            this.child(muted_note(
-                "Choose an effect to turn this zone on.",
-                cx.theme(),
-            ))
-        })
+        .child(labelled_slider(
+            "Speed",
+            format!("{speed_pct}%"),
+            controls.map(|c| c.speed.clone()),
+            busy || !support.speed,
+            theme,
+        ))
+        .when_some(note, |this, note| this.child(muted_note(note, theme)))
 }
 
+/// Speed as a 0–100 % readout of the zone's own range. Firmware defaults can sit above a
+/// zone's maximum, so the result is clamped.
+fn speed_percent(speed: u8, max_speed: u8) -> u16 {
+    let max = u32::from(max_speed.max(1));
+    let pct = (u32::from(speed) * 100 + max / 2) / max;
+    u16::try_from(pct.min(100)).unwrap_or(100)
+}
+
+/// Right column: full-color switch, saturation/value pad with hue strip, swatches, and
+/// a HEX / RGB entry row.
+#[allow(clippy::too_many_lines)]
 fn render_color(
     app: &AgnoPeriphApp,
     state: RgbZoneState,
+    support: ZoneSupport,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let current = effect_color(state.effect).unwrap_or(RgbColor::WHITE);
+    let (h, s, v) = app.lighting.hsv.unwrap_or_else(|| rgb_to_hsv(current));
     let shown = app
         .lighting
         .hsv
         .map_or(current, |(h, s, v)| hsv_to_rgb(h, s, v));
-    let (h, s, v) = app.lighting.hsv.unwrap_or_else(|| rgb_to_hsv(current));
-    let controls = app.controls.as_ref();
-    let hue = controls.map(|c| c.hue.clone());
-    let saturation = controls.map(|c| c.saturation.clone());
-    let value = controls.map(|c| c.value.clone());
-    let hex = controls.map(|c| c.hex.clone());
+    let is_enabled = support.color && !support.is_colorful && !busy;
+    let hex = app.controls.as_ref().map(|c| c.hex.clone());
+    let format = app.lighting.format;
+    let entity = cx.entity().downgrade();
 
-    let swatches: Vec<AnyElement> = PALETTE
+    let swatches: Vec<AnyElement> = SWATCHES
         .iter()
         .map(|&(name, color)| {
             let theme = cx.theme();
             Button::new(SharedString::from(format!("rgb-swatch-{name}")))
                 .outline()
-                .small()
+                .xsmall()
                 .compact()
                 .selected(color == current)
-                .disabled(busy)
+                .disabled(!is_enabled)
                 .accessibility_label(format!("{name} {}", rgb_to_hex(color)))
                 .tooltip(name)
                 .child(
                     div()
-                        .size_5()
+                        .size_4()
                         .rounded(theme.radius)
                         .border_1()
                         .border_color(theme.border)
@@ -727,128 +841,335 @@ fn render_color(
                 .into_any_element()
         })
         .collect();
+    let mut swatch_grid = v_flex().flex_shrink_0().gap_1();
+    let mut swatches = swatches.into_iter();
+    while let Some(first) = swatches.next() {
+        swatch_grid = swatch_grid.child(h_flex().gap_1().child(first).children(swatches.next()));
+    }
 
-    let channels: Vec<AnyElement> = [("R", 0usize, shown.r), ("G", 1, shown.g), ("B", 2, shown.b)]
-        .into_iter()
-        .map(|(label, channel, level)| {
-            let theme = cx.theme();
-            h_flex()
-                .gap_1()
-                .child(
+    let format_toggle = ButtonGroup::new("rgb-format")
+        .outline()
+        .xsmall()
+        .child(
+            Button::new("rgb-format-hex")
+                .label("HEX")
+                .selected(format == ColorFormat::Hex)
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.set_color_format(ColorFormat::Hex, cx)),
+                ),
+        )
+        .child(
+            Button::new("rgb-format-rgb")
+                .label("RGB")
+                .selected(format == ColorFormat::Rgb)
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.set_color_format(ColorFormat::Rgb, cx)),
+                ),
+        );
+
+    let entry: AnyElement = match format {
+        ColorFormat::Hex => h_flex()
+            .gap_2()
+            .flex_1()
+            .min_w_0()
+            .when_some(hex, |this, hex| {
+                this.child(
                     div()
-                        .w_4()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(label),
+                        .w_32()
+                        .child(Input::new(&hex).small().disabled(!is_enabled)),
                 )
-                .child(
-                    Button::new(("rgb-channel-dec", channel))
-                        .outline()
-                        .xsmall()
-                        .label("−")
-                        .accessibility_label(format!("Decrease {label}"))
-                        .disabled(busy || level == 0)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.step_channel(channel, -5, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .w_10()
-                        .text_sm()
-                        .text_center()
-                        .font_family(theme.mono_font_family.clone())
-                        .child(level.to_string()),
-                )
-                .child(
-                    Button::new(("rgb-channel-inc", channel))
-                        .outline()
-                        .xsmall()
-                        .label("+")
-                        .accessibility_label(format!("Increase {label}"))
-                        .disabled(busy || level == 255)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.step_channel(channel, 5, cx);
-                        })),
-                )
-                .into_any_element()
-        })
-        .collect();
+            })
+            .into_any_element(),
+        ColorFormat::Rgb => h_flex()
+            .gap_3()
+            .flex_1()
+            .min_w_0()
+            .children(
+                [("R", 0usize, shown.r), ("G", 1, shown.g), ("B", 2, shown.b)]
+                    .into_iter()
+                    .map(|(label, channel, level)| {
+                        channel_stepper(label, channel, level, is_enabled, cx)
+                    }),
+            )
+            .into_any_element(),
+    };
 
     let theme = cx.theme();
-    // The hue track is the LED spectrum itself; its stops are data, not theme colors.
-    let spectrum = h_flex()
-        .h_1p5()
+    let thumb = |theme: &Theme| {
+        div()
+            .absolute()
+            .size_3()
+            .rounded_full()
+            .border_2()
+            .border_color(theme.background)
+            .shadow_sm()
+    };
+    let pure_hue = swatch_color(hsv_to_rgb(h, 1.0, 1.0));
+    let white = gpui_kit::white();
+    let black = gpui_kit::black();
+    // The pad and strip draw LED color space itself: their colors are data, not theme.
+    let pad = div()
+        .id("rgb-sv-pad")
+        .relative()
         .w_full()
+        .h_32()
         .rounded(theme.radius)
-        .overflow_hidden()
-        .children((0..12).map(|step| {
-            div().flex_1().h_full().bg(swatch_color(hsv_to_rgb(
-                f32::from(u8::try_from(step).unwrap_or(0)) * 30.0,
-                1.0,
-                1.0,
-            )))
-        }));
-    group("rgb-color", "Color", theme)
-        .flex_1()
-        .min_w_0()
+        .border_1()
+        .border_color(theme.border)
+        .bg(pure_hue)
+        .when(is_enabled, Styled::cursor_crosshair)
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(theme.radius)
+                .bg(linear_gradient(
+                    90.,
+                    linear_color_stop(white, 0.),
+                    linear_color_stop(white.opacity(0.), 1.),
+                )),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded(theme.radius)
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(black.opacity(0.), 0.),
+                    linear_color_stop(black, 1.),
+                )),
+        )
+        .child(
+            thumb(theme)
+                .left(relative(s.clamp(0.0, 1.0)))
+                .top(relative((1.0 - v).clamp(0.0, 1.0)))
+                .ml(rems(-0.375))
+                .mt(rems(-0.375))
+                .bg(swatch_color(shown)),
+        )
+        .child(picker_surface(
+            PickerPart::SaturationValue,
+            is_enabled,
+            entity.clone(),
+        ))
+        .test_support();
+
+    let strip = div()
+        .id("rgb-hue-strip")
+        .relative()
+        .w_full()
+        .h_3()
+        .rounded_full()
+        .when(is_enabled, Styled::cursor_crosshair)
         .child(
             h_flex()
-                .gap_4()
+                .size_full()
+                .rounded_full()
+                .overflow_hidden()
+                .children((0..6u8).map(|segment| {
+                    let from = f32::from(segment) * 60.0;
+                    div().flex_1().h_full().bg(linear_gradient(
+                        90.,
+                        linear_color_stop(swatch_color(hsv_to_rgb(from, 1.0, 1.0)), 0.),
+                        linear_color_stop(swatch_color(hsv_to_rgb(from + 60.0, 1.0, 1.0)), 1.),
+                    ))
+                })),
+        )
+        .child(
+            thumb(theme)
+                .top_0()
+                .left(relative((h / 360.0).clamp(0.0, 1.0)))
+                .ml(rems(-0.375))
+                .bg(pure_hue),
+        )
+        .child(picker_surface(PickerPart::Hue, is_enabled, entity))
+        .test_support();
+
+    let reason = if support.is_colorful {
+        Some("Full color mode cycles the spectrum, so a single color isn’t used.")
+    } else if !support.color {
+        Some("This effect sets its own colors.")
+    } else {
+        None
+    };
+
+    v_flex()
+        .id("rgb-color")
+        .flex_basis(relative(0.38))
+        .flex_grow(1.)
+        .min_w_72()
+        .gap_3()
+        .child(
+            column_title("Color settings", theme).child(
+                Switch::new("rgb-colorful")
+                    .label("Full color mode")
+                    .checked(support.is_colorful)
+                    .disabled(busy || !support.colorful)
+                    .tooltip(if support.colorful {
+                        "Cycle through every color instead of one"
+                    } else {
+                        "This effect has no full color mode"
+                    })
+                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_colorful(*checked, cx);
+                    })),
+            ),
+        )
+        .child(
+            h_flex()
                 .items_start()
-                .child(
-                    div()
-                        .id("rgb-preview")
-                        .size_16()
-                        .flex_shrink_0()
-                        .rounded(theme.radius_lg)
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(swatch_color(shown)),
-                )
+                .gap_4()
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .child(labelled_slider(
-                                    "Hue",
-                                    format!("{}°", to_units(h)),
-                                    hue,
-                                    busy,
-                                    theme,
-                                ))
-                                .child(spectrum),
-                        )
-                        .child(labelled_slider(
-                            "Saturation",
-                            format!("{}%", to_units(s * 100.0)),
-                            saturation,
-                            busy,
-                            theme,
-                        ))
-                        .child(labelled_slider(
-                            "Brightness of color",
-                            format!("{}%", to_units(v * 100.0)),
-                            value,
-                            busy,
-                            theme,
-                        )),
-                ),
+                        .gap_2p5()
+                        .when(!is_enabled, |this| this.opacity(0.45))
+                        .child(pad)
+                        .child(strip),
+                )
+                .child(swatch_grid),
         )
+        // Toggle and preview on one line, the entry below: R/G/B steppers need the
+        // column's full width at the default window size.
         .child(
             h_flex()
-                .gap_4()
-                .flex_wrap()
-                .child(h_flex().gap_3().children(channels))
-                .when_some(hex, |this, hex| {
-                    this.child(div().w_32().child(Input::new(&hex).small().disabled(busy)))
-                }),
+                .gap_3()
+                .justify_between()
+                .child(format_toggle)
+                .child(
+                    div()
+                        .id("rgb-preview")
+                        .flex_shrink_0()
+                        .size_6()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(swatch_color(shown))
+                        .test_support(),
+                ),
         )
-        .child(h_flex().flex_wrap().gap_1().children(swatches))
+        .child(entry)
+        .when_some(reason, |this, reason| this.child(muted_note(reason, theme)))
+}
+
+fn channel_stepper(
+    label: &'static str,
+    channel: usize,
+    level: u8,
+    is_enabled: bool,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> AnyElement {
+    let theme = cx.theme();
+    h_flex()
+        .gap_0p5()
+        .child(
+            div()
+                .w_3()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(
+            Button::new(("rgb-channel-dec", channel))
+                .ghost()
+                .xsmall()
+                .label("−")
+                .accessibility_label(format!("Decrease {label}"))
+                .disabled(!is_enabled || level == 0)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.step_channel(channel, -5, cx);
+                })),
+        )
+        .child(
+            div()
+                .w_8()
+                .text_sm()
+                .text_center()
+                .font_family(cx.theme().mono_font_family.clone())
+                .child(level.to_string()),
+        )
+        .child(
+            Button::new(("rgb-channel-inc", channel))
+                .ghost()
+                .xsmall()
+                .label("+")
+                .accessibility_label(format!("Increase {label}"))
+                .disabled(!is_enabled || level == 255)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.step_channel(channel, 5, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+/// Pointer surface over a picker part. Window-level listeners keep a drag alive when the
+/// pointer leaves the part; a press only starts one on this part's own unoccluded hitbox.
+fn picker_surface(
+    part: PickerPart,
+    is_enabled: bool,
+    app: WeakEntity<AgnoPeriphApp>,
+) -> impl IntoElement {
+    canvas(
+        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |bounds, hitbox, window, _| {
+            let fraction = move |position: Point<Pixels>| {
+                let x = ((position.x - bounds.left()) / bounds.size.width).clamp(0.0, 1.0);
+                let y = ((position.y - bounds.top()) / bounds.size.height).clamp(0.0, 1.0);
+                (x, y)
+            };
+            if is_enabled {
+                let app_down = app.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Bubble
+                        && event.button == MouseButton::Left
+                        && hitbox.is_hovered(window)
+                    {
+                        let (x, y) = fraction(event.position);
+                        let _ = app_down.update(cx, |this, cx| {
+                            this.lighting.drag = Some(part);
+                            this.pick_hsv(part, x, y, cx);
+                        });
+                    }
+                });
+            }
+            let app_move = app.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let is_pressed = event.pressed_button == Some(MouseButton::Left);
+                let (x, y) = fraction(event.position);
+                let _ = app_move.update(cx, |this, cx| {
+                    if this.lighting.drag != Some(part) {
+                        return;
+                    }
+                    if is_pressed {
+                        this.pick_hsv(part, x, y, cx);
+                    } else {
+                        // The release happened where this window couldn't see it.
+                        this.lighting.drag = None;
+                        this.commit_hsv(cx);
+                    }
+                });
+            });
+            let app_up = app.clone();
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let _ = app_up.update(cx, |this, cx| {
+                    if this.lighting.drag == Some(part) {
+                        this.lighting.drag = None;
+                        this.commit_hsv(cx);
+                    }
+                });
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
 }
 
 #[cfg(test)]

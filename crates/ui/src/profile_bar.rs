@@ -8,12 +8,12 @@ use agnoperiph_core::{DeviceId, ProfileSlot};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable, WindowExt,
     button::{Button, ButtonGroup, ButtonVariant, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, mm, muted_note};
+use crate::app::{AgnoPeriphApp, mm};
 use crate::backend::{ActuationTarget, DeviceSnapshot, SettingChange};
 use crate::game_profiles::SavedKeyboardPreset;
 
@@ -266,53 +266,56 @@ pub(crate) fn render(
         "Preset"
     };
 
-    v_flex()
+    h_flex()
         .id("profile-bar")
         .gap_2()
+        .flex_wrap()
         .child(
-            h_flex()
-                .gap_3()
-                .flex_wrap()
-                .child(
-                    div()
-                        .w_24()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(caption),
-                )
-                .child(
-                    ButtonGroup::new(SharedString::from(format!("{prefix}-slots")))
-                        .outline()
-                        .small()
-                        .children(buttons),
-                )
-                .child(
-                    Button::new("rename-preset")
-                        .ghost()
-                        .small()
-                        .label("Rename…")
-                        .disabled(busy)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_rename_preset(rename_device.clone(), active, window, cx);
-                        })),
-                )
-                .when(hardware.is_none(), |this| {
-                    this.child(
-                        Button::new("save-preset")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Check)
-                            .label("Save current settings")
-                            .disabled(busy)
-                            .tooltip("Store the keyboard’s current dead zones, lighting, advanced settings and (when uniform) actuation in this preset")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.save_current_to_preset(&save_device, cx);
-                            })),
-                    )
-                }),
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(caption),
         )
+        .child(
+            ButtonGroup::new(SharedString::from(format!("{prefix}-slots")))
+                .outline()
+                .small()
+                .children(buttons),
+        )
+        .child(
+            Button::new("rename-preset")
+                .ghost()
+                .small()
+                .label("Rename…")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_rename_preset(rename_device.clone(), active, window, cx);
+                })),
+        )
+        .when(hardware.is_none(), |this| {
+            this.child(
+                Button::new("save-preset")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Check)
+                    .label("Save current settings")
+                    .disabled(busy)
+                    .tooltip("Store the keyboard’s current dead zones, lighting, advanced settings and (when uniform) actuation in this preset")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.save_current_to_preset(&save_device, cx);
+                    })),
+            )
+        })
         .when_some(saved, |this, saved| {
-            this.child(h_flex().gap_3().child(div().w_24()).child(muted_note(saved, theme)))
+            this.child(
+                div()
+                    .flex_1()
+                    .min_w_40()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .truncate()
+                    .child(saved),
+            )
         })
         .into_any_element()
 }

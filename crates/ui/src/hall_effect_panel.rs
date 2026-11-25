@@ -1,7 +1,7 @@
 //! Triggers & paired keys: per-key actuation and Rapid Trigger with multi-key selection,
 //! keyboard-wide dead zones, and the paired / advanced key functions (RS, SOCD, DKS, MT, TGL).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use agnoperiph_core::{
     DksBinding, DksStageAction, DksTriggerDirection, KeyCode, KeyIndex, ModTapBinding,
@@ -160,6 +160,8 @@ pub(crate) struct PairedKeysUi {
     pub(crate) primary_usage: u8,
     pub(crate) secondary_usage: u8,
     pub(crate) delay_ms: u16,
+    /// Why the last key click was refused, shown next to the pick buttons.
+    pub(crate) conflict: Option<SharedString>,
 }
 
 impl Default for PairedKeysUi {
@@ -195,6 +197,7 @@ impl Default for PairedKeysUi {
             primary_usage: 0x2C,
             secondary_usage: 0xE1,
             delay_ms: 200,
+            conflict: None,
         }
     }
 }
@@ -222,10 +225,12 @@ impl PairedKeysUi {
 
     pub(crate) fn cancel_pick(&mut self) {
         self.pick = None;
+        self.conflict = None;
     }
 
     fn reset_flow(&mut self) {
         self.pick = None;
+        self.conflict = None;
         self.first = None;
         self.second = None;
     }
@@ -554,6 +559,7 @@ impl AgnoPeriphApp {
 
     fn start_pick(&mut self, target: PickTarget, cx: &mut Context<Self>) {
         self.paired.pick = Some(target);
+        self.paired.conflict = None;
         cx.notify();
     }
 
@@ -571,6 +577,16 @@ impl AgnoPeriphApp {
         let Some(first) = ui.first else {
             return;
         };
+        if let Some(device) = self.selected_device() {
+            let occupied = crate::backend::occupied_advanced_keys(device);
+            if [Some(first), ui.second]
+                .into_iter()
+                .flatten()
+                .any(|key| occupied.contains_key(&key))
+            {
+                return;
+            }
+        }
         let changes = match ui.mode {
             PairedMode::RapidSwitch => {
                 let Some(second) = ui.second else {
@@ -802,30 +818,28 @@ pub(crate) fn render(
         );
     };
     let layout = KeyLayout::for_device(&device.info, &he.capabilities);
-    let base = section(
-        "hall-effect-panel",
-        "Triggers",
-        "Select keys on the map, then tune when they actuate. Ctrl- or Shift-click to select several.",
-        cx.theme(),
-    );
+    let occupied = crate::backend::occupied_advanced_keys(device);
     let has_paired = he.capabilities.has_socd() || he.capabilities.has_dks();
 
-    base.child(render_selection_toolbar(app, &layout, cx))
-        .child(render_matrix(app, he, &layout, cx))
+    v_flex()
+        .id("hall-effect-panel")
+        .gap_4()
         .child(
             h_flex()
                 .items_start()
-                .gap_6()
-                .child(render_gauge(app, he, cx))
-                .child(render_key_editor(app, he, &layout, cx))
-                .child(render_deadzones(app, cx)),
+                .gap_4()
+                .child(render_matrix(app, he, &layout, &occupied, cx))
+                .child(render_selection_rail(app, &layout, cx)),
         )
+        .child(render_deck(app, he, &layout, cx))
         .when(has_paired, |this| {
-            this.child(render_paired(app, he, &layout, cx))
+            this.child(render_paired(app, he, &layout, &occupied, cx))
         })
 }
 
-fn render_selection_toolbar(
+/// Selection commands beside the matrix, as in ATK HUB: what is selected, then the
+/// bulk selection tools, then the one command that writes.
+fn render_selection_rail(
     app: &AgnoPeriphApp,
     layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
@@ -838,19 +852,26 @@ fn render_selection_toolbar(
         n => format!("{n} keys selected").into(),
     };
     let theme = cx.theme();
-    h_flex()
-        .gap_2()
+    v_flex()
+        .id("selection-rail")
+        .flex_1()
+        .min_w_32()
+        .max_w_48()
+        .gap_1()
         .child(
             div()
-                .flex_1()
                 .text_sm()
-                .font_weight(FontWeight::MEDIUM)
+                .font_weight(FontWeight::SEMIBOLD)
                 .child(summary),
         )
+        .child(muted_note("Click keys to select or deselect them.", theme))
+        .child(div().h_2())
         .child(
             Button::new("select-all-keys")
                 .ghost()
                 .small()
+                .w_full()
+                .justify_start()
                 .label("Select all")
                 .on_click(cx.listener(|this, _, _, cx| this.select_all_keys(cx))),
         )
@@ -858,6 +879,8 @@ fn render_selection_toolbar(
             Button::new("invert-keys")
                 .ghost()
                 .small()
+                .w_full()
+                .justify_start()
                 .label("Invert")
                 .on_click(cx.listener(|this, _, _, cx| this.invert_key_selection(cx))),
         )
@@ -865,15 +888,18 @@ fn render_selection_toolbar(
             Button::new("clear-keys")
                 .ghost()
                 .small()
-                .label("Clear")
+                .w_full()
+                .justify_start()
+                .label("Clear selection")
                 .disabled(count == 0)
                 .on_click(cx.listener(|this, _, _, cx| this.clear_key_selection(cx))),
         )
-        .child(div().w_px().h_5().bg(theme.border))
+        .child(div().my_2().h_px().w_full().bg(theme.border))
         .child(
             Button::new("restore-default-keys")
                 .outline()
                 .small()
+                .w_full()
                 .label("Restore default")
                 .tooltip(format!(
                     "Set the selected keys to {} mm with Rapid Trigger off",
@@ -887,38 +913,38 @@ fn render_selection_toolbar(
 fn trigger_select(
     app: &mut AgnoPeriphApp,
     key: KeyIndex,
-    extend: bool,
+    _extend: bool,
     _: &mut Window,
     cx: &mut Context<AgnoPeriphApp>,
 ) {
-    app.select_key(key, extend, cx);
+    app.toggle_key(key, cx);
 }
 
 fn render_matrix(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
     layout: &KeyLayout,
+    occupied: &BTreeMap<KeyIndex, &'static str>,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let max = f32::from(he.capabilities.actuation_max.as_hundredths().max(1));
-    let selected = app.selected_keys().clone();
-    let paired = app.paired.clone();
-    let rt_count = he
-        .snapshot
-        .keys
-        .iter()
-        .filter(|k| k.rapid_trigger.is_enabled())
-        .count();
-    let keys = he.snapshot.keys.clone();
+    let selected = app.selected_keys();
+    let paired = &app.paired;
+    let picking = paired.pick.is_some();
+    let keys = &he.snapshot.keys;
+    let rt_count = keys.iter().filter(|k| k.rapid_trigger.is_enabled()).count();
     let matrix = key_matrix::render(
         "key-matrix",
         "key",
         layout,
         |cap| {
             let config = keys.iter().find(|k| k.key == cap.index);
+            let owner = occupied.get(&cap.index).copied();
             let tone = if paired.is_picked(cap.index) {
                 KeyTone::Picked
-            } else if selected.contains(&cap.index) {
+            } else if picking && owner.is_some() {
+                KeyTone::Locked
+            } else if !picking && selected.contains(&cap.index) {
                 KeyTone::Selected
             } else {
                 KeyTone::Normal
@@ -927,6 +953,7 @@ fn render_matrix(
                 detail: Some(config.map_or_else(|| "–".into(), |c| mm(c.actuation).into())),
                 fill: Some(config.map_or(0.0, |c| f32::from(c.actuation.as_hundredths()) / max)),
                 marker: config.is_some_and(|c| c.rapid_trigger.is_enabled()),
+                badge: owner,
                 tone,
             }
         },
@@ -934,35 +961,39 @@ fn render_matrix(
         cx,
     );
     let theme = cx.theme();
-    let picking = app.paired.pick.is_some();
-    v_flex().gap_2().child(matrix).child(
+    v_flex().flex_shrink_0().gap_1p5().child(matrix).child(
         h_flex()
             .gap_4()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(div().w_4().h_1().rounded_sm().bg(theme.primary))
-                    .child("Bar length shows actuation depth"),
-            )
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(div().size_1p5().rounded_full().bg(theme.primary))
-                    .child(format!("Rapid Trigger on {rt_count} keys")),
-            )
+            .when(!picking, |this| {
+                this.child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(div().w_4().h_1().rounded_sm().bg(theme.primary))
+                        .child("Bar shows actuation depth"),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(div().size_1p5().rounded_full().bg(theme.primary))
+                        .child(format!("Rapid Trigger on {rt_count} keys")),
+                )
+            })
             .when(picking, |this| {
                 this.child(
                     div()
+                        .id("paired-pick-hint")
                         .text_color(theme.warning)
-                        .child("Click a key to pick it for the paired function"),
+                        .child("Click a key to pick it. Dimmed keys already belong to another function.")
+                        .test_support(),
                 )
             }),
     )
 }
 
-/// Vertical travel gauge: the signature view of where the selected key actuates.
+/// Vertical travel gauge: where the primary key actuates, its Rapid Trigger band and
+/// the keyboard's dead zones, read top (rest) to bottom (bottomed out).
 fn render_gauge(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
@@ -989,7 +1020,7 @@ fn render_gauge(
 
     v_flex()
         .id("travel-gauge")
-        .w_32()
+        .w_24()
         .flex_shrink_0()
         .gap_2()
         .child(
@@ -1002,7 +1033,7 @@ fn render_gauge(
             h_flex()
                 .items_stretch()
                 .gap_2()
-                .h_64()
+                .h_40()
                 .child(
                     v_flex()
                         .justify_between()
@@ -1015,7 +1046,7 @@ fn render_gauge(
                 .child(
                     div()
                         .relative()
-                        .w_6()
+                        .w_5()
                         .h_full()
                         .rounded(theme.radius)
                         .border_1()
@@ -1072,28 +1103,24 @@ fn render_gauge(
                 ),
         )
         .child(
-            v_flex()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .font_family(theme.mono_font_family.clone())
-                        .child(format!("{} mm", mm(actuation))),
-                )
-                .child(muted_note(
-                    if rt.is_enabled() {
-                        format!(
-                            "Rapid Trigger ↓{} ↑{}",
-                            mm(rt.press_sensitivity),
-                            mm(rt.release_sensitivity)
-                        )
-                    } else {
-                        "Rapid Trigger off".to_owned()
-                    },
-                    theme,
-                )),
+            div()
+                .text_base()
+                .font_weight(FontWeight::SEMIBOLD)
+                .font_family(theme.mono_font_family.clone())
+                .child(format!("{} mm", mm(actuation))),
         )
+        .child(muted_note(
+            if rt.is_enabled() {
+                format!(
+                    "RT ↓{} ↑{}",
+                    mm(rt.press_sensitivity),
+                    mm(rt.release_sensitivity)
+                )
+            } else {
+                "Rapid Trigger off".to_owned()
+            },
+            theme,
+        ))
 }
 
 fn stepper<F>(
@@ -1107,6 +1134,7 @@ where
     F: Fn(&mut AgnoPeriphApp, i32, &mut Context<AgnoPeriphApp>) + Copy + 'static,
 {
     h_flex()
+        .flex_shrink_0()
         .gap_1()
         .child(
             Button::new(SharedString::from(format!("{prefix}-dec")))
@@ -1137,13 +1165,16 @@ fn slider_row(
     theme: &Theme,
 ) -> impl IntoElement {
     v_flex()
-        .gap_1p5()
+        .gap_1()
+        .min_w_0()
         .child(
             h_flex()
                 .justify_between()
-                .gap_3()
+                .gap_2()
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(label),
@@ -1159,184 +1190,91 @@ fn slider_row(
         })
 }
 
-fn render_key_editor(
+/// Column title with room for a trailing control, shared by the deck's columns.
+fn deck_title(title: impl Into<SharedString>, theme: &Theme) -> Div {
+    h_flex().gap_2().justify_between().min_h_6().child(
+        div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.foreground)
+            .child(title.into()),
+    )
+}
+
+/// The bottom deck from ATK HUB: gauge, travel + dead zones, Rapid Trigger.
+/// One surface with hairline dividers instead of nested cards.
+fn render_deck(
+    app: &AgnoPeriphApp,
+    he: &HallEffectState,
+    layout: &KeyLayout,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> impl IntoElement + use<> {
+    let gauge = render_gauge(app, he, cx);
+    let travel = render_travel_column(app, he, layout, cx);
+    let rapid = he
+        .capabilities
+        .has_rapid_trigger()
+        .then(|| render_rapid_trigger_column(app, cx));
+    let theme = cx.theme();
+    let divider = || div().w_px().flex_shrink_0().bg(theme.border);
+    h_flex()
+        .id("trigger-deck")
+        .items_stretch()
+        .gap_4()
+        .p_4()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.group_box)
+        .child(gauge)
+        .child(divider())
+        .child(travel)
+        .when_some(rapid, |this, rapid| this.child(divider()).child(rapid))
+}
+
+fn render_travel_column(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
     layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let count = app.selected_keys().len();
-    let Some((actuation, rapid_trigger)) = app.key_values().filter(|_| count > 0) else {
-        return v_flex()
-            .flex_1()
-            .min_w_0()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child("Select one or more keys on the map to tune them.");
-    };
     let busy = app.is_busy();
-    let has_draft = app.key_draft != crate::app::KeyDraft::default();
-    let caps = he.capabilities.clone();
-    let target: SharedString = if count == 1 {
-        format!("{} key", layout.label(app.selected_key())).into()
-    } else {
-        format!("{count} keys, showing {}", layout.label(app.selected_key())).into()
-    };
+    let locked = busy || count == 0;
+    let (actuation, _) = app.key_values().unwrap_or((
+        he.capabilities.actuation_min,
+        RapidTriggerConfig::disabled(),
+    ));
+    let caps = &he.capabilities;
+    let range_note = format!(
+        "{}–{} mm, {} mm steps",
+        mm(caps.actuation_min),
+        mm(caps.actuation_max),
+        mm(caps.actuation_step)
+    );
     let controls = app.controls.as_ref();
     let travel_slider = controls.map(|c| c.travel.clone());
-    let press_slider = controls.map(|c| c.rt_press.clone());
-    let release_slider = controls.map(|c| c.rt_release.clone());
+    let top_slider = controls.map(|c| c.deadzone_top.clone());
+    let bottom_slider = controls.map(|c| c.deadzone_bottom.clone());
+    let (top, bottom) = app.deadzone_values().unwrap_or((t(0), t(0)));
+    let has_deadzone_draft = app.deadzone_draft != crate::app::DeadzoneDraft::default();
+    let target: SharedString = match count {
+        0 => "Trigger travel".into(),
+        1 => format!("Trigger travel: {}", layout.label(app.selected_key())).into(),
+        n => format!("Trigger travel: {n} keys").into(),
+    };
+    let apply_label = match count {
+        0 | 1 => "Apply to key".to_owned(),
+        n => format!("Apply to {n} keys"),
+    };
 
     let actuation_stepper = stepper(
         "actuation",
         actuation,
-        busy,
+        locked,
         AgnoPeriphApp::step_actuation,
         cx,
     );
-    let rt_enabled = rapid_trigger.is_enabled();
-    let press = stepper(
-        "press-sensitivity",
-        rapid_trigger.press_sensitivity,
-        busy || !rt_enabled,
-        |this, direction, cx| this.step_sensitivity(true, direction, cx),
-        cx,
-    );
-    let release = stepper(
-        "release-sensitivity",
-        rapid_trigger.release_sensitivity,
-        busy || !rt_enabled,
-        |this, direction, cx| this.step_sensitivity(false, direction, cx),
-        cx,
-    );
-    let apply_label = if count == 1 {
-        "Apply to key".to_owned()
-    } else {
-        format!("Apply to {count} keys")
-    };
-    let theme = cx.theme();
-
-    v_flex()
-        .flex_1()
-        .min_w_64()
-        .gap_4()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(target),
-        )
-        .child(
-            group("trigger-travel", "Trigger travel", theme)
-                .child(slider_row(
-                    "Actuation point",
-                    travel_slider,
-                    actuation_stepper,
-                    busy,
-                    theme,
-                ))
-                .child(muted_note(
-                    format!(
-                        "{} to {} mm in steps of {} mm",
-                        mm(caps.actuation_min),
-                        mm(caps.actuation_max),
-                        mm(caps.actuation_step)
-                    ),
-                    theme,
-                ))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("apply-actuation-key")
-                                .primary()
-                                .small()
-                                .label(apply_label.clone())
-                                .loading(busy)
-                                .disabled(app.key_draft.actuation.is_none())
-                                .on_click(cx.listener(|this, _, _, cx| this.apply_actuation(cx))),
-                        )
-                        .child(
-                            Button::new("apply-actuation-all")
-                                .outline()
-                                .small()
-                                .label("Apply to all keys")
-                                .disabled(busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.request_global_actuation(window, cx);
-                                })),
-                        ),
-                ),
-        )
-        .when(caps.has_rapid_trigger(), |this| {
-            this.child(
-                group("rapid-trigger-group", "Rapid Trigger", cx.theme())
-                    .child(
-                        Switch::new("rapid-trigger")
-                            .label("Re-trigger on direction change")
-                            .checked(rt_enabled)
-                            .disabled(busy)
-                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                this.set_rapid_trigger_enabled(*checked, cx);
-                            })),
-                    )
-                    .child(slider_row(
-                        "Press sensitivity",
-                        press_slider,
-                        press,
-                        busy || !rt_enabled,
-                        cx.theme(),
-                    ))
-                    .child(slider_row(
-                        "Lift sensitivity",
-                        release_slider,
-                        release,
-                        busy || !rt_enabled,
-                        cx.theme(),
-                    ))
-                    .child(
-                        h_flex().child(
-                            Button::new("apply-rapid-trigger")
-                                .primary()
-                                .small()
-                                .label(if count == 1 {
-                                    "Apply Rapid Trigger".to_owned()
-                                } else {
-                                    format!("Apply Rapid Trigger to {count} keys")
-                                })
-                                .loading(busy)
-                                .disabled(app.key_draft.rapid_trigger.is_none())
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.apply_rapid_trigger(cx)),
-                                ),
-                        ),
-                    ),
-            )
-        })
-        .when(has_draft, |this| {
-            this.child(
-                h_flex().child(
-                    Button::new("discard-key-draft")
-                        .ghost()
-                        .small()
-                        .label("Discard edits")
-                        .disabled(busy)
-                        .on_click(cx.listener(|this, _, _, cx| this.discard_key_draft(cx))),
-                ),
-            )
-        })
-}
-
-fn render_deadzones(
-    app: &AgnoPeriphApp,
-    cx: &mut Context<AgnoPeriphApp>,
-) -> impl IntoElement + use<> {
-    let busy = app.is_busy();
-    let (top, bottom) = app.deadzone_values().unwrap_or((t(0), t(0)));
-    let controls = app.controls.as_ref();
-    let top_slider = controls.map(|c| c.deadzone_top.clone());
-    let bottom_slider = controls.map(|c| c.deadzone_bottom.clone());
-    let has_draft = app.deadzone_draft != crate::app::DeadzoneDraft::default();
     let top_stepper = stepper(
         "deadzone-top",
         top,
@@ -1352,35 +1290,170 @@ fn render_deadzones(
         cx,
     );
     let theme = cx.theme();
-    v_flex().w_72().flex_shrink_0().child(
-        group("deadzones", "Dead zones", theme)
-            .child(muted_note("Applies to every key on the keyboard.", theme))
-            .child(slider_row(
-                "Top (press down)",
-                top_slider,
-                top_stepper,
-                busy,
-                theme,
-            ))
-            .child(slider_row(
-                "Bottom (lift up)",
-                bottom_slider,
-                bottom_stepper,
-                busy,
-                theme,
-            ))
-            .child(
-                h_flex().child(
-                    Button::new("apply-deadzones")
+
+    v_flex()
+        .id("trigger-travel")
+        .flex_1()
+        .min_w_0()
+        .gap_2()
+        .child(deck_title(target, theme))
+        .child(slider_row(
+            "Actuation point",
+            travel_slider,
+            actuation_stepper,
+            locked,
+            theme,
+        ))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(muted_note(range_note, theme)),
+                )
+                .child(
+                    Button::new("apply-actuation-all")
+                        .ghost()
+                        .small()
+                        .label("Apply to all keys")
+                        .disabled(locked)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.request_global_actuation(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("apply-actuation-key")
                         .primary()
                         .small()
-                        .label("Apply dead zones")
+                        .label(apply_label)
                         .loading(busy)
-                        .disabled(!has_draft)
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_deadzones(cx))),
+                        .disabled(count == 0 || app.key_draft.actuation.is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.apply_actuation(cx))),
                 ),
+        )
+        .child(div().h_px().my_1().w_full().bg(theme.border))
+        .child(
+            deck_title("Dead zones, all keys", theme).child(
+                Button::new("apply-deadzones")
+                    .outline()
+                    .small()
+                    .label("Apply dead zones")
+                    .loading(busy)
+                    .disabled(!has_deadzone_draft)
+                    .on_click(cx.listener(|this, _, _, cx| this.apply_deadzones(cx))),
             ),
-    )
+        )
+        .child(
+            h_flex()
+                .items_start()
+                .gap_4()
+                .child(div().flex_1().min_w_0().child(slider_row(
+                    "Top",
+                    top_slider,
+                    top_stepper,
+                    busy,
+                    theme,
+                )))
+                .child(div().flex_1().min_w_0().child(slider_row(
+                    "Bottom",
+                    bottom_slider,
+                    bottom_stepper,
+                    busy,
+                    theme,
+                ))),
+        )
+}
+
+fn render_rapid_trigger_column(
+    app: &AgnoPeriphApp,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> impl IntoElement + use<> {
+    let count = app.selected_keys().len();
+    let busy = app.is_busy();
+    let locked = busy || count == 0;
+    let rapid_trigger = app
+        .key_values()
+        .map_or(RapidTriggerConfig::disabled(), |(_, rt)| rt);
+    let rt_enabled = rapid_trigger.is_enabled();
+    let has_draft = app.key_draft != crate::app::KeyDraft::default();
+    let controls = app.controls.as_ref();
+    let press_slider = controls.map(|c| c.rt_press.clone());
+    let release_slider = controls.map(|c| c.rt_release.clone());
+    let press = stepper(
+        "press-sensitivity",
+        rapid_trigger.press_sensitivity,
+        locked || !rt_enabled,
+        |this, direction, cx| this.step_sensitivity(true, direction, cx),
+        cx,
+    );
+    let release = stepper(
+        "release-sensitivity",
+        rapid_trigger.release_sensitivity,
+        locked || !rt_enabled,
+        |this, direction, cx| this.step_sensitivity(false, direction, cx),
+        cx,
+    );
+    let apply_label = match count {
+        0 | 1 => "Apply Rapid Trigger".to_owned(),
+        n => format!("Apply to {n} keys"),
+    };
+    let theme = cx.theme();
+    v_flex()
+        .id("rapid-trigger-group")
+        .flex_1()
+        .min_w_0()
+        .gap_2()
+        .child(
+            deck_title("Rapid Trigger", theme).child(
+                Switch::new("rapid-trigger")
+                    .checked(rt_enabled)
+                    .disabled(locked)
+                    .tooltip("Re-trigger whenever the key changes direction")
+                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_rapid_trigger_enabled(*checked, cx);
+                    })),
+            ),
+        )
+        .child(slider_row(
+            "Press sensitivity",
+            press_slider,
+            press,
+            locked || !rt_enabled,
+            theme,
+        ))
+        .child(slider_row(
+            "Lift sensitivity",
+            release_slider,
+            release,
+            locked || !rt_enabled,
+            theme,
+        ))
+        .child(
+            h_flex()
+                .gap_2()
+                .justify_end()
+                .when(has_draft, |this| {
+                    this.child(
+                        Button::new("discard-key-draft")
+                            .ghost()
+                            .small()
+                            .label("Discard edits")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.discard_key_draft(cx))),
+                    )
+                })
+                .child(
+                    Button::new("apply-rapid-trigger")
+                        .primary()
+                        .small()
+                        .label(apply_label)
+                        .loading(busy)
+                        .disabled(count == 0 || app.key_draft.rapid_trigger.is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.apply_rapid_trigger(cx))),
+                ),
+        )
 }
 
 /// Button that opens a grouped HID key menu and passes the chosen usage to `on_pick`.
@@ -1429,6 +1502,7 @@ fn render_paired(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
     layout: &KeyLayout,
+    occupied: &BTreeMap<KeyIndex, &'static str>,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let mode = app.paired.mode;
@@ -1440,8 +1514,8 @@ fn render_paired(
         (PairedMode::ModTap, snapshot.mod_tap_bindings.len()),
         (PairedMode::Toggle, snapshot.toggle_bindings.len()),
     ];
-    let caps = he.capabilities.clone();
-    let cards: Vec<AnyElement> = PairedMode::ALL
+    let caps = &he.capabilities;
+    let pills: Vec<AnyElement> = PairedMode::ALL
         .iter()
         .filter(|m| match m {
             PairedMode::Socd => caps.has_socd(),
@@ -1453,46 +1527,38 @@ fn render_paired(
             let theme = cx.theme();
             Button::new(SharedString::from(format!("paired-mode-{}", m.id())))
                 .outline()
+                .small()
                 .selected(m == mode)
-                .h_auto()
                 .flex_1()
-                .min_w_32()
-                .p_3()
+                .min_w_0()
+                .tooltip(m.summary())
                 .child(
-                    v_flex()
+                    h_flex()
                         .w_full()
-                        .gap_1()
-                        .items_start()
+                        .min_w_0()
+                        .gap_2()
                         .child(
-                            h_flex()
-                                .w_full()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .font_family(theme.mono_font_family.clone())
-                                        .child(m.badge()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("{used} / {PAIRED_SLOT_LIMIT}")),
-                                ),
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_family(theme.mono_font_family.clone())
+                                .child(m.badge()),
                         )
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
                                 .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
                                 .child(m.title()),
                         )
                         .child(
                             div()
+                                .flex_shrink_0()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .whitespace_normal()
-                                .child(m.summary()),
+                                .child(format!("{used}/{PAIRED_SLOT_LIMIT}")),
                         ),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.set_paired_mode(m, cx)))
@@ -1500,18 +1566,18 @@ fn render_paired(
         })
         .collect();
 
-    let flow = render_flow(app, layout, cx);
+    let flow = render_flow(app, layout, occupied, cx);
     let list = render_configured(app, he, layout, cx);
     let theme = cx.theme();
     v_flex()
         .id("paired-keys")
-        .gap_4()
-        .pt_6()
+        .gap_3()
+        .pt_4()
         .border_t_1()
         .border_color(theme.border)
         .child(
-            v_flex()
-                .gap_1()
+            h_flex()
+                .gap_3()
                 .child(
                     div()
                         .text_base()
@@ -1519,12 +1585,12 @@ fn render_paired(
                         .child("Paired & advanced keys"),
                 )
                 .child(muted_note(
-                    "Combine keys or give one key several behaviours. Pick keys on the map above.",
+                    "Each key can belong to one function at a time.",
                     theme,
                 )),
         )
-        .child(h_flex().gap_2().items_stretch().children(cards))
-        .child(h_flex().items_start().gap_6().child(flow).child(list))
+        .child(h_flex().gap_2().children(pills))
+        .child(h_flex().items_start().gap_4().child(flow).child(list))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1559,16 +1625,32 @@ fn pick_button(
 fn render_flow(
     app: &AgnoPeriphApp,
     layout: &KeyLayout,
+    occupied: &BTreeMap<KeyIndex, &'static str>,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let ui = app.paired.clone();
     let busy = app.is_busy();
     let mode = ui.mode;
     let needs_two = matches!(mode, PairedMode::RapidSwitch | PairedMode::Socd);
-    let ready = ui.first.is_some()
+    // Picks are refused for taken keys, but a refresh can take a key after it was picked.
+    let taken = [ui.first, ui.second.filter(|_| needs_two)]
+        .into_iter()
+        .flatten()
+        .find_map(|key| occupied.get(&key).map(|owner| (key, *owner)));
+    let conflict: Option<SharedString> = ui.conflict.clone().or_else(|| {
+        taken.map(|(key, owner)| {
+            format!(
+                "{} is already used by {owner}. Remove it there first.",
+                layout.label(key)
+            )
+            .into()
+        })
+    });
+    let ready = taken.is_none()
+        && ui.first.is_some()
         && (!needs_two || ui.second.is_some_and(|second| Some(second) != ui.first));
     let first_label = if needs_two { "First key" } else { "Key" };
-    let mut body = v_flex().gap_3().child(pick_button(
+    let mut body = v_flex().gap_2().child(pick_button(
         "paired-pick-first",
         first_label,
         ui.first,
@@ -1739,7 +1821,18 @@ fn render_flow(
     group("paired-flow", format!("New {}", mode.title()), theme)
         .flex_1()
         .min_w_0()
+        .child(muted_note(mode.summary(), theme))
         .child(body)
+        .when_some(conflict, |this, conflict| {
+            this.child(
+                div()
+                    .id("paired-conflict")
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .child(conflict)
+                    .test_support(),
+            )
+        })
         .when(mode == PairedMode::Dks, |this| {
             this.child(muted_note(
                 "The key is rebound to the DKS slot on the Win Base layer.",
@@ -1809,7 +1902,7 @@ fn render_configured(
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let busy = app.is_busy();
-    let snapshot = he.snapshot.clone();
+    let snapshot = &he.snapshot;
     let mut rows: Vec<AnyElement> = Vec::new();
     let remove = |id: ElementId, entry: PairedEntry, cx: &mut Context<AgnoPeriphApp>| {
         Button::new(id)
@@ -1826,7 +1919,6 @@ fn render_configured(
                theme: &Theme| {
         h_flex()
             .gap_3()
-            .py_1()
             .child(
                 v_flex()
                     .flex_1()
@@ -1841,7 +1933,14 @@ fn render_configured(
                                     .text_color(theme.muted_foreground)
                                     .child(badge),
                             )
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title)),
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(title),
+                            ),
                     )
                     .when_some(detail, |this, detail| {
                         this.child(
@@ -1880,32 +1979,29 @@ fn render_configured(
             }
             PairedMode::Socd => {
                 for &pair in &snapshot.socd_pairs {
-                    let modes = SOCD_MODES.iter().map(|&(socd, label)| {
-                        Button::new(socd_element_id("socd-mode", pair, label))
-                            .label(label)
-                            .selected(pair.mode == socd)
-                            .disabled(busy)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if pair.mode != socd {
-                                    this.set_socd_mode(pair, socd, cx);
-                                }
-                            }))
-                    });
-                    let action = h_flex()
-                        .gap_2()
-                        .child(
-                            ButtonGroup::new(socd_element_id("socd-modes", pair, "group"))
-                                .outline()
-                                .xsmall()
-                                .children(modes),
-                        )
-                        .child(remove(
-                            socd_element_id("socd-remove", pair, "x"),
-                            PairedEntry::Socd(pair),
-                            cx,
-                        ))
-                        .into_any_element();
-                    rows.push(row(
+                    let modes = SOCD_MODES
+                        .iter()
+                        .map(|&(socd, label)| {
+                            Button::new(socd_element_id("socd-mode", pair, label))
+                                .label(label)
+                                .selected(pair.mode == socd)
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if pair.mode != socd {
+                                        this.set_socd_mode(pair, socd, cx);
+                                    }
+                                }))
+                        })
+                        .collect::<Vec<_>>();
+                    // Two lines: the pair and its Remove on top, the winner choice below,
+                    // so the mode buttons never crowd the key names.
+                    let action = remove(
+                        socd_element_id("socd-remove", pair, "x"),
+                        PairedEntry::Socd(pair),
+                        cx,
+                    )
+                    .into_any_element();
+                    let head = row(
                         badge,
                         format!(
                             "{} + {}",
@@ -1915,7 +2011,28 @@ fn render_configured(
                         None,
                         action,
                         cx.theme(),
-                    ));
+                    );
+                    rows.push(
+                        v_flex()
+                            .gap_1()
+                            .child(head)
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(muted_note("Winner", cx.theme()))
+                                    .child(
+                                        ButtonGroup::new(socd_element_id(
+                                            "socd-modes",
+                                            pair,
+                                            "group",
+                                        ))
+                                        .outline()
+                                        .xsmall()
+                                        .children(modes),
+                                    ),
+                            )
+                            .into_any_element(),
+                    );
                 }
             }
             PairedMode::Dks => {
@@ -2009,8 +2126,8 @@ fn render_configured(
         format!("Advanced keys configured ({used})"),
         theme,
     )
-    .w_96()
-    .flex_shrink_0()
+    .flex_1()
+    .min_w_0()
     .child(muted_note(
         format!("Each type holds up to {PAIRED_SLOT_LIMIT} entries."),
         theme,
@@ -2019,6 +2136,7 @@ fn render_configured(
         this.child(muted_note("Nothing configured yet.", theme))
     })
     .children(rows)
+    .test_support()
 }
 
 #[cfg(test)]
