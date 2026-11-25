@@ -102,7 +102,7 @@ Before designing or writing any UI code, **read both normative guides in full**:
 - **`gpui-kit`** skill (`references/coding-guides.md`, `references/usage.md`, `references/conventions.md`)
 - **`gpui-kit-design-guides`** skill (`references/design-guides.md` — visual hierarchy, spacing, density, desktop conventions, interaction states, overlays, data-heavy views, interface copy, and the Design Review Checklist)
 
-- **Single UI Dependency:** Depend only on `gpui-kit = "0.11.0"`. Import GPUI via `use gpui_kit::*;` and layers via `gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`, `gpui_kit::platform`. Never add separate `gpui` or `gpui-component` crate entries. (Sole exception: the test-only `gpui-pre-wgpu` dev-dependency for screenshots, §6.1.)
+- **Single UI Dependency:** Depend only on `gpui-kit = { version = "0.11.0", features = ["gpui-fast"] }`. Import GPUI via `use gpui_kit::*;` and layers via `gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`, `gpui_kit::platform`. Never add separate `gpui` or `gpui-component` crate entries. (Sole exception: the test-only `gpui-fast-wgpu` dev-dependency for screenshots, §6.1.)
 - **Bootstrap:** Call `gpui_kit::init(cx)` first inside `gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(...)` and open windows via `gpui_kit::open_window(...)` so `Root` mounts dialog/sheet/notification/tooltip layers properly.
 - **Never Invent APIs:** Always verify component constructors and methods against `gpui-kit` docs/source before writing code.
 - **State & Rendering:**
@@ -117,7 +117,7 @@ Before designing or writing any UI code, **read both normative guides in full**:
   - Use `Button` (with `ghost`/`outline` when quiet) for all in-app commands; reserve `Link` strictly for external URLs.
   - Use `AlertDialog` only for consequential/destructive actions (never reversible toggles).
 - **Testing:** Verify UI interactions using `#[gpui_kit::test]` and `VisualTestContext` against real production views.
-- **Engine:** `gpui-kit` here builds on **`gpui-pre`** (its `gpui-fast` feature is off). Read `gpui-pre-*` sources when checking framework behavior, not `gpui-fast-*`.
+- **Engine:** `gpui-kit` here runs on **`gpui-fast`** (Longbridge's GPUI fork with scroll layers and retained-subtree reuse), enabled by the workspace `gpui-fast` feature. `gpui_kit::*` re-exports `gpui_fast`, so read `gpui-fast-*` sources when checking framework behavior, not `gpui-pre-*` (still compiled as a gpui-kit dependency, but not re-exported). For smooth scrolling, move a `ScrollHandle` offset and `cx.notify(view)` the owning view; never call `window.refresh()`, which dirties the whole window and defeats scroll layers.
 
 ### 6.1 Visual Verification (Headless Screenshots)
 Behavior tests (`tests/ui.rs`) cannot show what the UI looks like. Any change with a visible surface (layout, spacing, color, theme, copy) must also be checked by rendering screenshots and **actually viewing them** before the work is reported done. Never launch the real binary for this: it enumerates live HID devices.
@@ -128,7 +128,7 @@ Behavior tests (`tests/ui.rs`) cannot show what the UI looks like. Any change wi
 4. **Report:** say which screenshots you viewed and what you fixed. If the renderer is unavailable (no GPU adapter, CI), say the visual check was skipped. Do not claim it passed.
 
 How it works, so nobody has to rediscover it:
-- **Renderer:** gpui supplies no headless renderer on Windows (`current_headless_renderer()` returns `None`). `tests/visual.rs` therefore builds a `HeadlessAppContext` with `gpui_wgpu::WgpuHeadlessRenderer` from the dev-dependency `gpui-pre-wgpu`, pinned to the exact `gpui-pre` version `gpui-kit` uses. This dev-dependency (plus `image` and `anyhow`) is the one allowed exception to "single UI dependency". It is test-only and must never move into `[dependencies]`. When upgrading `gpui-kit`, bump the pin to match, or the build fails with "multiple versions of crate `gpui`".
+- **Renderer:** gpui supplies no headless renderer on Windows (`current_headless_renderer()` returns `None`). `tests/visual.rs` therefore builds a `HeadlessAppContext` with `gpui_wgpu::WgpuHeadlessRenderer` from the dev-dependency `gpui-fast-wgpu` (lib name `gpui_wgpu`), pinned to the exact `gpui-fast` version `gpui-kit` uses (`=0.1.19`). The context loads `agnoperiph::icons::AppAssets`, the same asset source as the app, so custom and extra icons render. This dev-dependency (plus `image` and `anyhow`) is the one allowed exception to "single UI dependency". It is test-only and must never move into `[dependencies]`. When upgrading `gpui-kit`, bump the pin to match, or the build fails with "multiple versions of crate `gpui`".
 - **Text:** `gpui_kit::platform::current_platform(true)` returns a **no-op** text system on Windows. Text lays out at the right size but every glyph is empty, so screenshots show boxes with no text. Use `current_platform(false).text_system()` (real DirectWrite), wrapped to force grayscale glyphs as the test does.
 - **Cost:** the first build compiles `wgpu`, which takes several minutes at the workspace's dependency `opt-level = 3`. Later builds reuse the cache. The test is `#[ignore]`d so `cargo test --workspace` stays GPU-free and fast.
 

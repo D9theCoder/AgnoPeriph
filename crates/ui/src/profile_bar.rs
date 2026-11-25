@@ -6,12 +6,12 @@
 //! is diffed and pushed through [`crate::backend::PeripheralService`] when switched.
 
 use agnoperiph_core::{DeviceId, KeyIndex, ProfileSlot};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable,
-    button::{Button, ButtonGroup, ButtonVariants},
+    ActiveTheme, Disableable, Icon, Selectable, Sizable,
+    button::{Button, ButtonGroup},
     h_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::AgnoPeriphApp;
@@ -206,41 +206,6 @@ pub(crate) fn capture_preset(device: &DeviceSnapshot) -> SavedKeyboardPreset {
     preset
 }
 
-fn describe_preset_short(preset: &SavedKeyboardPreset) -> String {
-    if preset.is_empty() {
-        return "Clean preset — edits auto-save".to_owned();
-    }
-    let mut parts = Vec::new();
-    let pairs = preset.socd_pairs.len()
-        + preset.rapid_switch_pairs.len()
-        + preset.dks_bindings.len()
-        + preset.mod_tap_bindings.len()
-        + preset.toggle_bindings.len();
-    if pairs > 0 {
-        parts.push(if pairs == 1 {
-            "1 adv key".to_owned()
-        } else {
-            format!("{pairs} adv keys")
-        });
-    }
-    let rt_keys = preset
-        .key_configs
-        .iter()
-        .filter(|k| k.rapid_trigger.is_enabled())
-        .count();
-    if rt_keys > 0 {
-        parts.push(format!("RT ×{rt_keys}"));
-    }
-    if !preset.rgb_zones.is_empty() {
-        parts.push("RGB".to_owned());
-    }
-    if parts.is_empty() {
-        "Saved · auto-saves edits".to_owned()
-    } else {
-        format!("Saved: {}", parts.join(" · "))
-    }
-}
-
 impl AgnoPeriphApp {
     /// Activates `slot` on `device`.
     pub(crate) fn request_profile_switch(
@@ -367,16 +332,6 @@ pub(crate) fn render(
                 }
             }))
     });
-    let saved = hardware.is_none().then(|| {
-        app.config()
-            .software_profiles
-            .get(id.as_str())
-            .and_then(|sw| sw.slots.iter().find(|s| s.slot == active))
-            .map_or_else(
-                || describe_preset_short(&SavedKeyboardPreset::default()),
-                |s| describe_preset_short(&s.saved),
-            )
-    });
     let rename_device = id.clone();
     let theme = cx.theme();
     let caption = if hardware.is_some() {
@@ -403,21 +358,14 @@ pub(crate) fn render(
         )
         .child(
             Button::new("rename-preset")
-                .ghost()
+                .outline()
                 .small()
+                .icon(Icon::new(IconName::Pencil))
                 .label("Rename…")
                 .disabled(busy)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.open_rename_preset(rename_device.clone(), active, window, cx);
                 })),
         )
-        .when_some(saved, |this, saved| {
-            this.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(saved),
-            )
-        })
         .into_any_element()
 }

@@ -24,7 +24,7 @@ agnoperiph-driver-logitech = { path = "crates/drivers/driver-logitech" }
 agnoperiph-transport = { path = "crates/transport" }
 
 anyhow = "1.0.105"
-gpui-kit = "0.11.0"
+gpui-kit = { version = "0.11.0", features = ["gpui-fast"] }
 clap = { version = "4.6.10", features = ["derive"] }
 hex = "0.4.3"
 hidapi = "2.6.7"

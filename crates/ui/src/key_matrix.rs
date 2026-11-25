@@ -16,9 +16,12 @@ use crate::keymap::{KeyLayout, LayoutKey};
 
 /// Width of one key unit in rem; sized so the board sits cleanly beside Paired & Advanced Keys
 /// at the default 1240×820 window width without clipping either column.
-const KEY_UNIT_REM: f32 = 2.30;
+const KEY_UNIT_REM: f32 = 2.42;
 /// Space between neighbouring keycaps in rem (matches `gap_1`).
 const KEY_GAP_REM: f32 = 0.25;
+/// Height of a 1u keycap in rem, kept proportional to `KEY_UNIT_REM - KEY_GAP_REM` (~0.94:1)
+/// so keycaps retain crisp square proportions rather than stretching vertically.
+const KEY_HEIGHT_REM: f32 = 2.30;
 
 /// How a keycap is emphasised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +192,8 @@ fn keycap(
         .gap_0p5()
         .child(
             div()
-                .text_xs()
+                .text_size(rems(0.6875))
+                .line_height(rems(0.85))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(label_color)
                 .truncate()
@@ -213,7 +217,7 @@ fn keycap(
         .aria_selected(face.tone == KeyTone::Selected)
         .ml(rems(gap))
         .w(rems(width))
-        .h_11()
+        .h(rems(KEY_HEIGHT_REM))
         .px_0p5()
         .py_0p5()
         .flex()
@@ -234,7 +238,8 @@ fn keycap(
         .when_some(face.detail.clone(), |this, detail| {
             this.child(
                 div()
-                    .text_size(rems(0.625))
+                    .text_size(rems(0.60))
+                    .line_height(rems(0.75))
                     .truncate()
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)

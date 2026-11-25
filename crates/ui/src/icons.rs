@@ -48,6 +48,8 @@ pub fn advanced_svg(icon: AdvancedIcon, icon_size: Rems, color: Hsla) -> Svg {
         .text_color(color)
 }
 
+gpui_kit::assets::icon_assets!(ExtraIcons, [Pencil]);
+
 /// Asset source combining AgnoPeriph's embedded custom SVGs with GPUI Kit's Lucide icons.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AppAssets;
@@ -80,11 +82,15 @@ impl AssetSource for AppAssets {
         if let Some((_, bytes)) = CUSTOM_ICONS.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(*bytes)));
         }
+        if let Some(bytes) = ExtraIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
         gpui_kit::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut out = gpui_kit::assets::Assets.list(path)?;
+        out.extend(ExtraIcons.list(path)?);
         for (p, _) in CUSTOM_ICONS {
             if p.starts_with(path) {
                 out.push(p.into());
