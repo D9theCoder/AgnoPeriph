@@ -9,6 +9,7 @@ pub mod battery;
 pub mod device;
 pub mod error;
 pub mod hall_effect;
+pub mod keyboard;
 pub mod pointer;
 pub mod profile;
 pub mod registry;
@@ -21,8 +22,13 @@ pub use device::{
 pub use error::{CoreError, CoreResult};
 pub use hall_effect::{
     CalibrationStatus, DksBinding, DksStageAction, DksTriggerDirection, HallEffectCapabilities,
-    HallEffectKeyboard, HallEffectSnapshot, KeyHallEffectConfig, KeyIndex, RapidTriggerConfig,
-    SocdMode, SocdPair, TravelHundredthsMm,
+    HallEffectKeyboard, HallEffectSnapshot, KeyHallEffectConfig, KeyIndex, ModTapBinding,
+    RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair, ToggleKeyBinding, TravelHundredthsMm,
+};
+pub use keyboard::{
+    KeyCode, KeyboardConfigCapabilities, KeyboardConfigController, KeyboardConfigSnapshot,
+    KeymapCapabilities, KeymapController, KeymapSnapshot, MacroActionKind, MacroCapabilities,
+    MacroController, MacroSlot, MacroStep,
 };
 pub use pointer::{
     DebounceMs, DpiStage, DpiValue, LiftOffDistance, PointerCapabilities, PointerDevice,
@@ -36,5 +42,5 @@ pub use registry::{
 };
 pub use rgb::{
     Brightness, RgbCapabilities, RgbColor, RgbController, RgbDirection, RgbEffect, RgbEffectKind,
-    RgbSnapshot, RgbZoneId, RgbZoneInfo, RgbZoneState,
+    RgbPresetInfo, RgbSnapshot, RgbZoneId, RgbZoneInfo, RgbZoneState,
 };

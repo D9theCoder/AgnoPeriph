@@ -12,9 +12,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use agnoperiph_core::{
     BatteryStatus, Brightness, Capabilities, CoreError, CoreResult, DebounceMs, DeviceId,
     DeviceInfo, DeviceRegistry, DksBinding, DpiStage, HallEffectCapabilities, HallEffectSnapshot,
-    KeyHallEffectConfig, KeyIndex, LiftOffDistance, Peripheral, PointerCapabilities,
-    PointerSnapshot, PollingRateHz, ProfileCapabilities, ProfileSlot, ProfileSnapshot,
-    RapidTriggerConfig, RgbCapabilities, RgbEffect, RgbSnapshot, RgbZoneId, SocdPair,
+    KeyCode, KeyHallEffectConfig, KeyIndex, KeyboardConfigCapabilities, KeyboardConfigSnapshot,
+    KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroCapabilities, MacroSlot,
+    ModTapBinding, Peripheral, PointerCapabilities, PointerSnapshot, PollingRateHz,
+    ProfileCapabilities, ProfileSlot, ProfileSnapshot, RapidSwitchPair, RapidTriggerConfig,
+    RgbCapabilities, RgbEffect, RgbSnapshot, RgbZoneId, SocdPair, ToggleKeyBinding,
     TravelHundredthsMm,
 };
 use agnoperiph_driver_atk::AtkRs7Device;
@@ -69,6 +71,30 @@ pub struct RgbState {
 pub struct ProfileState {
     pub capabilities: ProfileCapabilities,
     pub snapshot: ProfileSnapshot,
+}
+
+/// Dynamic keymap capability limits paired with the keyboard's active layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeymapState {
+    pub capabilities: KeymapCapabilities,
+    pub snapshot: KeymapSnapshot,
+}
+
+/// Onboard macro capability limits paired with the keyboard's macro slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MacroState {
+    pub capabilities: MacroCapabilities,
+    pub slots: Vec<MacroSlot>,
+}
+
+/// Advanced keyboard system configuration capability limits and active toggles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyboardConfigState {
+    pub capabilities: KeyboardConfigCapabilities,
+    pub snapshot: KeyboardConfigSnapshot,
 }
 
 /// Per-capability read warning that did not prevent the device from loading.
@@ -129,6 +155,9 @@ pub struct DeviceSnapshot {
     pub rgb: Option<RgbState>,
     pub battery: Option<BatteryStatus>,
     pub profiles: Option<ProfileState>,
+    pub keymap: Option<KeymapState>,
+    pub macros: Option<MacroState>,
+    pub keyboard_config: Option<KeyboardConfigState>,
     /// Per-capability read failures that did not prevent the device from loading.
     pub warnings: Vec<DeviceWarning>,
     /// `true` when values include dry-run edits that were validated and logged but never
@@ -168,9 +197,21 @@ pub enum SettingChange {
         target: ActuationTarget,
         point: TravelHundredthsMm,
     },
+    ActuationMany {
+        keys: Vec<KeyIndex>,
+        point: TravelHundredthsMm,
+    },
     RapidTrigger {
         key: KeyIndex,
         config: RapidTriggerConfig,
+    },
+    RapidTriggerMany {
+        keys: Vec<KeyIndex>,
+        config: RapidTriggerConfig,
+    },
+    Deadzones {
+        top: TravelHundredthsMm,
+        bottom: TravelHundredthsMm,
     },
     /// Writes a DKS binding into the hardware slot `binding.key` (`0..max_dks_bindings`).
     Dks(DksBinding),
@@ -178,6 +219,28 @@ pub enum SettingChange {
         slot: KeyIndex,
     },
     Socd(Vec<SocdPair>),
+    RapidSwitch(Vec<RapidSwitchPair>),
+    ModTap(ModTapBinding),
+    ClearModTap {
+        slot: u8,
+        key: KeyIndex,
+    },
+    ToggleKey(ToggleKeyBinding),
+    ClearToggleKey {
+        slot: u8,
+        key: KeyIndex,
+    },
+    KeyBinding {
+        layer: u8,
+        key: KeyIndex,
+        code: KeyCode,
+    },
+    ResetKeymap,
+    Macros(Vec<MacroSlot>),
+    KeyboardConfig(KeyboardConfigSnapshot),
+    StartCalibration,
+    FinishCalibration,
+    PollCalibrationProgress,
     Rgb {
         zone: RgbZoneId,
         effect: RgbEffect,
@@ -317,6 +380,7 @@ fn require<T>(value: Option<T>, capability: &'static str) -> CoreResult<T> {
 ///
 /// Drivers validate again before encoding; validating here keeps dry-run previews
 /// from ever showing values the device would reject.
+#[allow(clippy::too_many_lines)]
 pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> CoreResult<()> {
     match change {
         SettingChange::Pointer(change) => {
@@ -330,10 +394,42 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
             }
             he.capabilities.validate_actuation(*point)
         }
+        SettingChange::ActuationMany { keys, point } => {
+            let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            for &key in keys {
+                he.capabilities.validate_key(key)?;
+            }
+            he.capabilities.validate_actuation(*point)
+        }
         SettingChange::RapidTrigger { key, config } => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
             he.capabilities.validate_key(*key)?;
             he.capabilities.validate_rapid_trigger(config)
+        }
+        SettingChange::RapidTriggerMany { keys, config } => {
+            let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            for &key in keys {
+                he.capabilities.validate_key(key)?;
+            }
+            he.capabilities.validate_rapid_trigger(config)
+        }
+        SettingChange::Deadzones { top, bottom } => {
+            let _ = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            if top.as_hundredths() > 100 {
+                return Err(CoreError::OutOfRange {
+                    field: "top_deadzone",
+                    actual: top.to_string(),
+                    expected: "0.00..=1.00 mm".to_owned(),
+                });
+            }
+            if bottom.as_hundredths() > 100 {
+                return Err(CoreError::OutOfRange {
+                    field: "bottom_deadzone",
+                    actual: bottom.to_string(),
+                    expected: "0.00..=1.00 mm".to_owned(),
+                });
+            }
+            Ok(())
         }
         SettingChange::Dks(DksBinding { key: slot, .. }) | SettingChange::ClearDks { slot } => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
@@ -352,6 +448,76 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
         SettingChange::Socd(pairs) => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
             he.capabilities.validate_socd_pairs(pairs)
+        }
+        SettingChange::RapidSwitch(pairs) => {
+            let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            for pair in pairs {
+                he.capabilities.validate_key(pair.key_a)?;
+                he.capabilities.validate_key(pair.key_b)?;
+            }
+            Ok(())
+        }
+        SettingChange::ModTap(binding) => {
+            let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            he.capabilities.validate_key(binding.key)
+        }
+        SettingChange::ClearModTap { key, .. } | SettingChange::ClearToggleKey { key, .. } => {
+            let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            he.capabilities.validate_key(*key)
+        }
+        SettingChange::ToggleKey(binding) => {
+            let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            he.capabilities.validate_key(binding.key)
+        }
+        SettingChange::KeyBinding { layer, key, .. } => {
+            let km = require(snapshot.keymap.as_ref(), "keymap")?;
+            km.capabilities.validate_layer(*layer)?;
+            let max_keys = u16::from(km.capabilities.rows) * u16::from(km.capabilities.cols);
+            if key.value() >= max_keys {
+                return Err(CoreError::OutOfRange {
+                    field: "key_index",
+                    actual: key.value().to_string(),
+                    expected: format!("0..{max_keys}"),
+                });
+            }
+            Ok(())
+        }
+        SettingChange::ResetKeymap => {
+            let _ = require(snapshot.keymap.as_ref(), "keymap")?;
+            Ok(())
+        }
+        SettingChange::Macros(slots) => {
+            let mac = require(snapshot.macros.as_ref(), "macros")?;
+            if slots.len() > usize::from(mac.capabilities.max_slots) {
+                return Err(CoreError::OutOfRange {
+                    field: "macros",
+                    actual: slots.len().to_string(),
+                    expected: format!("0..={}", mac.capabilities.max_slots),
+                });
+            }
+            Ok(())
+        }
+        SettingChange::KeyboardConfig(cfg) => {
+            let kc = require(snapshot.keyboard_config.as_ref(), "keyboard_config")?;
+            if !kc.capabilities.supported_polling_rates.is_empty()
+                && !kc
+                    .capabilities
+                    .supported_polling_rates
+                    .contains(&cfg.polling_rate)
+            {
+                return Err(CoreError::OutOfRange {
+                    field: "polling_rate",
+                    actual: cfg.polling_rate.to_string(),
+                    expected: "a polling rate supported by the keyboard".to_owned(),
+                });
+            }
+            Ok(())
+        }
+        SettingChange::StartCalibration
+        | SettingChange::FinishCalibration
+        | SettingChange::PollCalibrationProgress => {
+            let _ = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            Ok(())
         }
         SettingChange::Rgb { zone, effect, .. } => {
             let rgb = require(snapshot.rgb.as_ref(), "rgb")?;
@@ -402,6 +568,7 @@ fn validate_pointer_change(pointer: &PointerState, change: &PointerChange) -> Co
 }
 
 /// Applies an already validated change to a snapshot without touching hardware.
+#[allow(clippy::too_many_lines)]
 pub fn apply_change_to_snapshot(snapshot: &mut DeviceSnapshot, change: &SettingChange) {
     match change {
         SettingChange::Pointer(change) => {
@@ -420,6 +587,15 @@ pub fn apply_change_to_snapshot(snapshot: &mut DeviceSnapshot, change: &SettingC
                 }
             }
         }
+        SettingChange::ActuationMany { keys, point } => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                for config in &mut he.snapshot.keys {
+                    if keys.contains(&config.key) {
+                        config.actuation = *point;
+                    }
+                }
+            }
+        }
         SettingChange::RapidTrigger { key, config } => {
             if let Some(entry) = snapshot
                 .hall_effect
@@ -427,6 +603,23 @@ pub fn apply_change_to_snapshot(snapshot: &mut DeviceSnapshot, change: &SettingC
                 .and_then(|he| he.snapshot.keys.iter_mut().find(|k| k.key == *key))
             {
                 entry.rapid_trigger = *config;
+            }
+        }
+        SettingChange::RapidTriggerMany { keys, config } => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                for entry in &mut he.snapshot.keys {
+                    if keys.contains(&entry.key) {
+                        entry.rapid_trigger = *config;
+                    }
+                }
+            }
+        }
+        SettingChange::Deadzones { top, bottom } => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                for entry in &mut he.snapshot.keys {
+                    entry.top_deadzone = Some(*top);
+                    entry.bottom_deadzone = Some(*bottom);
+                }
             }
         }
         SettingChange::Dks(binding) => {
@@ -447,6 +640,59 @@ pub fn apply_change_to_snapshot(snapshot: &mut DeviceSnapshot, change: &SettingC
         SettingChange::Socd(pairs) => {
             if let Some(he) = snapshot.hall_effect.as_mut() {
                 he.snapshot.socd_pairs.clone_from(pairs);
+            }
+        }
+        SettingChange::RapidSwitch(pairs) => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                he.snapshot.rapid_switch_pairs.clone_from(pairs);
+            }
+        }
+        SettingChange::ModTap(binding) => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                he.snapshot
+                    .mod_tap_bindings
+                    .retain(|b| b.slot != binding.slot);
+                he.snapshot.mod_tap_bindings.push(*binding);
+            }
+        }
+        SettingChange::ClearModTap { slot, .. } => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                he.snapshot.mod_tap_bindings.retain(|b| b.slot != *slot);
+            }
+        }
+        SettingChange::ToggleKey(binding) => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                he.snapshot
+                    .toggle_bindings
+                    .retain(|b| b.slot != binding.slot);
+                he.snapshot.toggle_bindings.push(*binding);
+            }
+        }
+        SettingChange::ClearToggleKey { slot, .. } => {
+            if let Some(he) = snapshot.hall_effect.as_mut() {
+                he.snapshot.toggle_bindings.retain(|b| b.slot != *slot);
+            }
+        }
+        SettingChange::KeyBinding { layer, key, code } => {
+            if let Some(km) = snapshot.keymap.as_mut()
+                && let Some(layer_vec) = km.snapshot.layers.get_mut(usize::from(*layer))
+                && let Some(slot) = layer_vec.get_mut(usize::from(key.value()))
+            {
+                *slot = *code;
+            }
+        }
+        SettingChange::ResetKeymap
+        | SettingChange::StartCalibration
+        | SettingChange::FinishCalibration
+        | SettingChange::PollCalibrationProgress => {}
+        SettingChange::Macros(slots) => {
+            if let Some(mac) = snapshot.macros.as_mut() {
+                mac.slots.clone_from(slots);
+            }
+        }
+        SettingChange::KeyboardConfig(cfg) => {
+            if let Some(kc) = snapshot.keyboard_config.as_mut() {
+                kc.snapshot = *cfg;
             }
         }
         SettingChange::Rgb {
@@ -535,6 +781,36 @@ fn collect_snapshot(peripheral: &mut dyn Peripheral) -> DeviceSnapshot {
             .map_err(|err| record("Profiles", err))
             .ok()
     });
+    let keymap = peripheral.as_keymap_mut().and_then(|km| {
+        let capabilities = km.keymap_capabilities();
+        km.read_keymap()
+            .map(|snapshot| KeymapState {
+                capabilities,
+                snapshot,
+            })
+            .map_err(|err| record("Keymap", err))
+            .ok()
+    });
+    let macros = peripheral.as_macros_mut().and_then(|mac| {
+        let capabilities = mac.macro_capabilities();
+        mac.read_macros()
+            .map(|slots| MacroState {
+                capabilities,
+                slots,
+            })
+            .map_err(|err| record("Macros", err))
+            .ok()
+    });
+    let keyboard_config = peripheral.as_keyboard_config_mut().and_then(|kc| {
+        let capabilities = kc.keyboard_config_capabilities();
+        kc.read_keyboard_config()
+            .map(|snapshot| KeyboardConfigState {
+                capabilities,
+                snapshot,
+            })
+            .map_err(|err| record("Keyboard Config", err))
+            .ok()
+    });
 
     DeviceSnapshot {
         info: peripheral.info().clone(),
@@ -544,6 +820,9 @@ fn collect_snapshot(peripheral: &mut dyn Peripheral) -> DeviceSnapshot {
         rgb,
         battery,
         profiles,
+        keymap,
+        macros,
+        keyboard_config,
         warnings,
         is_preview: false,
     }
@@ -571,9 +850,20 @@ fn apply_to_peripheral(peripheral: &mut dyn Peripheral, change: &SettingChange) 
                 ActuationTarget::AllKeys => he.set_global_actuation(*point),
             }
         }
+        SettingChange::ActuationMany { keys, point } => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?
+                .set_keys_actuation(keys, *point)
+        }
         SettingChange::RapidTrigger { key, config } => {
             require(peripheral.as_hall_effect_mut(), "hall_effect")?
                 .set_rapid_trigger(*key, *config)
+        }
+        SettingChange::RapidTriggerMany { keys, config } => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?
+                .set_keys_rapid_trigger(keys, *config)
+        }
+        SettingChange::Deadzones { top, bottom } => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?.set_deadzones(*top, *bottom)
         }
         SettingChange::Dks(binding) => require(peripheral.as_hall_effect_mut(), "hall_effect")?
             .set_dks_binding(binding.clone()),
@@ -582,6 +872,45 @@ fn apply_to_peripheral(peripheral: &mut dyn Peripheral, change: &SettingChange) 
         }
         SettingChange::Socd(pairs) => {
             require(peripheral.as_hall_effect_mut(), "hall_effect")?.set_socd_pairs(pairs)
+        }
+        SettingChange::RapidSwitch(pairs) => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?.set_rapid_switch_pairs(pairs)
+        }
+        SettingChange::ModTap(binding) => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?.set_mod_tap_binding(*binding)
+        }
+        SettingChange::ClearModTap { slot, key } => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?
+                .clear_mod_tap_binding(*slot, *key)
+        }
+        SettingChange::ToggleKey(binding) => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?.set_toggle_binding(*binding)
+        }
+        SettingChange::ClearToggleKey { slot, key } => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?
+                .clear_toggle_binding(*slot, *key)
+        }
+        SettingChange::KeyBinding { layer, key, code } => {
+            require(peripheral.as_keymap_mut(), "keymap")?.set_key_binding(*layer, *key, *code)
+        }
+        SettingChange::ResetKeymap => require(peripheral.as_keymap_mut(), "keymap")?.reset_keymap(),
+        SettingChange::Macros(slots) => {
+            require(peripheral.as_macros_mut(), "macros")?.write_macros(slots)
+        }
+        SettingChange::KeyboardConfig(cfg) => {
+            require(peripheral.as_keyboard_config_mut(), "keyboard_config")?
+                .set_keyboard_config(cfg)
+        }
+        SettingChange::StartCalibration => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?.start_calibration()
+        }
+        SettingChange::FinishCalibration => {
+            require(peripheral.as_hall_effect_mut(), "hall_effect")?.finish_calibration()
+        }
+        SettingChange::PollCalibrationProgress => {
+            let _ = require(peripheral.as_hall_effect_mut(), "hall_effect")?
+                .read_calibration_key_progress()?;
+            Ok(())
         }
         SettingChange::Rgb {
             zone,
@@ -780,6 +1109,17 @@ impl PeripheralService for LiveHidService {
             return Err(ApplyError::rejected(err));
         }
 
+        if matches!(change, SettingChange::PollCalibrationProgress) {
+            let flags = require(target.peripheral.as_hall_effect_mut(), "hall_effect")
+                .map_err(ApplyError::rejected)?
+                .read_calibration_key_progress()
+                .map_err(|err| ApplyError::failed_after_send(err, None))?;
+            if let Some(he) = target.snapshot.hall_effect.as_mut() {
+                he.snapshot.calibrated_keys = flags;
+            }
+            return Ok(target.snapshot.clone());
+        }
+
         if let Err(err) = apply_to_peripheral(target.peripheral.as_mut(), &change) {
             if dry_run {
                 return Err(ApplyError::rejected(err));
@@ -941,6 +1281,51 @@ mod tests {
         rgb[7] = RgbColor::WHITE.b;
         rgb[8] = 80;
         mock.push_input_response(rgb);
+
+        // Logo Light (zone 1)
+        let mut logo = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        logo[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        logo[3] = 3; // Always On
+        logo[5] = 120; // 75%
+        logo[7] = RgbColor::WHITE.r;
+        logo[8] = RgbColor::WHITE.g;
+        logo[9] = RgbColor::WHITE.b;
+        mock.push_input_response(logo);
+
+        // Keymap: 768 bytes in 28-byte chunks = 28 reads + active layer read
+        for _ in 0..28 {
+            let mut km = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            km[0] = atk::cmd::DYNAMIC_KEYMAP_GET_BUFFER;
+            mock.push_input_response(km);
+        }
+        let mut layer = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        layer[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        layer[3] = 1;
+        mock.push_input_response(layer);
+
+        // Macros: buffer size = 0 (no chunk reads needed)
+        let mut mac_sz = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        mac_sz[0] = atk::cmd::MACRO_GET_BUFFER_SIZE;
+        mock.push_input_response(mac_sz);
+
+        // Keyboard Config: feature flags, anti-accidental touch, game mode, polling rate
+        let mut feat = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        feat[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        feat[7] = 1; // NKRO
+        mock.push_input_response(feat);
+
+        let mut anti = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        anti[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        mock.push_input_response(anti);
+
+        let mut gm = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        gm[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        mock.push_input_response(gm);
+
+        let mut rr = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        rr[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        rr[3] = 8; // 8000 Hz
+        mock.push_input_response(rr);
     }
 
     #[test]

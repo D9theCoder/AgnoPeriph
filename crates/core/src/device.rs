@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::battery::BatteryMonitor;
 use crate::error::CoreResult;
 use crate::hall_effect::HallEffectKeyboard;
+use crate::keyboard::{KeyboardConfigController, KeymapController, MacroController};
 use crate::pointer::PointerDevice;
 use crate::profile::ProfileManager;
 use crate::rgb::RgbController;
@@ -141,6 +142,9 @@ pub struct Capabilities {
     pub rgb: bool,
     pub battery: bool,
     pub profiles: bool,
+    pub keymap: bool,
+    pub macros: bool,
+    pub keyboard_config: bool,
 }
 
 impl Capabilities {
@@ -152,6 +156,9 @@ impl Capabilities {
             rgb: false,
             battery: false,
             profiles: false,
+            keymap: false,
+            macros: false,
+            keyboard_config: false,
         }
     }
 
@@ -180,6 +187,21 @@ impl Capabilities {
         self
     }
 
+    pub const fn with_keymap(mut self, enabled: bool) -> Self {
+        self.keymap = enabled;
+        self
+    }
+
+    pub const fn with_macros(mut self, enabled: bool) -> Self {
+        self.macros = enabled;
+        self
+    }
+
+    pub const fn with_keyboard_config(mut self, enabled: bool) -> Self {
+        self.keyboard_config = enabled;
+        self
+    }
+
     pub const fn has_pointer(&self) -> bool {
         self.pointer
     }
@@ -198,6 +220,18 @@ impl Capabilities {
 
     pub const fn has_profiles(&self) -> bool {
         self.profiles
+    }
+
+    pub const fn has_keymap(&self) -> bool {
+        self.keymap
+    }
+
+    pub const fn has_macros(&self) -> bool {
+        self.macros
+    }
+
+    pub const fn has_keyboard_config(&self) -> bool {
+        self.keyboard_config
     }
 }
 
@@ -296,6 +330,30 @@ pub trait Peripheral: Send + Sync {
     }
 
     fn as_profiles_mut(&mut self) -> Option<&mut dyn ProfileManager> {
+        None
+    }
+
+    fn as_keymap(&self) -> Option<&dyn KeymapController> {
+        None
+    }
+
+    fn as_keymap_mut(&mut self) -> Option<&mut dyn KeymapController> {
+        None
+    }
+
+    fn as_macros(&self) -> Option<&dyn MacroController> {
+        None
+    }
+
+    fn as_macros_mut(&mut self) -> Option<&mut dyn MacroController> {
+        None
+    }
+
+    fn as_keyboard_config(&self) -> Option<&dyn KeyboardConfigController> {
+        None
+    }
+
+    fn as_keyboard_config_mut(&mut self) -> Option<&mut dyn KeyboardConfigController> {
         None
     }
 }

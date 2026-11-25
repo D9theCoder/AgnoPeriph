@@ -4,9 +4,9 @@
 //! from official ATK HUB v3.2.33 WebHID JS (`api-NHsRvjW6.js`, `demoMode.store-x0QG9XUG.js`).
 
 use agnoperiph_core::{
-    CoreError, CoreResult, DksBinding, DksStageAction, DksTriggerDirection, KeyIndex,
-    PollingRateHz, RapidTriggerConfig, RgbColor, RgbDirection, RgbEffect, SocdMode, SocdPair,
-    TravelHundredthsMm,
+    CoreError, CoreResult, DksBinding, DksStageAction, DksTriggerDirection, KeyCode, KeyIndex,
+    MacroActionKind, MacroSlot, MacroStep, PollingRateHz, RapidSwitchPair, RapidTriggerConfig,
+    RgbColor, RgbEffect, RgbPresetInfo, SocdMode, SocdPair, TravelHundredthsMm,
 };
 use agnoperiph_transport::{FixedReportValidator, ReportKind};
 
@@ -38,20 +38,32 @@ pub const RS7_STEP_EXTREME: TravelHundredthsMm = TravelHundredthsMm::from_hundre
 pub const RS7_RT_MIN: TravelHundredthsMm = TravelHundredthsMm::from_hundredths(2); // 0.02 mm
 pub const RS7_RT_MAX: TravelHundredthsMm = TravelHundredthsMm::from_hundredths(340); // 3.40 mm
 
-/// Maximum DKS and RS/SOCD hardware slots (`0..20`).
+/// Maximum DKS, RS/SOCD, MT, TGL, and Macro slots on the ATK RS7.
 pub const RS7_MAX_DKS_SLOTS: u8 = 20;
 pub const RS7_MAX_SOCD_SLOTS: u8 = 20;
+pub const RS7_MAX_MT_SLOTS: u8 = 20;
+pub const RS7_MAX_TGL_SLOTS: u8 = 20;
+pub const RS7_MAX_MACRO_SLOTS: u8 = 16;
+pub const RS7_LAYERS: u8 = 4;
 
 /// VIA-compatible top-level command IDs (`p[0]`).
 pub mod cmd {
     pub const GET_KEYBOARD_VALUE: u8 = 0x02;
     pub const SET_KEYBOARD_VALUE: u8 = 0x03;
+    pub const DYNAMIC_KEYMAP_GET_KEYCODE: u8 = 0x04;
+    pub const DYNAMIC_KEYMAP_SET_KEYCODE: u8 = 0x05;
     pub const DYNAMIC_KEYMAP_RESET: u8 = 0x06;
     pub const LIGHTING_SET_VALUE: u8 = 0x07;
     pub const LIGHTING_GET_VALUE: u8 = 0x08;
     pub const EEPROM_RESET: u8 = 0x0A;
     pub const BOOTLOADER_JUMP: u8 = 0x0B;
+    pub const MACRO_GET_BUFFER_SIZE: u8 = 0x0D;
+    pub const MACRO_GET_BUFFER: u8 = 0x0E;
+    pub const MACRO_SET_BUFFER: u8 = 0x0F;
     pub const MACRO_RESET: u8 = 0x10;
+    pub const DYNAMIC_KEYMAP_GET_BUFFER: u8 = 0x12;
+    pub const DYNAMIC_KEYMAP_SET_BUFFER: u8 = 0x13;
+    pub const VIAL_PREFIX: u8 = 0xFE;
 }
 
 /// DuckBread custom sub-command IDs (`p[1] == 0x96`, `p[2] == subcmd`).
@@ -63,17 +75,43 @@ pub mod sub {
     pub const BUFFER_TOG_TH: u8 = 0x0D; // 13
     pub const BUFFER_RT: u8 = 0x0E; // 14
     pub const DKS: u8 = 0x0F; // 15
+    pub const FEATURE: u8 = 0x11; // 17 (MAC mode, WASD swap, Win lock, 6KRO)
     pub const LAYER: u8 = 0x13; // 19
     pub const RESET_ALL: u8 = 0x15; // 21 (BLOCKED by safety validator)
-    pub const CALIBRATION_START: u8 = 0x18; // 24 (BLOCKED by safety validator)
-    pub const CALIBRATION_FINISH: u8 = 0x19; // 25 (BLOCKED by safety validator)
+    pub const CALIBRATION_START: u8 = 0x18; // 24
+    pub const CALIBRATION_FINISH: u8 = 0x19; // 25
+    pub const CALIBRATION_LIVE_BUFFER: u8 = 0x1C; // 28
+    pub const BOTTOM_OPTIMIZE_SWITCH: u8 = 0x1D; // 29 (Anti-Accidental Touch)
     pub const GAME_MODE: u8 = 0x1E; // 30
     pub const CALIBRATION_STATUS: u8 = 0x1F; // 31
     pub const RS_SOCD: u8 = 0x20; // 32
     pub const BOX_LIGHT: u8 = 0x21; // 33
     pub const REPORT_RATE: u8 = 0x22; // 34
     pub const LIGHT_INFO: u8 = 0x41; // 65 (used with LIGHTING_GET/SET_VALUE)
+    pub const VIAL_ENTRY_OP: u8 = 0x0D; // 13 (used with VIAL_PREFIX)
+    pub const TAP_DANCE_GET: u8 = 0x01;
+    pub const TAP_DANCE_SET: u8 = 0x02;
     pub const IAP: u8 = 0x98; // 152 (BLOCKED by safety validator)
+}
+
+/// Key class bytes (`x` enum in `api-NHsRvjW6.js`).
+pub mod key_class {
+    pub const GENERAL: u8 = 0x00;
+    pub const LAYER: u8 = 0x52;
+    pub const TAP_DANCE: u8 = 0x57; // 0..=19 = MT, 20..=39 = TGL
+    pub const MACRO: u8 = 0x77; // 0..=15 = M1..M16
+    pub const LIGHT: u8 = 0x78;
+    pub const SYSTEM: u8 = 0x7C;
+    pub const KB_AND_USER: u8 = 0x7E; // 5..=24 = DKS 0..19
+}
+
+/// Vial/QMK macro action opcodes (`Y` enum in `api-NHsRvjW6.js`).
+pub mod macro_wire {
+    pub const PREFIX: u8 = 0x01;
+    pub const SS_TAP_CODE: u8 = 0x01;
+    pub const SS_DOWN_CODE: u8 = 0x02;
+    pub const SS_UP_CODE: u8 = 0x03;
+    pub const SS_DELAY_CODE: u8 = 0x04;
 }
 
 /// Flash bulk write operation flags (`_t` enum in `api-NHsRvjW6.js`).
@@ -109,7 +147,7 @@ pub fn verify_atk_rs7_safety(_kind: ReportKind, report: &[u8]) -> Result<(), Str
     let top_cmd = report[1];
     if matches!(
         top_cmd,
-        cmd::DYNAMIC_KEYMAP_RESET | cmd::EEPROM_RESET | cmd::BOOTLOADER_JUMP | cmd::MACRO_RESET
+        cmd::EEPROM_RESET | cmd::BOOTLOADER_JUMP | cmd::MACRO_RESET
     ) {
         return Err(format!(
             "blocked dangerous VIA bootloader/reset command 0x{top_cmd:02X}"
@@ -117,10 +155,7 @@ pub fn verify_atk_rs7_safety(_kind: ReportKind, report: &[u8]) -> Result<(), Str
     }
     if top_cmd == cmd::SET_KEYBOARD_VALUE && report[2] == sub::CUSTOM_ID {
         let sub_cmd = report[3];
-        if matches!(
-            sub_cmd,
-            sub::RESET_ALL | sub::IAP | sub::CALIBRATION_START | sub::CALIBRATION_FINISH
-        ) {
+        if matches!(sub_cmd, sub::RESET_ALL | sub::IAP) {
             return Err(format!(
                 "blocked dangerous DuckBread command 0x96/0x{sub_cmd:02X}"
             ));
@@ -449,6 +484,44 @@ pub fn req_backlight_get() -> [u8; RS7_PAYLOAD_LEN] {
     p
 }
 
+/// All 21 official Back Lamp presets on the ATK RS7 (`da` in `api-NHsRvjW6.js`).
+pub fn back_lamp_presets() -> Vec<RgbPresetInfo> {
+    vec![
+        RgbPresetInfo::new(0, "Close", false, false, false),
+        RgbPresetInfo::new(1, "Customization", true, false, false),
+        RgbPresetInfo::new(2, "Single Color Constant", true, false, false),
+        RgbPresetInfo::new(3, "Focus", true, false, false),
+        RgbPresetInfo::new(4, "Up-Down Rainbow", true, false, false),
+        RgbPresetInfo::new(5, "Left-Right Rainbow", true, false, false),
+        RgbPresetInfo::new(6, "Monochrome Breath", true, true, false),
+        RgbPresetInfo::new(7, "Fluttering Ribbons", true, true, false),
+        RgbPresetInfo::new(8, "Laser", true, true, false),
+        RgbPresetInfo::new(9, "Pinwheel", true, true, false),
+        RgbPresetInfo::new(11, "Vortex", true, true, false),
+        RgbPresetInfo::new(13, "Spectral Cycle", false, true, false),
+        RgbPresetInfo::new(19, "Colorful Swirls", false, true, false),
+        RgbPresetInfo::new(23, "Double Vortex", false, true, false),
+        RgbPresetInfo::new(25, "Christmas", false, true, false),
+        RgbPresetInfo::new(26, "Spectrum Breathing", true, true, false),
+        RgbPresetInfo::new(28, "Spectrum Float", true, true, false),
+        RgbPresetInfo::new(30, "Digital Rain", false, false, false),
+        RgbPresetInfo::new(31, "Single Light Up", true, true, false),
+        RgbPresetInfo::new(36, "Crucifix", true, true, false),
+        RgbPresetInfo::new(39, "Fingertip Rainbow", false, true, false),
+    ]
+}
+
+/// All 5 official Logo Light presets on the ATK RS7 (`ga` in `api-NHsRvjW6.js`).
+pub fn logo_light_presets() -> Vec<RgbPresetInfo> {
+    vec![
+        RgbPresetInfo::new(0, "Close", false, false, false),
+        RgbPresetInfo::new(3, "Always On", true, false, false),
+        RgbPresetInfo::new(1, "Streamer", true, true, true),
+        RgbPresetInfo::new(2, "Spectral Cycle", false, true, false),
+        RgbPresetInfo::new(4, "Monochrome Breath", true, true, true),
+    ]
+}
+
 pub fn req_backlight_set(effect: RgbEffect, brightness_pct: u8) -> [u8; RS7_PAYLOAD_LEN] {
     let (mode_id, speed, color) = match effect {
         RgbEffect::Off => (0u8, 0u8, RgbColor::BLACK),
@@ -457,6 +530,9 @@ pub fn req_backlight_set(effect: RgbEffect, brightness_pct: u8) -> [u8; RS7_PAYL
         RgbEffect::SpectrumCycle { speed } => (13u8, speed, RgbColor::WHITE),
         RgbEffect::Wave { speed, .. } => (19u8, speed, RgbColor::WHITE),
         RgbEffect::Reactive { color, speed } => (31u8, speed, color),
+        RgbEffect::Preset {
+            id, color, speed, ..
+        } => (id, speed, color),
     };
     let mut p = [0u8; RS7_PAYLOAD_LEN];
     p[0] = cmd::LIGHTING_SET_VALUE;
@@ -475,16 +551,425 @@ pub fn decode_backlight(p: &[u8; RS7_PAYLOAD_LEN]) -> (RgbEffect, u8) {
     let speed = p[4];
     let color = RgbColor::new(p[5], p[6], p[7]);
     let brightness = p[8].min(100);
-    let effect = match mode_id {
-        0 => RgbEffect::Off,
-        6 | 26 => RgbEffect::Breathing { color, speed },
-        13 => RgbEffect::SpectrumCycle { speed },
-        4 | 5 | 7 | 19 => RgbEffect::Wave {
+    let effect = if mode_id == 0 {
+        RgbEffect::Off
+    } else {
+        RgbEffect::Preset {
+            id: mode_id,
+            color,
             speed,
-            direction: RgbDirection::LeftToRight,
-        },
-        31 | 36 | 39 => RgbEffect::Reactive { color, speed },
-        _ => RgbEffect::Static { color },
+            colorful: false,
+        }
     };
     (effect, brightness)
+}
+
+pub fn req_logo_light_get() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::GET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::BOX_LIGHT;
+    p
+}
+
+pub fn req_logo_light_set(effect: RgbEffect, brightness_pct: u8) -> [u8; RS7_PAYLOAD_LEN] {
+    let (mode_id, colorful, speed, color) = match effect {
+        RgbEffect::Off => (0u8, false, 0u8, RgbColor::BLACK),
+        RgbEffect::Static { color } => (3u8, false, 0u8, color),
+        RgbEffect::Breathing { color, speed } => (4u8, false, speed.min(40), color),
+        RgbEffect::SpectrumCycle { speed } => (2u8, false, speed.min(40), RgbColor::WHITE),
+        RgbEffect::Wave { speed, .. } => (1u8, true, speed.min(40), RgbColor::WHITE),
+        RgbEffect::Reactive { color, speed } => (1u8, false, speed.min(40), color),
+        RgbEffect::Preset {
+            id,
+            color,
+            speed,
+            colorful,
+        } => (id, colorful, speed.min(40), color),
+    };
+    let max_raw: u16 = if mode_id == 4 { 100 } else { 160 };
+    let raw_brightness =
+        u8::try_from((u16::from(brightness_pct.min(100)) * max_raw + 50) / 100).unwrap_or(100);
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::BOX_LIGHT;
+    p[3] = mode_id;
+    p[4] = u8::from(colorful);
+    p[5] = raw_brightness;
+    p[6] = speed;
+    p[7] = color.r;
+    p[8] = color.g;
+    p[9] = color.b;
+    p
+}
+
+pub fn decode_logo_light(p: &[u8; RS7_PAYLOAD_LEN]) -> (RgbEffect, u8) {
+    let mode_id = p[3];
+    let colorful = p[4] != 0;
+    let raw_brightness = p[5];
+    let speed = p[6].min(40);
+    let color = RgbColor::new(p[7], p[8], p[9]);
+    let max_raw: u16 = if mode_id == 4 { 100 } else { 160 };
+    let brightness_pct =
+        u8::try_from(((u16::from(raw_brightness) * 100 + max_raw / 2) / max_raw).min(100))
+            .unwrap_or(100);
+    let effect = if mode_id == 0 {
+        RgbEffect::Off
+    } else {
+        RgbEffect::Preset {
+            id: mode_id,
+            color,
+            speed,
+            colorful,
+        }
+    };
+    (effect, brightness_pct)
+}
+
+pub fn req_deadzone_set(
+    top: TravelHundredthsMm,
+    bottom: TravelHundredthsMm,
+) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::DEAD_BAND;
+    let [t_hi, t_lo] = top.as_hundredths().to_be_bytes();
+    let [b_hi, b_lo] = bottom.as_hundredths().to_be_bytes();
+    p[3] = t_hi;
+    p[4] = t_lo;
+    p[5] = b_hi;
+    p[6] = b_lo;
+    p
+}
+
+pub fn req_rs_pair_set(
+    slot: u8,
+    pair: Option<&RapidSwitchPair>,
+) -> CoreResult<[u8; RS7_PAYLOAD_LEN]> {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::RS_SOCD;
+    p[5] = 0x03; // Vs.set
+    p[6] = slot;
+    p[8] = if slot >= 26 { slot - 26 } else { slot };
+    if let Some(pair) = pair {
+        let (r1, c1) = key_to_row_col(pair.key_a)?;
+        let (r2, c2) = key_to_row_col(pair.key_b)?;
+        p[7] = socd_wire::RS;
+        p[11] = 1; // withGlobal
+        p[13] = r1;
+        p[14] = c1;
+        p[15] = r2;
+        p[16] = c2;
+        p[17] = 0; // layer 0
+    } else {
+        p[7] = socd_wire::NONE;
+    }
+    Ok(p)
+}
+
+pub fn decode_rs_slot(p: &[u8; RS7_PAYLOAD_LEN]) -> Option<RapidSwitchPair> {
+    if p[7] != socd_wire::RS {
+        return None;
+    }
+    let key_a = row_col_to_key(p[13], p[14]);
+    let key_b = row_col_to_key(p[15], p[16]);
+    RapidSwitchPair::new(key_a, key_b).ok()
+}
+
+pub fn req_tap_dance_get(slot: u8) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::VIAL_PREFIX;
+    p[1] = sub::VIAL_ENTRY_OP;
+    p[2] = sub::TAP_DANCE_GET;
+    p[3] = slot;
+    p
+}
+
+pub fn req_tap_dance_set(
+    slot: u8,
+    tap: (u8, u8),
+    hold: (u8, u8),
+    timer_ms: u16,
+) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::VIAL_PREFIX;
+    p[1] = sub::VIAL_ENTRY_OP;
+    p[2] = sub::TAP_DANCE_SET;
+    p[3] = slot;
+    p[4] = tap.0;
+    p[5] = tap.1;
+    p[6] = hold.0;
+    p[7] = hold.1;
+    let [hi, lo] = timer_ms.to_be_bytes();
+    p[8] = hi;
+    p[9] = lo;
+    p
+}
+
+pub fn decode_tap_dance(p: &[u8; RS7_PAYLOAD_LEN]) -> ((u8, u8), (u8, u8), u16) {
+    let tap = (p[4], p[5]);
+    let hold = (p[6], p[7]);
+    let timer = u16::from_be_bytes([p[8], p[9]]);
+    (tap, hold, timer)
+}
+
+pub fn req_calibration_start() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::CALIBRATION_START;
+    p
+}
+
+pub fn req_calibration_finish() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::CALIBRATION_FINISH;
+    p
+}
+
+pub fn req_calibration_live_status_get(offset: u16, count: u8) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::GET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::CALIBRATION_LIVE_BUFFER;
+    let [hi, lo] = offset.to_be_bytes();
+    p[5] = hi;
+    p[6] = lo;
+    p[7] = count;
+    p
+}
+
+pub fn req_feature_flags_get() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::GET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::FEATURE;
+    p
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+pub fn req_feature_flags_set(
+    rgb_area: u8,
+    exchange_wasd: bool,
+    mac_mode: bool,
+    win_lock: bool,
+    six_key_rollover: bool,
+) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::FEATURE;
+    p[3] = rgb_area;
+    p[4] = u8::from(exchange_wasd);
+    p[5] = u8::from(mac_mode);
+    p[6] = u8::from(win_lock);
+    // Verified in duckbread_readable.js:2714-2718: wire byte = 1 - sixKeyNoPunch
+    p[7] = u8::from(!six_key_rollover);
+    p
+}
+
+/// Decodes `(rgb_area, exchange_wasd, mac_mode, win_lock, six_key_rollover)`.
+pub fn decode_feature_flags(p: &[u8; RS7_PAYLOAD_LEN]) -> (u8, bool, bool, bool, bool) {
+    (p[3], p[4] != 0, p[5] != 0, p[6] != 0, p[7] == 0)
+}
+
+pub fn req_anti_accidental_touch_get() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::GET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::BOTTOM_OPTIMIZE_SWITCH;
+    p
+}
+
+pub fn req_anti_accidental_touch_set(enabled: bool) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::BOTTOM_OPTIMIZE_SWITCH;
+    p[3] = u8::from(enabled);
+    p
+}
+
+pub fn req_game_mode_set(extreme: bool) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::GAME_MODE;
+    p[3] = u8::from(extreme);
+    p
+}
+
+pub fn req_report_rate_set(rate: PollingRateHz) -> CoreResult<[u8; RS7_PAYLOAD_LEN]> {
+    let raw = match rate {
+        PollingRateHz::Hz1000 => 1u8,
+        PollingRateHz::Hz2000 => 2u8,
+        PollingRateHz::Hz4000 => 4u8,
+        PollingRateHz::Hz8000 => 8u8,
+        other => {
+            return Err(CoreError::OutOfRange {
+                field: "polling_rate",
+                actual: other.to_string(),
+                expected: "1000, 2000, 4000, or 8000 Hz".to_owned(),
+            });
+        }
+    };
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::SET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::REPORT_RATE;
+    p[3] = raw;
+    Ok(p)
+}
+
+pub fn req_active_layer_get() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::GET_KEYBOARD_VALUE;
+    p[1] = sub::CUSTOM_ID;
+    p[2] = sub::LAYER;
+    p
+}
+
+pub fn decode_active_layer(raw: u8) -> u8 {
+    match raw {
+        4 | 8 => 2,
+        _ => 0,
+    }
+}
+
+pub fn req_keymap_get_buffer(offset: u16, length: u8) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::DYNAMIC_KEYMAP_GET_BUFFER;
+    let [hi, lo] = offset.to_be_bytes();
+    p[1] = hi;
+    p[2] = lo;
+    p[3] = length;
+    p
+}
+
+pub fn req_keymap_set_keycode(layer: u8, row: u8, col: u8, code: KeyCode) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::DYNAMIC_KEYMAP_SET_KEYCODE;
+    p[1] = layer;
+    p[2] = row;
+    p[3] = col;
+    p[4] = code.class;
+    p[5] = code.id;
+    p
+}
+
+pub fn req_keymap_reset() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::DYNAMIC_KEYMAP_RESET;
+    p
+}
+
+pub fn req_macro_buffer_size_get() -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::MACRO_GET_BUFFER_SIZE;
+    p
+}
+
+pub fn req_macro_buffer_get(offset: u16, size: u8) -> [u8; RS7_PAYLOAD_LEN] {
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::MACRO_GET_BUFFER;
+    let [hi, lo] = offset.to_be_bytes();
+    p[1] = hi;
+    p[2] = lo;
+    p[3] = size;
+    p
+}
+
+pub fn req_macro_buffer_set(offset: u16, data: &[u8]) -> [u8; RS7_PAYLOAD_LEN] {
+    let len = data.len().min(28);
+    let mut p = [0u8; RS7_PAYLOAD_LEN];
+    p[0] = cmd::MACRO_SET_BUFFER;
+    let [hi, lo] = offset.to_be_bytes();
+    p[1] = hi;
+    p[2] = lo;
+    p[3] = u8::try_from(len).unwrap_or(28);
+    p[4..4 + len].copy_from_slice(&data[..len]);
+    p
+}
+
+/// Encodes up to `RS7_MAX_MACRO_SLOTS` macros into the null-terminated QMK/Vial macro stream.
+pub fn encode_macros(macros: &[MacroSlot]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for slot_ix in 0..usize::from(RS7_MAX_MACRO_SLOTS) {
+        if let Some(slot) = macros.iter().find(|m| usize::from(m.index) == slot_ix) {
+            for step in &slot.steps {
+                let op = match step.kind {
+                    MacroActionKind::KeyTap => macro_wire::SS_TAP_CODE,
+                    MacroActionKind::KeyDown => macro_wire::SS_DOWN_CODE,
+                    MacroActionKind::KeyUp => macro_wire::SS_UP_CODE,
+                };
+                out.push(macro_wire::PREFIX);
+                out.push(op);
+                out.push(step.hid_keycode);
+                if step.delay_ms > 0 {
+                    let [lo, hi] = step.delay_ms.to_le_bytes();
+                    out.push(macro_wire::PREFIX);
+                    out.push(macro_wire::SS_DELAY_CODE);
+                    out.push(lo.saturating_add(1));
+                    out.push(hi.saturating_add(1));
+                }
+            }
+        }
+        out.push(0x00);
+    }
+    out
+}
+
+/// Decodes the null-terminated QMK/Vial macro buffer into `RS7_MAX_MACRO_SLOTS` slots.
+pub fn decode_macros(raw: &[u8]) -> Vec<MacroSlot> {
+    let mut slots = Vec::with_capacity(usize::from(RS7_MAX_MACRO_SLOTS));
+    let mut chunks = raw.split(|&b| b == 0x00);
+    for slot_ix in 0..RS7_MAX_MACRO_SLOTS {
+        let mut steps: Vec<MacroStep> = Vec::new();
+        if let Some(bytes) = chunks.next() {
+            let mut pos = 0usize;
+            while pos + 2 < bytes.len() {
+                if bytes[pos] != macro_wire::PREFIX {
+                    pos += 1;
+                    continue;
+                }
+                let op = bytes[pos + 1];
+                match op {
+                    macro_wire::SS_TAP_CODE | macro_wire::SS_DOWN_CODE | macro_wire::SS_UP_CODE => {
+                        let kind = match op {
+                            macro_wire::SS_TAP_CODE => MacroActionKind::KeyTap,
+                            macro_wire::SS_DOWN_CODE => MacroActionKind::KeyDown,
+                            _ => MacroActionKind::KeyUp,
+                        };
+                        let keycode = bytes[pos + 2];
+                        pos += 3;
+                        let mut delay_ms = 0u16;
+                        if pos + 3 < bytes.len()
+                            && bytes[pos] == macro_wire::PREFIX
+                            && bytes[pos + 1] == macro_wire::SS_DELAY_CODE
+                        {
+                            let lo = bytes[pos + 2].saturating_sub(1);
+                            let hi = bytes[pos + 3].saturating_sub(1);
+                            delay_ms = u16::from_le_bytes([lo, hi]);
+                            pos += 4;
+                        }
+                        steps.push(MacroStep::new(kind, keycode, delay_ms));
+                    }
+                    macro_wire::SS_DELAY_CODE | 5..=7 if pos + 3 < bytes.len() => {
+                        pos += 4;
+                    }
+                    _ => {
+                        pos += 1;
+                    }
+                }
+            }
+        }
+        slots.push(MacroSlot::new(slot_ix, format!("M{}", slot_ix + 1), steps));
+    }
+    slots
 }

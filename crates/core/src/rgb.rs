@@ -68,17 +68,68 @@ pub enum RgbEffectKind {
     SpectrumCycle,
     Wave,
     Reactive,
+    /// Vendor/firmware-defined lighting preset identified by numeric ID.
+    Preset,
+}
+
+/// Metadata describing one firmware-defined lighting preset exposed by a zone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RgbPresetInfo {
+    pub id: u8,
+    pub name: String,
+    pub supports_color: bool,
+    pub supports_speed: bool,
+    pub supports_colorful: bool,
+}
+
+impl RgbPresetInfo {
+    pub fn new(
+        id: u8,
+        name: impl Into<String>,
+        supports_color: bool,
+        supports_speed: bool,
+        supports_colorful: bool,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            supports_color,
+            supports_speed,
+            supports_colorful,
+        }
+    }
 }
 
 /// Configured RGB lighting effect parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RgbEffect {
     Off,
-    Static { color: RgbColor },
-    Breathing { color: RgbColor, speed: u8 },
-    SpectrumCycle { speed: u8 },
-    Wave { speed: u8, direction: RgbDirection },
-    Reactive { color: RgbColor, speed: u8 },
+    Static {
+        color: RgbColor,
+    },
+    Breathing {
+        color: RgbColor,
+        speed: u8,
+    },
+    SpectrumCycle {
+        speed: u8,
+    },
+    Wave {
+        speed: u8,
+        direction: RgbDirection,
+    },
+    Reactive {
+        color: RgbColor,
+        speed: u8,
+    },
+    /// Firmware preset effect by ID with color, speed (`0..=255`), and full-color toggle.
+    Preset {
+        id: u8,
+        color: RgbColor,
+        speed: u8,
+        colorful: bool,
+    },
 }
 
 impl RgbEffect {
@@ -90,6 +141,7 @@ impl RgbEffect {
             Self::SpectrumCycle { .. } => RgbEffectKind::SpectrumCycle,
             Self::Wave { .. } => RgbEffectKind::Wave,
             Self::Reactive { .. } => RgbEffectKind::Reactive,
+            Self::Preset { .. } => RgbEffectKind::Preset,
         }
     }
 }
@@ -114,6 +166,10 @@ impl RgbZoneId {
 pub struct RgbZoneInfo {
     pub id: RgbZoneId,
     pub name: String,
+    /// Optional zone-specific firmware lighting presets (e.g. Back Lamp 21 modes, Logo Light 5 modes).
+    pub presets: Vec<RgbPresetInfo>,
+    /// Maximum raw speed value supported by this zone (`255` default, `40` for ATK Logo Light).
+    pub max_speed: u8,
 }
 
 impl RgbZoneInfo {
@@ -121,7 +177,19 @@ impl RgbZoneInfo {
         Self {
             id,
             name: name.into(),
+            presets: Vec::new(),
+            max_speed: 255,
         }
+    }
+
+    pub fn with_presets(mut self, presets: Vec<RgbPresetInfo>) -> Self {
+        self.presets = presets;
+        self
+    }
+
+    pub const fn with_max_speed(mut self, max_speed: u8) -> Self {
+        self.max_speed = max_speed;
+        self
     }
 }
 

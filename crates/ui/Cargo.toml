@@ -20,6 +20,10 @@ agnoperiph-driver-lamzu = { workspace = true }
 agnoperiph-driver-logitech = { workspace = true }
 agnoperiph-transport = { workspace = true }
 gpui-kit = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+winreg = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

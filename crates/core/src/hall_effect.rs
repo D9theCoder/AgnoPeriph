@@ -175,6 +175,75 @@ impl SocdPair {
     }
 }
 
+/// Paired keys for hardware Rapid Switching / Rappy Snappy (deeper press wins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RapidSwitchPair {
+    pub key_a: KeyIndex,
+    pub key_b: KeyIndex,
+}
+
+impl RapidSwitchPair {
+    pub fn new(key_a: KeyIndex, key_b: KeyIndex) -> CoreResult<Self> {
+        if key_a == key_b {
+            return Err(CoreError::Validation(format!(
+                "Rapid Switch pair requires two distinct keys, got {key_a}"
+            )));
+        }
+        Ok(Self { key_a, key_b })
+    }
+}
+
+/// Hold/Click (Mod-Tap / MT) binding stored in a tap-dance slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ModTapBinding {
+    pub slot: u8,
+    pub key: KeyIndex,
+    pub tap_keycode: (u8, u8),
+    pub hold_keycode: (u8, u8),
+    pub hold_delay_ms: u16,
+}
+
+impl ModTapBinding {
+    pub const fn new(
+        slot: u8,
+        key: KeyIndex,
+        tap_keycode: (u8, u8),
+        hold_keycode: (u8, u8),
+        hold_delay_ms: u16,
+    ) -> Self {
+        Self {
+            slot,
+            key,
+            tap_keycode,
+            hold_keycode,
+            hold_delay_ms,
+        }
+    }
+}
+
+/// Toggle Switch (TGL) binding stored in a tap-dance slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ToggleKeyBinding {
+    pub slot: u8,
+    pub key: KeyIndex,
+    pub keycode: (u8, u8),
+    pub delay_ms: u16,
+}
+
+impl ToggleKeyBinding {
+    pub const fn new(slot: u8, key: KeyIndex, keycode: (u8, u8), delay_ms: u16) -> Self {
+        Self {
+            slot,
+            key,
+            keycode,
+            delay_ms,
+        }
+    }
+}
+
 /// Magnetic sensor calibration state reported by the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalibrationStatus {
@@ -395,7 +464,12 @@ pub struct HallEffectSnapshot {
     pub keys: Vec<KeyHallEffectConfig>,
     pub dks_bindings: Vec<DksBinding>,
     pub socd_pairs: Vec<SocdPair>,
+    pub rapid_switch_pairs: Vec<RapidSwitchPair>,
+    pub mod_tap_bindings: Vec<ModTapBinding>,
+    pub toggle_bindings: Vec<ToggleKeyBinding>,
     pub calibration: CalibrationStatus,
+    /// Per-key calibration status (`true` = calibrated) indexed by [`KeyIndex`], when reported.
+    pub calibrated_keys: Vec<bool>,
 }
 
 impl HallEffectSnapshot {
@@ -409,8 +483,32 @@ impl HallEffectSnapshot {
             keys,
             dks_bindings,
             socd_pairs,
+            rapid_switch_pairs: Vec::new(),
+            mod_tap_bindings: Vec::new(),
+            toggle_bindings: Vec::new(),
             calibration,
+            calibrated_keys: Vec::new(),
         }
+    }
+
+    pub fn with_rapid_switch_pairs(mut self, pairs: Vec<RapidSwitchPair>) -> Self {
+        self.rapid_switch_pairs = pairs;
+        self
+    }
+
+    pub fn with_mod_tap_bindings(mut self, bindings: Vec<ModTapBinding>) -> Self {
+        self.mod_tap_bindings = bindings;
+        self
+    }
+
+    pub fn with_toggle_bindings(mut self, bindings: Vec<ToggleKeyBinding>) -> Self {
+        self.toggle_bindings = bindings;
+        self
+    }
+
+    pub fn with_calibrated_keys(mut self, calibrated_keys: Vec<bool>) -> Self {
+        self.calibrated_keys = calibrated_keys;
+        self
     }
 }
 
@@ -428,11 +526,45 @@ pub trait HallEffectKeyboard: Send + Sync {
     /// Sets actuation travel distance for a single key.
     fn set_key_actuation(&mut self, key: KeyIndex, point: TravelHundredthsMm) -> CoreResult<()>;
 
+    /// Sets actuation travel distance for a subset of keys.
+    fn set_keys_actuation(
+        &mut self,
+        keys: &[KeyIndex],
+        point: TravelHundredthsMm,
+    ) -> CoreResult<()> {
+        for &key in keys {
+            self.set_key_actuation(key, point)?;
+        }
+        Ok(())
+    }
+
     /// Sets uniform actuation travel distance across all keys.
     fn set_global_actuation(&mut self, point: TravelHundredthsMm) -> CoreResult<()>;
 
     /// Configures per-key Rapid Trigger.
     fn set_rapid_trigger(&mut self, key: KeyIndex, config: RapidTriggerConfig) -> CoreResult<()>;
+
+    /// Configures Rapid Trigger for a subset of keys.
+    fn set_keys_rapid_trigger(
+        &mut self,
+        keys: &[KeyIndex],
+        config: RapidTriggerConfig,
+    ) -> CoreResult<()> {
+        for &key in keys {
+            self.set_rapid_trigger(key, config)?;
+        }
+        Ok(())
+    }
+
+    /// Sets global top and bottom switch deadzones.
+    fn set_deadzones(
+        &mut self,
+        top: TravelHundredthsMm,
+        bottom: TravelHundredthsMm,
+    ) -> CoreResult<()> {
+        let _ = (top, bottom);
+        Err(CoreError::UnsupportedCapability("deadzone"))
+    }
 
     /// Configures a 4-stage Dynamic Keystroke (DKS) binding for a key.
     fn set_dks_binding(&mut self, binding: DksBinding) -> CoreResult<()> {
@@ -450,5 +582,50 @@ pub trait HallEffectKeyboard: Send + Sync {
     fn set_socd_pairs(&mut self, pairs: &[SocdPair]) -> CoreResult<()> {
         let _ = pairs;
         Err(CoreError::UnsupportedCapability("socd"))
+    }
+
+    /// Writes the active hardware Rapid Switching (Rappy Snappy) key pairs.
+    fn set_rapid_switch_pairs(&mut self, pairs: &[RapidSwitchPair]) -> CoreResult<()> {
+        let _ = pairs;
+        Err(CoreError::UnsupportedCapability("rapid_switch"))
+    }
+
+    /// Writes a Hold/Click (Mod-Tap) binding and binds its target key on layer 0.
+    fn set_mod_tap_binding(&mut self, binding: ModTapBinding) -> CoreResult<()> {
+        let _ = binding;
+        Err(CoreError::UnsupportedCapability("mod_tap"))
+    }
+
+    /// Clears a Hold/Click (Mod-Tap) binding slot.
+    fn clear_mod_tap_binding(&mut self, slot: u8, key: KeyIndex) -> CoreResult<()> {
+        let _ = (slot, key);
+        Err(CoreError::UnsupportedCapability("mod_tap"))
+    }
+
+    /// Writes a Toggle Switch (TGL) binding and binds its target key on layer 0.
+    fn set_toggle_binding(&mut self, binding: ToggleKeyBinding) -> CoreResult<()> {
+        let _ = binding;
+        Err(CoreError::UnsupportedCapability("toggle_key"))
+    }
+
+    /// Clears a Toggle Switch (TGL) binding slot.
+    fn clear_toggle_binding(&mut self, slot: u8, key: KeyIndex) -> CoreResult<()> {
+        let _ = (slot, key);
+        Err(CoreError::UnsupportedCapability("toggle_key"))
+    }
+
+    /// Enters interactive magnetic sensor calibration mode.
+    fn start_calibration(&mut self) -> CoreResult<()> {
+        Err(CoreError::UnsupportedCapability("calibration_control"))
+    }
+
+    /// Exits interactive magnetic sensor calibration mode and saves calibrated values.
+    fn finish_calibration(&mut self) -> CoreResult<()> {
+        Err(CoreError::UnsupportedCapability("calibration_control"))
+    }
+
+    /// Polls per-key calibration completion flags (`true` = calibrated).
+    fn read_calibration_key_progress(&mut self) -> CoreResult<Vec<bool>> {
+        Err(CoreError::UnsupportedCapability("calibration_control"))
     }
 }

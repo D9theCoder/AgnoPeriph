@@ -37,6 +37,7 @@ fn effect_label(kind: RgbEffectKind) -> &'static str {
         RgbEffectKind::SpectrumCycle => "Spectrum",
         RgbEffectKind::Wave => "Wave",
         RgbEffectKind::Reactive => "Reactive",
+        RgbEffectKind::Preset => "Preset",
     }
 }
 
@@ -44,7 +45,8 @@ fn effect_color(effect: RgbEffect) -> Option<RgbColor> {
     match effect {
         RgbEffect::Static { color }
         | RgbEffect::Breathing { color, .. }
-        | RgbEffect::Reactive { color, .. } => Some(color),
+        | RgbEffect::Reactive { color, .. }
+        | RgbEffect::Preset { color, .. } => Some(color),
         RgbEffect::Off | RgbEffect::SpectrumCycle { .. } | RgbEffect::Wave { .. } => None,
     }
 }
@@ -54,7 +56,8 @@ fn effect_speed(effect: RgbEffect) -> u8 {
         RgbEffect::Breathing { speed, .. }
         | RgbEffect::SpectrumCycle { speed }
         | RgbEffect::Wave { speed, .. }
-        | RgbEffect::Reactive { speed, .. } => speed,
+        | RgbEffect::Reactive { speed, .. }
+        | RgbEffect::Preset { speed, .. } => speed,
         RgbEffect::Off | RgbEffect::Static { .. } => DEFAULT_SPEED,
     }
 }
@@ -71,6 +74,12 @@ pub fn effect_of_kind(kind: RgbEffectKind, color: RgbColor, speed: u8) -> RgbEff
             direction: RgbDirection::LeftToRight,
         },
         RgbEffectKind::Reactive => RgbEffect::Reactive { color, speed },
+        RgbEffectKind::Preset => RgbEffect::Preset {
+            id: 2,
+            color,
+            speed,
+            colorful: false,
+        },
     }
 }
 

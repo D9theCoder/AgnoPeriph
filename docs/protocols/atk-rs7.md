@@ -74,8 +74,49 @@ All byte offsets below are 0-based indices into the 32-byte payload `p[0..32]` (
 | **DKS Slot** (`Wt.get`) | `[0x02, 0x96, 0x0F, 0, 0, 0x01, idx]` (`idx: 0..20`) | `p[7..23]`: 4 actions × 4 bytes `[status_hi, status_lo, keyClass, keyId]` |
 | **SOCD / RS Slot** (`rs.get`) | `[0x02, 0x96, 0x20, 0, 0, 0x01, idx, 0, idx]` (`idx: 0..20`) | `p[7]=mode`, `p[8]=id`, `p[9..11]=point (>u16)`, `p[11]=withGlobal`, `p[12]=rt`, `p[13..17]=[k1_r, k1_c, k2_r, k2_c]`, `p[17]=layer` |
 | **Calibration Init Status** (`Qt.getInitStatusBuffer`) | `[0x02, 0x96, 0x1F, 0, 0, off_hi, off_lo, count]` | `p[8 .. 8 + count]`: `count` (`<=24`) bytes (`1` = calibrated, `0` = uncalibrated) |
+| **Calibration Live Progress** (`Qt.getAdcTripCompStatusBuffer`) | `[0x02, 0x96, 0x1C, 0, 0, off_hi, off_lo, count]` | `p[8 .. 8 + count*5]`: `count` (`<=4`) × `[adc_u16_be, travel_u16_be, is_calibrated_u8]` |
+| **Keyboard Feature Flags** (`qs.get`) | `[0x02, 0x96, 0x11]` | `p[3]=rgbArea`, `p[4]=wasdSwitch`, `p[5]=macSwitch`, `p[6]=winLock`, `p[7]=1-nKroSwitch` (`0`=6KRO, `1`=NKRO) |
+| **Anti-Accidental Touch** (`Qs.get`) | `[0x02, 0x96, 0x1D]` | `p[3]=status` (`0`/`1`) |
+| **Keymap Single Key** (`ha.get`) | `[0x04, layer, row, col]` | `p[4]=keyClass`, `p[5]=keyId` (`layer`: `0`=Win Base, `1`=Win Fn, `2`=Mac Base, `3`=Mac Fn) |
+| **Keymap Bulk Buffer** (`zs.get`) | `[0x12, off_hi, off_lo, len]` (`len<=28`) | `p[4 .. 4 + len]`: `len/2` pairs `[keyClass, keyId]` across `4×6×16×2 = 768` bytes |
+| **MT / TGL Tap-Dance Slot** (`bt.get`) | `[0xFE, 0x0D, 0x01, slot]` (`0..19`=MT, `20..39`=TGL) | `p[4..6]=tap[class,id]`, `p[6..8]=hold[class,id]`, `p[8..10]=timer_ms (>u16)` |
+| **Macro Buffer Size** (`ua.get`) | `[0x0D]` | `p[1..3]=size (>u16)` |
+| **Macro Buffer Chunk** (`$s.get`) | `[0x0E, off_hi, off_lo, sz]` (`sz<=28`) | `p[4 .. 4 + sz]`: null-terminated (`0x00`) QMK/Vial macro stream (`M1..M16`) |
 | **Backlight RGB** (`Ys.get`) | `[0x08, 0x41]` | `p[2]=effect`, `p[4]=speed`, `p[5..8]=[r, g, b]`, `p[8]=brightness (0..=100)` |
 | **Logo Light** (`Js.get`) | `[0x02, 0x96, 0x21]` | `p[3]=mode`, `p[4]=colorful`, `p[5]=brightness`, `p[6]=speed`, `p[7..10]=[r, g, b]` |
+
+### Back Lamp Effect IDs (`da` in `api-NHsRvjW6.js`)
+| ID | Name | ID | Name | ID | Name |
+| --- | --- | --- | --- | --- | --- |
+| `0` | Close | `8` | Laser | `26` | Spectrum Breathing |
+| `1` | Customization | `9` | Pinwheel | `28` | Spectrum Float |
+| `2` | Single Color Constant | `11` | Vortex | `30` | Digital Rain |
+| `3` | Focus | `13` | Spectral Cycle | `31` | Single Light Up |
+| `4` | Up-Down Rainbow | `19` | Colorful Swirls | `36` | Crucifix |
+| `5` | Left-Right Rainbow | `23` | Double Vortex | `39` | Fingertip Rainbow |
+| `6` | Monochrome Breath | `25` | Christmas | | |
+| `7` | Fluttering Ribbons | | | | |
+
+### Logo Light Effect IDs (`ga` in `api-NHsRvjW6.js`)
+| ID | Name | Brightness Range | Speed Range | Supports `colorful` |
+| --- | --- | --- | --- | --- |
+| `0` | Close | — | — | No |
+| `1` | Streamer | `0..=160` | `0..=40` | Yes |
+| `2` | Spectral Cycle | `0..=160` | `0..=40` | No |
+| `3` | Always On | `0..=160` | — | No |
+| `4` | Monochrome Breath | `0..=100` | `0..=40` | Yes |
+
+### Key Classes (`x` in `api-NHsRvjW6.js`)
+- `0x00` (`general`): standard USB HID keycode (`0x00, 0x01` = transparent)
+- `0x52` (`layer`): layer switch (`MO` / `Fn`)
+- `0x57` (`tapDance`): `0..=19` = MT (Hold/Click), `20..=39` = TGL (Toggle Switch)
+- `0x77` (`macro`): `0..=15` = Macro `M1..M16`
+- `0x78` (`light`): Backlight / Logo Light control keys
+- `0x7C` (`system`): Media & OS system keys
+- `0x7E` (`kbAndUser`): `5..=24` = DKS slot `0..=19`
+
+### Onboard Hardware Profiles Note
+In `api-NHsRvjW6.js` (`Aa.getProfile()` / `Aa.setProfile()`), the DuckBread RS7 firmware exposes a single onboard hardware slot (`0`). Multi-profile switching in ATK HUB is implemented via host-stored named profiles pushed to the device (`setCustomConfig`). AgnoPeriph mirrors this by managing named software profiles for the RS7 alongside hardware profile slots for Lamzu/Logitech.
 
 ### SOCD / RS Mode Enum (`G`)
 | Wire Byte | Name | Mapped `SocdMode` |
@@ -100,8 +141,17 @@ All byte offsets below are 0-based indices into the 32-byte payload `p[0..32]` (
 | **Global Deadzone** (`Xs.create`) | `[0x03, 0x96, 0x0B, top_hi, top_lo, bot_hi, bot_lo]` | Updates top & bottom deadzones |
 | **DKS Slot** (`Wt.create`) | `[0x03, 0x96, 0x0F, 0, 0, 0x03, idx, actions[16]]` | Writes 4-stage DKS action table for slot `idx` (`0..20`) |
 | **SOCD / RS Slot** (`rs.create`) | `[0x03, 0x96, 0x20, 0, 0, 0x03, idx, mode, id, pt_hi, pt_lo, withGlobal, rt, k1_r, k1_c, k2_r, k2_c, layer]` | Writes or clears (`mode=0`) one SOCD pair slot (`0..20`) |
-| **Backlight RGB** (`Ys.create`) | `[0x07, 0x41, effect, 0, speed, r, g, b, brightness]` | Sets main key backlight effect, speed, RGB color, and brightness (`0..=100`) |
+| **Backlight RGB** (`Ys.create`) | `[0x07, 0x41, effect, 0, speed, r, g, b, brightness]` | Sets main key backlight effect, speed (`1..=255`), RGB color, and brightness (`0..=100`) |
 | **Logo Light** (`Js.create`) | `[0x03, 0x96, 0x21, mode, colorful, brightness, speed, r, g, b]` | Sets ATK RS7 logo light zone |
+| **Keyboard Feature Flags** (`qs.create`) | `[0x03, 0x96, 0x11, rgbArea, wasdSwitch, macSwitch, winLock, 1-nKroSwitch]` | Sets MAC Mode, Exchange WASD, Win Lock, and 6-Key Rollover (`0`=6KRO, `1`=NKRO) |
+| **Anti-Accidental Touch** (`Qs.create`) | `[0x03, 0x96, 0x1D, status]` | Toggles bottom-optimize / anti-accidental touch mode (`0`/`1`) |
+| **Extreme Performance Mode** (`_e.create`) | `[0x03, 0x96, 0x1E, status]` | Toggles Normal (`0`, 0.02 mm step) vs Extreme (`1`, 0.01 mm step) |
+| **Polling Rate** (`Zs.create`) | `[0x03, 0x96, 0x22, rate]` | Sets USB polling rate (`1`=1K, `2`=2K, `4`=4K, `8`=8K Hz) |
+| **Keymap Single Key** (`ha.create`) | `[0x05, layer, row, col, keyClass, keyId]` | Remaps one key on layer `0..=3` |
+| **Keymap Reset** (`Ws.getKeyAction`) | `[0x06]` | Resets dynamic keymap layers to factory defaults (safe, non-EEPROM/bootloader) |
+| **MT / TGL Tap-Dance Slot** (`bt.create`) | `[0xFE, 0x0D, 0x02, slot, tapClass, tapId, holdClass, holdId, timer_hi, timer_lo]` | Writes MT (`slot 0..19`) or TGL (`slot 20..39`) binding |
+| **Macro Buffer Chunk** (`$s.create`) | `[0x0F, off_hi, off_lo, sz, data[0..sz]]` | Writes `sz<=28` bytes of QMK/Vial macro stream (`[0x01, 0x02, kc]` down, `[0x01, 0x03, kc]` up, `[0x01, 0x01, kc]` tap, `[0x01, 0x04, (lo+1).min(255), (hi+1).min(255)]` delay, `0x00` macro separator) |
+| **Calibration Start / Finish** (`Qt.start` / `Qt.finish`) | `[0x03, 0x96, 0x18]` / `[0x03, 0x96, 0x19]` | Enters or exits interactive magnetic sensor calibration mode |
 
 ---
 

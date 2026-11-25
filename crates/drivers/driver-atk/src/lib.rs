@@ -12,26 +12,54 @@ use std::time::Duration;
 use agnoperiph_core::{
     Brightness, CalibrationStatus, Capabilities, ConnectionKind, CoreError, CoreResult, DeviceId,
     DeviceInfo, DeviceMatchRule, DksBinding, DriverDescriptor, HallEffectCapabilities,
-    HallEffectKeyboard, HallEffectSnapshot, KeyHallEffectConfig, KeyIndex, Peripheral,
-    PollingRateHz, RapidTriggerConfig, RgbCapabilities, RgbController, RgbEffect, RgbEffectKind,
-    RgbSnapshot, RgbZoneId, RgbZoneInfo, RgbZoneState, SocdPair, TravelHundredthsMm, VendorKind,
+    HallEffectKeyboard, HallEffectSnapshot, KeyCode, KeyHallEffectConfig, KeyIndex,
+    KeyboardConfigCapabilities, KeyboardConfigController, KeyboardConfigSnapshot,
+    KeymapCapabilities, KeymapController, KeymapSnapshot, MacroCapabilities, MacroController,
+    MacroSlot, ModTapBinding, Peripheral, PollingRateHz, RapidSwitchPair, RapidTriggerConfig,
+    RgbCapabilities, RgbController, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId, RgbZoneInfo,
+    RgbZoneState, SocdPair, ToggleKeyBinding, TravelHundredthsMm, VendorKind,
 };
 use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
 
 use crate::protocol::{
-    ATK_RS7_PID, ATK_RS7_USAGE_ID, ATK_RS7_USAGE_PAGE, ATK_VID, RS7_KEY_COUNT, RS7_MAX_DKS_SLOTS,
-    RS7_MAX_SOCD_SLOTS, RS7_PAYLOAD_LEN, RS7_RT_MAX, RS7_RT_MIN, RS7_STEP_EXTREME, RS7_STEP_NORMAL,
-    RS7_TRAVEL_MAX, RS7_TRAVEL_MIN, RS7_TX_REPORT_LEN, atk_rs7_validator, decode_backlight,
-    decode_deadzone, decode_dks_slot, decode_firmware_version, decode_report_rate,
-    decode_socd_slot, flash_op, key_to_row_col, req_backlight_get, req_backlight_set,
-    req_calibration_init_status_get, req_deadzone_get, req_dks_get, req_dks_set,
-    req_firmware_version, req_game_mode, req_report_rate, req_rt_buffer_get,
-    req_single_actuation_set, req_single_rt_set, req_socd_get, req_socd_set, req_travel_buffer_get,
+    ATK_RS7_PID, ATK_RS7_USAGE_ID, ATK_RS7_USAGE_PAGE, ATK_VID, RS7_COLS, RS7_KEY_COUNT,
+    RS7_LAYERS, RS7_MAX_DKS_SLOTS, RS7_MAX_MACRO_SLOTS, RS7_MAX_MT_SLOTS, RS7_MAX_SOCD_SLOTS,
+    RS7_MAX_TGL_SLOTS, RS7_PAYLOAD_LEN, RS7_ROWS, RS7_RT_MAX, RS7_RT_MIN, RS7_STEP_EXTREME,
+    RS7_STEP_NORMAL, RS7_TRAVEL_MAX, RS7_TRAVEL_MIN, RS7_TX_REPORT_LEN, atk_rs7_validator,
+    back_lamp_presets, decode_active_layer, decode_backlight, decode_deadzone, decode_dks_slot,
+    decode_feature_flags, decode_firmware_version, decode_logo_light, decode_macros,
+    decode_report_rate, decode_rs_slot, decode_socd_slot, decode_tap_dance, encode_macros,
+    flash_op, key_class, key_to_row_col, logo_light_presets, req_active_layer_get,
+    req_anti_accidental_touch_get, req_anti_accidental_touch_set, req_backlight_get,
+    req_backlight_set, req_calibration_finish, req_calibration_init_status_get,
+    req_calibration_live_status_get, req_calibration_start, req_deadzone_get, req_deadzone_set,
+    req_dks_get, req_dks_set, req_feature_flags_get, req_feature_flags_set, req_firmware_version,
+    req_game_mode, req_game_mode_set, req_keymap_get_buffer, req_keymap_reset,
+    req_keymap_set_keycode, req_logo_light_get, req_logo_light_set, req_macro_buffer_get,
+    req_macro_buffer_set, req_macro_buffer_size_get, req_report_rate, req_report_rate_set,
+    req_rs_pair_set, req_rt_buffer_get, req_single_actuation_set, req_single_rt_set, req_socd_get,
+    req_socd_set, req_tap_dance_get, req_tap_dance_set, req_travel_buffer_get,
     req_travel_buffer_set, unwrap_rx, wrap_tx,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_READ_ATTEMPTS: usize = 8;
+
+struct PairedSlotScan {
+    socd_pairs: Vec<SocdPair>,
+    socd_slots: Vec<u8>,
+    rs_pairs: Vec<RapidSwitchPair>,
+    rs_slots: Vec<u8>,
+    other_reserved: Vec<u8>,
+}
+
+/// Decoded Tap-Dance slot entry (`tap`, `hold`, `hold_delay_ms`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapDanceEntry {
+    pub tap: (u8, u8),
+    pub hold: (u8, u8),
+    pub hold_delay_ms: u16,
+}
 
 /// Returns the declarative `DriverDescriptor` registering ATK RS7 (`0x373B:0x1044`, `0xFF60:0x0061`).
 pub fn driver_descriptor() -> DriverDescriptor {
@@ -57,8 +85,12 @@ pub struct AtkRs7Device<T: HidTransport> {
     polling_rate: Option<PollingRateHz>,
     /// Hardware SOCD slot indices (`0..RS7_MAX_SOCD_SLOTS`) observed on the last read/write.
     socd_slots: Option<Vec<u8>>,
-    /// Hardware slots occupied by non-SOCD modes (e.g. Rappy Snappy / OKS) that must never be overwritten.
+    /// Hardware Rapid Switch (RS) slot indices observed on the last read/write.
+    rs_slots: Option<Vec<u8>>,
+    /// Hardware slots occupied by other non-SOCD/non-RS modes (e.g. OKS) that must never be overwritten.
     reserved_rs_slots: Vec<u8>,
+    /// Last read `rgbArea` byte from feature flags so writes preserve it.
+    rgb_area: u8,
 }
 
 impl<T: HidTransport> fmt::Debug for AtkRs7Device<T> {
@@ -116,12 +148,19 @@ impl<T: HidTransport> AtkRs7Device<T> {
         let mut dev = Self {
             transport: guarded,
             info,
-            capabilities: Capabilities::empty().with_hall_effect(true).with_rgb(true),
+            capabilities: Capabilities::empty()
+                .with_hall_effect(true)
+                .with_rgb(true)
+                .with_keymap(true)
+                .with_macros(true)
+                .with_keyboard_config(true),
             he_caps: build_he_caps(false),
             extreme_mode: false,
             polling_rate: None,
             socd_slots: None,
+            rs_slots: None,
             reserved_rs_slots: Vec::new(),
+            rgb_area: 0,
         };
 
         dev.discover_readonly()?;
@@ -197,20 +236,43 @@ impl<T: HidTransport> AtkRs7Device<T> {
         Ok(())
     }
 
-    fn scan_socd_slots(&mut self) -> CoreResult<(Vec<SocdPair>, Vec<u8>, Vec<u8>)> {
-        let mut pairs = Vec::new();
+    fn scan_paired_slots(&mut self) -> CoreResult<PairedSlotScan> {
+        let mut socd_pairs = Vec::new();
         let mut socd_slots = Vec::new();
-        let mut reserved_rs_slots = Vec::new();
+        let mut rs_pairs = Vec::new();
+        let mut rs_slots = Vec::new();
+        let mut other_reserved = Vec::new();
         for slot in 0..RS7_MAX_SOCD_SLOTS {
             let resp = self.exchange(req_socd_get(slot), false)?;
             if let Some(pair) = decode_socd_slot(&resp) {
-                pairs.push(pair);
+                socd_pairs.push(pair);
                 socd_slots.push(slot);
+            } else if let Some(pair) = decode_rs_slot(&resp) {
+                rs_pairs.push(pair);
+                rs_slots.push(slot);
             } else if resp[7] != protocol::socd_wire::NONE {
-                reserved_rs_slots.push(slot);
+                other_reserved.push(slot);
             }
         }
-        Ok((pairs, socd_slots, reserved_rs_slots))
+        Ok(PairedSlotScan {
+            socd_pairs,
+            socd_slots,
+            rs_pairs,
+            rs_slots,
+            other_reserved,
+        })
+    }
+
+    fn read_calibrated_keys_init(&mut self) -> CoreResult<Vec<bool>> {
+        let mut flags = Vec::with_capacity(usize::from(RS7_KEY_COUNT));
+        for chunk_ix in 0..(RS7_KEY_COUNT / 24) {
+            let offset = chunk_ix * 24;
+            let resp = self.exchange(req_calibration_init_status_get(offset, 24), false)?;
+            for k in 0..24usize {
+                flags.push(resp[8 + k] != 0);
+            }
+        }
+        Ok(flags)
     }
 }
 
@@ -253,6 +315,30 @@ impl<T: HidTransport> Peripheral for AtkRs7Device<T> {
     }
 
     fn as_rgb_mut(&mut self) -> Option<&mut dyn RgbController> {
+        Some(self)
+    }
+
+    fn as_keymap(&self) -> Option<&dyn KeymapController> {
+        Some(self)
+    }
+
+    fn as_keymap_mut(&mut self) -> Option<&mut dyn KeymapController> {
+        Some(self)
+    }
+
+    fn as_macros(&self) -> Option<&dyn MacroController> {
+        Some(self)
+    }
+
+    fn as_macros_mut(&mut self) -> Option<&mut dyn MacroController> {
+        Some(self)
+    }
+
+    fn as_keyboard_config(&self) -> Option<&dyn KeyboardConfigController> {
+        Some(self)
+    }
+
+    fn as_keyboard_config_mut(&mut self) -> Option<&mut dyn KeyboardConfigController> {
         Some(self)
     }
 }
@@ -305,11 +391,14 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
             })
             .collect();
 
-        // 4. Read active SOCD pairs across hardware slots (0..20), remembering occupied and
-        // non-SOCD (RS/OKS) slots so writes update in place and clear removed pairs safely.
-        let (socd_pairs, socd_slots, reserved_rs_slots) = self.scan_socd_slots()?;
-        self.socd_slots = Some(socd_slots);
-        self.reserved_rs_slots = reserved_rs_slots;
+        // 4. Read active SOCD and RS pairs across hardware slots (0..20), remembering occupied and
+        // non-SOCD slots so writes update in place and clear removed pairs safely.
+        let scan = self.scan_paired_slots()?;
+        let socd_pairs = scan.socd_pairs;
+        let rs_pairs = scan.rs_pairs;
+        self.socd_slots = Some(scan.socd_slots);
+        self.rs_slots = Some(scan.rs_slots);
+        self.reserved_rs_slots = scan.other_reserved;
 
         // 5. Read active DKS bindings across hardware slots (0..20)
         let mut dks_bindings = Vec::new();
@@ -321,34 +410,28 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
             }
         }
 
-        // 6. Calibration init status
-        let calibration = self.read_calibration_status()?;
+        // 6. Calibration init status (per-key flags + aggregate status)
+        let calibrated_keys = self.read_calibrated_keys_init()?;
+        let calibration = if calibrated_keys.is_empty() {
+            CalibrationStatus::Unknown
+        } else if calibrated_keys.iter().any(|&v| v) {
+            CalibrationStatus::Calibrated
+        } else {
+            CalibrationStatus::NeedsCalibration
+        };
 
-        Ok(HallEffectSnapshot::new(
-            keys,
-            dks_bindings,
-            socd_pairs,
-            calibration,
-        ))
+        Ok(
+            HallEffectSnapshot::new(keys, dks_bindings, socd_pairs, calibration)
+                .with_rapid_switch_pairs(rs_pairs)
+                .with_calibrated_keys(calibrated_keys),
+        )
     }
 
     fn read_calibration_status(&mut self) -> CoreResult<CalibrationStatus> {
-        let mut calibrated_count = 0usize;
-        let mut total_checked = 0usize;
-        for chunk_ix in 0..(RS7_KEY_COUNT / 24) {
-            let offset = chunk_ix * 24;
-            let resp = self.exchange(req_calibration_init_status_get(offset, 24), false)?;
-            for k in 0..24usize {
-                total_checked += 1;
-                if resp[8 + k] != 0 {
-                    calibrated_count += 1;
-                }
-            }
-        }
-
-        if total_checked == 0 {
+        let calibrated_keys = self.read_calibrated_keys_init()?;
+        if calibrated_keys.is_empty() {
             Ok(CalibrationStatus::Unknown)
-        } else if calibrated_count > 0 {
+        } else if calibrated_keys.iter().any(|&v| v) {
             Ok(CalibrationStatus::Calibrated)
         } else {
             Ok(CalibrationStatus::NeedsCalibration)
@@ -416,18 +499,43 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
         self.set_dks_binding(empty)
     }
 
+    fn set_deadzones(
+        &mut self,
+        top: TravelHundredthsMm,
+        bottom: TravelHundredthsMm,
+    ) -> CoreResult<()> {
+        if top.as_hundredths() > 100 {
+            return Err(CoreError::OutOfRange {
+                field: "top_deadzone",
+                actual: top.to_string(),
+                expected: "0.00..=1.00 mm".to_owned(),
+            });
+        }
+        if bottom.as_hundredths() > 100 {
+            return Err(CoreError::OutOfRange {
+                field: "bottom_deadzone",
+                actual: bottom.to_string(),
+                expected: "0.00..=1.00 mm".to_owned(),
+            });
+        }
+        self.exchange(req_deadzone_set(top, bottom), true)?;
+        Ok(())
+    }
+
     fn set_socd_pairs(&mut self, pairs: &[SocdPair]) -> CoreResult<()> {
         self.he_caps.validate_socd_pairs(pairs)?;
 
         // Before mutating real hardware, ensure we know which slots hold SOCD pairs and which
-        // hold non-SOCD modes (RS/OKS) so we never duplicate pairs or overwrite RS/OKS slots.
+        // hold RS/OKS so we never duplicate pairs or overwrite RS/OKS slots.
         if self.socd_slots.is_none() && !self.transport.is_dry_run() {
-            let (_, socd_slots, reserved_rs_slots) = self.scan_socd_slots()?;
-            self.socd_slots = Some(socd_slots);
-            self.reserved_rs_slots = reserved_rs_slots;
+            let scan = self.scan_paired_slots()?;
+            self.socd_slots = Some(scan.socd_slots);
+            self.rs_slots = Some(scan.rs_slots);
+            self.reserved_rs_slots = scan.other_reserved;
         }
 
         let previous_slots = self.socd_slots.clone().unwrap_or_default();
+        let rs_occupied = self.rs_slots.clone().unwrap_or_default();
         let mut target_slots: Vec<u8> = Vec::with_capacity(pairs.len());
 
         // Reuse previously occupied SOCD slots in order first, then claim lowest free non-reserved slots.
@@ -440,7 +548,10 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
             if target_slots.len() >= pairs.len() {
                 break;
             }
-            if !target_slots.contains(&slot) && !self.reserved_rs_slots.contains(&slot) {
+            if !target_slots.contains(&slot)
+                && !rs_occupied.contains(&slot)
+                && !self.reserved_rs_slots.contains(&slot)
+            {
                 target_slots.push(slot);
             }
         }
@@ -449,9 +560,9 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
                 field: "socd_pairs",
                 actual: pairs.len().to_string(),
                 expected: format!(
-                    "at most {} free SOCD slots ({} occupied by non-SOCD modes)",
-                    usize::from(RS7_MAX_SOCD_SLOTS).saturating_sub(self.reserved_rs_slots.len()),
-                    self.reserved_rs_slots.len()
+                    "at most {} free SOCD slots",
+                    usize::from(RS7_MAX_SOCD_SLOTS)
+                        .saturating_sub(rs_occupied.len() + self.reserved_rs_slots.len()),
                 ),
             });
         }
@@ -485,12 +596,191 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
             }
         }
     }
+
+    fn set_rapid_switch_pairs(&mut self, pairs: &[RapidSwitchPair]) -> CoreResult<()> {
+        for pair in pairs {
+            self.he_caps.validate_key(pair.key_a)?;
+            self.he_caps.validate_key(pair.key_b)?;
+        }
+        if self.rs_slots.is_none() && !self.transport.is_dry_run() {
+            let scan = self.scan_paired_slots()?;
+            self.socd_slots = Some(scan.socd_slots);
+            self.rs_slots = Some(scan.rs_slots);
+            self.reserved_rs_slots = scan.other_reserved;
+        }
+
+        let previous_slots = self.rs_slots.clone().unwrap_or_default();
+        let socd_occupied = self.socd_slots.clone().unwrap_or_default();
+        let mut target_slots: Vec<u8> = Vec::with_capacity(pairs.len());
+
+        for &slot in &previous_slots {
+            if target_slots.len() < pairs.len() {
+                target_slots.push(slot);
+            }
+        }
+        for slot in 0..RS7_MAX_SOCD_SLOTS {
+            if target_slots.len() >= pairs.len() {
+                break;
+            }
+            if !target_slots.contains(&slot)
+                && !socd_occupied.contains(&slot)
+                && !self.reserved_rs_slots.contains(&slot)
+            {
+                target_slots.push(slot);
+            }
+        }
+        if target_slots.len() < pairs.len() {
+            return Err(CoreError::OutOfRange {
+                field: "rapid_switch_pairs",
+                actual: pairs.len().to_string(),
+                expected: format!(
+                    "at most {} free slots",
+                    usize::from(RS7_MAX_SOCD_SLOTS)
+                        .saturating_sub(socd_occupied.len() + self.reserved_rs_slots.len())
+                ),
+            });
+        }
+
+        let write_result = (|| -> CoreResult<()> {
+            for (&slot, pair) in target_slots.iter().zip(pairs.iter()) {
+                let payload = req_rs_pair_set(slot, Some(pair))?;
+                self.exchange(payload, true)?;
+            }
+            for &old_slot in &previous_slots {
+                if !target_slots.contains(&old_slot) {
+                    let payload = req_rs_pair_set(old_slot, None)?;
+                    self.exchange(payload, true)?;
+                }
+            }
+            Ok(())
+        })();
+
+        match write_result {
+            Ok(()) => {
+                if !self.transport.is_dry_run() {
+                    self.rs_slots = Some(target_slots);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.rs_slots = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn set_mod_tap_binding(&mut self, binding: ModTapBinding) -> CoreResult<()> {
+        if binding.slot >= RS7_MAX_MT_SLOTS {
+            return Err(CoreError::OutOfRange {
+                field: "mt_slot",
+                actual: binding.slot.to_string(),
+                expected: format!("0..{RS7_MAX_MT_SLOTS}"),
+            });
+        }
+        let (row, col) = key_to_row_col(binding.key)?;
+        self.exchange(
+            req_tap_dance_set(
+                binding.slot,
+                binding.tap_keycode,
+                binding.hold_keycode,
+                binding.hold_delay_ms,
+            ),
+            true,
+        )?;
+        self.exchange(
+            req_keymap_set_keycode(
+                0,
+                row,
+                col,
+                KeyCode::new(key_class::TAP_DANCE, binding.slot),
+            ),
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn clear_mod_tap_binding(&mut self, slot: u8, key: KeyIndex) -> CoreResult<()> {
+        if slot >= RS7_MAX_MT_SLOTS {
+            return Err(CoreError::OutOfRange {
+                field: "mt_slot",
+                actual: slot.to_string(),
+                expected: format!("0..{RS7_MAX_MT_SLOTS}"),
+            });
+        }
+        let _ = key_to_row_col(key)?;
+        self.exchange(req_tap_dance_set(slot, (0, 0), (0, 0), 200), true)?;
+        Ok(())
+    }
+
+    fn set_toggle_binding(&mut self, binding: ToggleKeyBinding) -> CoreResult<()> {
+        if binding.slot >= RS7_MAX_TGL_SLOTS {
+            return Err(CoreError::OutOfRange {
+                field: "tgl_slot",
+                actual: binding.slot.to_string(),
+                expected: format!("0..{RS7_MAX_TGL_SLOTS}"),
+            });
+        }
+        let (row, col) = key_to_row_col(binding.key)?;
+        let hw_slot = binding.slot + RS7_MAX_MT_SLOTS;
+        self.exchange(
+            req_tap_dance_set(hw_slot, binding.keycode, (0, 0), binding.delay_ms),
+            true,
+        )?;
+        self.exchange(
+            req_keymap_set_keycode(0, row, col, KeyCode::new(key_class::TAP_DANCE, hw_slot)),
+            true,
+        )?;
+        Ok(())
+    }
+
+    fn clear_toggle_binding(&mut self, slot: u8, key: KeyIndex) -> CoreResult<()> {
+        if slot >= RS7_MAX_TGL_SLOTS {
+            return Err(CoreError::OutOfRange {
+                field: "tgl_slot",
+                actual: slot.to_string(),
+                expected: format!("0..{RS7_MAX_TGL_SLOTS}"),
+            });
+        }
+        let _ = key_to_row_col(key)?;
+        let hw_slot = slot + RS7_MAX_MT_SLOTS;
+        self.exchange(req_tap_dance_set(hw_slot, (0, 0), (0, 0), 200), true)?;
+        Ok(())
+    }
+
+    fn start_calibration(&mut self) -> CoreResult<()> {
+        self.exchange(req_calibration_start(), true)?;
+        Ok(())
+    }
+
+    fn finish_calibration(&mut self) -> CoreResult<()> {
+        self.exchange(req_calibration_finish(), true)?;
+        Ok(())
+    }
+
+    fn read_calibration_key_progress(&mut self) -> CoreResult<Vec<bool>> {
+        let mut flags = Vec::with_capacity(usize::from(RS7_KEY_COUNT));
+        for chunk_ix in 0..(RS7_KEY_COUNT / 4) {
+            let offset = chunk_ix * 4;
+            let resp = self.exchange(req_calibration_live_status_get(offset, 4), false)?;
+            for k in 0..4usize {
+                flags.push(resp[8 + k * 5 + 4] != 0);
+            }
+        }
+        Ok(flags)
+    }
 }
 
 impl<T: HidTransport> RgbController for AtkRs7Device<T> {
     fn rgb_capabilities(&self) -> RgbCapabilities {
         RgbCapabilities::new(
-            vec![RgbZoneInfo::new(RgbZoneId::new(0), "Key Backlight")],
+            vec![
+                RgbZoneInfo::new(RgbZoneId::new(0), "Back Lamp")
+                    .with_presets(back_lamp_presets())
+                    .with_max_speed(255),
+                RgbZoneInfo::new(RgbZoneId::new(1), "Logo Light")
+                    .with_presets(logo_light_presets())
+                    .with_max_speed(40),
+            ],
             vec![
                 RgbEffectKind::Off,
                 RgbEffectKind::Static,
@@ -498,6 +788,7 @@ impl<T: HidTransport> RgbController for AtkRs7Device<T> {
                 RgbEffectKind::SpectrumCycle,
                 RgbEffectKind::Wave,
                 RgbEffectKind::Reactive,
+                RgbEffectKind::Preset,
             ],
             true,
         )
@@ -507,11 +798,18 @@ impl<T: HidTransport> RgbController for AtkRs7Device<T> {
         let resp = self.exchange(req_backlight_get(), false)?;
         let (effect, brightness_pct) = decode_backlight(&resp);
         let brightness = Brightness::new(brightness_pct)?;
-        Ok(RgbSnapshot::new(vec![RgbZoneState::new(
-            RgbZoneId::new(0),
-            effect,
-            brightness,
-        )]))
+        let mut zones = vec![RgbZoneState::new(RgbZoneId::new(0), effect, brightness)];
+
+        if let Ok(logo_resp) = self.exchange(req_logo_light_get(), false) {
+            let (logo_effect, logo_brightness_pct) = decode_logo_light(&logo_resp);
+            let logo_brightness = Brightness::new(logo_brightness_pct)?;
+            zones.push(RgbZoneState::new(
+                RgbZoneId::new(1),
+                logo_effect,
+                logo_brightness,
+            ));
+        }
+        Ok(RgbSnapshot::new(zones))
     }
 
     fn set_zone_effect(
@@ -520,16 +818,211 @@ impl<T: HidTransport> RgbController for AtkRs7Device<T> {
         effect: RgbEffect,
         brightness: Brightness,
     ) -> CoreResult<()> {
-        if zone.value() != 0 {
-            return Err(CoreError::OutOfRange {
+        match zone.value() {
+            0 => {
+                self.exchange(req_backlight_set(effect, brightness.percent()), true)?;
+                Ok(())
+            }
+            1 => {
+                self.exchange(req_logo_light_set(effect, brightness.percent()), true)?;
+                Ok(())
+            }
+            other => Err(CoreError::OutOfRange {
                 field: "rgb_zone",
-                actual: zone.value().to_string(),
-                expected: "0".to_owned(),
-            });
+                actual: other.to_string(),
+                expected: "0 (Back Lamp) or 1 (Logo Light)".to_owned(),
+            }),
         }
-        self.exchange(req_backlight_set(effect, brightness.percent()), true)?;
+    }
+}
+
+impl<T: HidTransport> KeymapController for AtkRs7Device<T> {
+    fn keymap_capabilities(&self) -> KeymapCapabilities {
+        KeymapCapabilities::new(
+            vec![
+                "Win Base".to_owned(),
+                "Win Fn".to_owned(),
+                "Mac Base".to_owned(),
+                "Mac Fn".to_owned(),
+            ],
+            RS7_ROWS,
+            RS7_COLS,
+            true,
+        )
+    }
+
+    fn read_keymap(&mut self) -> CoreResult<KeymapSnapshot> {
+        let total_keys = usize::from(RS7_LAYERS) * usize::from(RS7_KEY_COUNT);
+        let total_bytes = total_keys * 2; // 768 bytes
+        let mut flat: Vec<KeyCode> = Vec::with_capacity(total_keys);
+        let mut offset = 0usize;
+        while offset < total_bytes {
+            let chunk_len = (total_bytes - offset).min(28);
+            let resp = self.exchange(
+                req_keymap_get_buffer(
+                    u16::try_from(offset).unwrap_or(0),
+                    u8::try_from(chunk_len).unwrap_or(28),
+                ),
+                false,
+            )?;
+            for &[class, id] in resp[4..4 + chunk_len].as_chunks::<2>().0 {
+                flat.push(KeyCode::new(class, id));
+            }
+            offset += chunk_len;
+        }
+        let layers: Vec<Vec<KeyCode>> = flat
+            .chunks(usize::from(RS7_KEY_COUNT))
+            .map(<[KeyCode]>::to_vec)
+            .collect();
+        let active_layer = self
+            .exchange(req_active_layer_get(), false)
+            .map_or(0, |r| decode_active_layer(r[3]));
+        Ok(KeymapSnapshot::new(layers, active_layer))
+    }
+
+    fn set_key_binding(&mut self, layer: u8, key: KeyIndex, code: KeyCode) -> CoreResult<()> {
+        self.keymap_capabilities().validate_layer(layer)?;
+        let (row, col) = key_to_row_col(key)?;
+        self.exchange(req_keymap_set_keycode(layer, row, col, code), true)?;
         Ok(())
     }
+
+    fn reset_keymap(&mut self) -> CoreResult<()> {
+        self.exchange(req_keymap_reset(), true)?;
+        Ok(())
+    }
+}
+
+impl<T: HidTransport> MacroController for AtkRs7Device<T> {
+    fn macro_capabilities(&self) -> MacroCapabilities {
+        MacroCapabilities::new(RS7_MAX_MACRO_SLOTS, 512)
+    }
+
+    fn read_macros(&mut self) -> CoreResult<Vec<MacroSlot>> {
+        let sz_resp = self.exchange(req_macro_buffer_size_get(), false)?;
+        let total_size = usize::from(u16::from_be_bytes([sz_resp[1], sz_resp[2]])).min(2048);
+        let mut raw = Vec::with_capacity(total_size);
+        let mut offset = 0usize;
+        while offset < total_size {
+            let chunk = (total_size - offset).min(28);
+            let resp = self.exchange(
+                req_macro_buffer_get(
+                    u16::try_from(offset).unwrap_or(0),
+                    u8::try_from(chunk).unwrap_or(28),
+                ),
+                false,
+            )?;
+            raw.extend_from_slice(&resp[4..4 + chunk]);
+            let terminators = raw.iter().fold(0usize, |acc, &b| acc + usize::from(b == 0));
+            if terminators > usize::from(RS7_MAX_MACRO_SLOTS) {
+                break;
+            }
+            offset += chunk;
+        }
+        Ok(decode_macros(&raw))
+    }
+
+    fn write_macros(&mut self, macros: &[MacroSlot]) -> CoreResult<()> {
+        let encoded = encode_macros(macros);
+        for (ix, chunk) in encoded.chunks(28).enumerate() {
+            let offset = u16::try_from(ix * 28).unwrap_or(0);
+            self.exchange(req_macro_buffer_set(offset, chunk), true)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: HidTransport> KeyboardConfigController for AtkRs7Device<T> {
+    fn keyboard_config_capabilities(&self) -> KeyboardConfigCapabilities {
+        KeyboardConfigCapabilities::new(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            vec![
+                PollingRateHz::Hz1000,
+                PollingRateHz::Hz2000,
+                PollingRateHz::Hz4000,
+                PollingRateHz::Hz8000,
+            ],
+        )
+    }
+
+    fn read_keyboard_config(&mut self) -> CoreResult<KeyboardConfigSnapshot> {
+        let feat = self.exchange(req_feature_flags_get(), false)?;
+        let (rgb_area, exchange_wasd, mac_mode, win_lock, six_key_rollover) =
+            decode_feature_flags(&feat);
+        self.rgb_area = rgb_area;
+
+        let anti_accidental_touch = self
+            .exchange(req_anti_accidental_touch_get(), false)
+            .is_ok_and(|r| r[3] != 0);
+        let extreme_mode = self
+            .exchange(req_game_mode(), false)
+            .map_or(self.extreme_mode, |r| r[3] == 1);
+        let polling_rate = self
+            .exchange(req_report_rate(), false)
+            .ok()
+            .and_then(|r| decode_report_rate(r[3]))
+            .or(self.polling_rate)
+            .unwrap_or(PollingRateHz::Hz1000);
+
+        self.extreme_mode = extreme_mode;
+        self.he_caps = build_he_caps(extreme_mode);
+        self.polling_rate = Some(polling_rate);
+
+        Ok(KeyboardConfigSnapshot::new(
+            mac_mode,
+            exchange_wasd,
+            win_lock,
+            six_key_rollover,
+            anti_accidental_touch,
+            extreme_mode,
+            polling_rate,
+        ))
+    }
+
+    fn set_keyboard_config(&mut self, config: &KeyboardConfigSnapshot) -> CoreResult<()> {
+        let rate_req = req_report_rate_set(config.polling_rate)?;
+        self.exchange(
+            req_feature_flags_set(
+                self.rgb_area,
+                config.exchange_wasd,
+                config.mac_mode,
+                config.win_lock,
+                config.six_key_rollover,
+            ),
+            true,
+        )?;
+        self.exchange(
+            req_anti_accidental_touch_set(config.anti_accidental_touch),
+            true,
+        )?;
+        self.exchange(req_game_mode_set(config.extreme_mode), true)?;
+        self.exchange(rate_req, true)?;
+        if !self.transport.is_dry_run() {
+            self.extreme_mode = config.extreme_mode;
+            self.he_caps = build_he_caps(config.extreme_mode);
+            self.polling_rate = Some(config.polling_rate);
+        }
+        Ok(())
+    }
+}
+
+/// Reads one Tap-Dance hardware slot (`0..19` MT, `20..39` TGL).
+pub fn read_tap_dance_slot<T: HidTransport>(
+    dev: &mut AtkRs7Device<T>,
+    slot: u8,
+) -> CoreResult<TapDanceEntry> {
+    let resp = dev.exchange(req_tap_dance_get(slot), false)?;
+    let (tap, hold, hold_delay_ms) = decode_tap_dance(&resp);
+    Ok(TapDanceEntry {
+        tap,
+        hold,
+        hold_delay_ms,
+    })
 }
 
 #[cfg(test)]
@@ -752,8 +1245,11 @@ mod tests {
         assert_eq!(light.zones[0].brightness.percent(), 80);
         assert_eq!(
             light.zones[0].effect,
-            RgbEffect::Static {
-                color: RgbColor::new(0x00, 0xE5, 0xFF)
+            RgbEffect::Preset {
+                id: 2,
+                color: RgbColor::new(0x00, 0xE5, 0xFF),
+                speed: 0,
+                colorful: false,
             }
         );
     }
@@ -884,5 +1380,53 @@ mod tests {
         // Write 3: slot 1 explicitly cleared with NONE (0)
         assert_eq!(socd_sets[3][7], 1);
         assert_eq!(socd_sets[3][8], protocol::socd_wire::NONE);
+    }
+
+    #[test]
+    fn logo_light_feature_flags_and_macro_codecs_roundtrip() {
+        // Logo light Always On (mode 3) @ 75% brightness -> 120 raw out of 160
+        let req = req_logo_light_set(
+            RgbEffect::Preset {
+                id: 3,
+                color: RgbColor::new(0x10, 0x80, 0xFF),
+                speed: 20,
+                colorful: true,
+            },
+            75,
+        );
+        let (eff, pct) = decode_logo_light(&req);
+        assert_eq!(pct, 75);
+        assert_eq!(
+            eff,
+            RgbEffect::Preset {
+                id: 3,
+                color: RgbColor::new(0x10, 0x80, 0xFF),
+                speed: 20,
+                colorful: true,
+            }
+        );
+
+        // Feature flags: 6KRO inverted on wire (true => byte 0, false => byte 1)
+        let f = req_feature_flags_set(0, true, false, true, true);
+        assert_eq!(f[7], 0);
+        assert_eq!(decode_feature_flags(&f), (0, true, false, true, true));
+
+        // Macro roundtrip with key down + 50ms delay + key up
+        let macros = vec![MacroSlot::new(
+            0,
+            "M1",
+            vec![
+                agnoperiph_core::MacroStep::new(
+                    agnoperiph_core::MacroActionKind::KeyDown,
+                    0x04,
+                    50,
+                ),
+                agnoperiph_core::MacroStep::new(agnoperiph_core::MacroActionKind::KeyUp, 0x04, 0),
+            ],
+        )];
+        let encoded = encode_macros(&macros);
+        let decoded = decode_macros(&encoded);
+        assert_eq!(decoded.len(), usize::from(RS7_MAX_MACRO_SLOTS));
+        assert_eq!(decoded[0].steps, macros[0].steps);
     }
 }

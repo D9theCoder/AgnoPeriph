@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod game_profiles;
 mod hall_effect_panel;
 mod inspector_drawer;
 pub mod keymap;

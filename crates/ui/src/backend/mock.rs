@@ -5,11 +5,13 @@ use std::sync::{Arc, Mutex};
 use agnoperiph_core::{
     BatteryStatus, Brightness, CalibrationStatus, Capabilities, ChargingState, ConnectionKind,
     CoreError, CoreResult, DebounceMs, DeviceId, DeviceInfo, DksBinding, DksStageAction,
-    DksTriggerDirection, DpiStage, DpiValue, HallEffectCapabilities, HallEffectSnapshot,
-    KeyHallEffectConfig, KeyIndex, LiftOffDistance, PointerCapabilities, PointerSnapshot,
-    PollingRateHz, ProfileCapabilities, ProfileInfo, ProfileMode, ProfileSlot, ProfileSnapshot,
-    RapidTriggerConfig, RgbCapabilities, RgbColor, RgbEffect, RgbEffectKind, RgbSnapshot,
-    RgbZoneId, RgbZoneInfo, RgbZoneState, SocdMode, SocdPair, TravelHundredthsMm, VendorKind,
+    DksTriggerDirection, DpiStage, DpiValue, HallEffectCapabilities, HallEffectSnapshot, KeyCode,
+    KeyHallEffectConfig, KeyIndex, KeyboardConfigCapabilities, KeyboardConfigSnapshot,
+    KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroActionKind, MacroCapabilities,
+    MacroSlot, MacroStep, PointerCapabilities, PointerSnapshot, PollingRateHz, ProfileCapabilities,
+    ProfileInfo, ProfileMode, ProfileSlot, ProfileSnapshot, RapidSwitchPair, RapidTriggerConfig,
+    RgbCapabilities, RgbColor, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId, RgbZoneInfo,
+    RgbZoneState, SocdMode, SocdPair, TravelHundredthsMm, VendorKind,
 };
 use agnoperiph_driver_atk::protocol as atk;
 use agnoperiph_driver_lamzu::atlantis::{self, AtlantisRateFamily, Command as LamzuCommand};
@@ -19,9 +21,9 @@ use agnoperiph_transport::{
 };
 
 use super::{
-    ActuationTarget, ApplyError, DeviceSnapshot, HallEffectState, PeripheralService, PointerChange,
-    PointerState, ProfileState, RgbState, SequencedSink, SettingChange, apply_change_to_snapshot,
-    lock, validate_change,
+    ActuationTarget, ApplyError, DeviceSnapshot, HallEffectState, KeyboardConfigState, KeymapState,
+    MacroState, PeripheralService, PointerChange, PointerState, ProfileState, RgbState,
+    SequencedSink, SettingChange, apply_change_to_snapshot, lock, validate_change,
 };
 
 /// Stable id of the emulated Lamzu Atlantis 1K receiver.
@@ -110,6 +112,7 @@ fn encode_lamzu(family: AtlantisRateFamily, change: &SettingChange) -> CoreResul
     Ok(frames)
 }
 
+#[allow(clippy::too_many_lines)]
 fn encode_atk(
     change: &SettingChange,
     key_count: u16,
@@ -147,10 +150,25 @@ fn encode_atk(
                 })
                 .collect()
         }
+        SettingChange::ActuationMany { keys, point } => keys
+            .iter()
+            .map(|&key| {
+                let (row, col) = atk::key_to_row_col(key)?;
+                Ok(atk::req_single_actuation_set(row, col, *point))
+            })
+            .collect::<CoreResult<Vec<_>>>()?,
         SettingChange::RapidTrigger { key, config } => {
             let (row, col) = atk::key_to_row_col(*key)?;
             vec![atk::req_single_rt_set(row, col, config)]
         }
+        SettingChange::RapidTriggerMany { keys, config } => keys
+            .iter()
+            .map(|&key| {
+                let (row, col) = atk::key_to_row_col(key)?;
+                Ok(atk::req_single_rt_set(row, col, config))
+            })
+            .collect::<CoreResult<Vec<_>>>()?,
+        SettingChange::Deadzones { top, bottom } => vec![atk::req_deadzone_set(*top, *bottom)],
         SettingChange::Dks(binding) => {
             let slot = u8::try_from(binding.key.value()).unwrap_or(u8::MAX);
             vec![atk::req_dks_set(slot, binding)]
@@ -171,9 +189,90 @@ fn encode_atk(
             }
             frames
         }
+        SettingChange::RapidSwitch(pairs) => pairs
+            .iter()
+            .enumerate()
+            .map(|(ix, pair)| atk::req_rs_pair_set(u8::try_from(ix).unwrap_or(0), Some(pair)))
+            .collect::<CoreResult<Vec<_>>>()?,
+        SettingChange::ModTap(binding) => {
+            let (row, col) = atk::key_to_row_col(binding.key)?;
+            vec![
+                atk::req_tap_dance_set(
+                    binding.slot,
+                    binding.tap_keycode,
+                    binding.hold_keycode,
+                    binding.hold_delay_ms,
+                ),
+                atk::req_keymap_set_keycode(
+                    0,
+                    row,
+                    col,
+                    KeyCode::new(atk::key_class::TAP_DANCE, binding.slot),
+                ),
+            ]
+        }
+        SettingChange::ClearModTap { slot, .. } => {
+            vec![atk::req_tap_dance_set(*slot, (0, 0), (0, 0), 200)]
+        }
+        SettingChange::ToggleKey(binding) => {
+            let (row, col) = atk::key_to_row_col(binding.key)?;
+            let hw_slot = binding.slot + atk::RS7_MAX_MT_SLOTS;
+            vec![
+                atk::req_tap_dance_set(hw_slot, binding.keycode, (0, 0), binding.delay_ms),
+                atk::req_keymap_set_keycode(
+                    0,
+                    row,
+                    col,
+                    KeyCode::new(atk::key_class::TAP_DANCE, hw_slot),
+                ),
+            ]
+        }
+        SettingChange::ClearToggleKey { slot, .. } => {
+            vec![atk::req_tap_dance_set(
+                *slot + atk::RS7_MAX_MT_SLOTS,
+                (0, 0),
+                (0, 0),
+                200,
+            )]
+        }
+        SettingChange::KeyBinding { layer, key, code } => {
+            let (row, col) = atk::key_to_row_col(*key)?;
+            vec![atk::req_keymap_set_keycode(*layer, row, col, *code)]
+        }
+        SettingChange::ResetKeymap => vec![atk::req_keymap_reset()],
+        SettingChange::Macros(slots) => atk::encode_macros(slots)
+            .chunks(28)
+            .enumerate()
+            .map(|(ix, chunk)| {
+                atk::req_macro_buffer_set(u16::try_from(ix * 28).unwrap_or(0), chunk)
+            })
+            .collect(),
+        SettingChange::KeyboardConfig(cfg) => vec![
+            atk::req_feature_flags_set(
+                0,
+                cfg.exchange_wasd,
+                cfg.mac_mode,
+                cfg.win_lock,
+                cfg.six_key_rollover,
+            ),
+            atk::req_anti_accidental_touch_set(cfg.anti_accidental_touch),
+            atk::req_game_mode_set(cfg.extreme_mode),
+            atk::req_report_rate_set(cfg.polling_rate)?,
+        ],
+        SettingChange::StartCalibration => vec![atk::req_calibration_start()],
+        SettingChange::FinishCalibration => vec![atk::req_calibration_finish()],
+        SettingChange::PollCalibrationProgress => Vec::new(),
         SettingChange::Rgb {
-            effect, brightness, ..
-        } => vec![atk::req_backlight_set(*effect, brightness.percent())],
+            zone,
+            effect,
+            brightness,
+        } => {
+            if zone.value() == 1 {
+                vec![atk::req_logo_light_set(*effect, brightness.percent())]
+            } else {
+                vec![atk::req_backlight_set(*effect, brightness.percent())]
+            }
+        }
         _ => return Err(CoreError::UnsupportedCapability("atk_setting")),
     };
     Ok(payloads
@@ -502,6 +601,9 @@ fn lamzu_atlantis_snapshot() -> DeviceSnapshot {
             capabilities: ProfileCapabilities::new(flash::PROFILE_COUNT, false, false),
             snapshot: profiles,
         }),
+        keymap: None,
+        macros: None,
+        keyboard_config: None,
         warnings: Vec::new(),
         is_preview: false,
     }
@@ -532,7 +634,12 @@ fn atk_rs7_snapshot() -> DeviceSnapshot {
 
     DeviceSnapshot {
         info,
-        capabilities: Capabilities::empty().with_hall_effect(true).with_rgb(true),
+        capabilities: Capabilities::empty()
+            .with_hall_effect(true)
+            .with_rgb(true)
+            .with_keymap(true)
+            .with_macros(true)
+            .with_keyboard_config(true),
         pointer: None,
         hall_effect: Some(HallEffectState {
             capabilities,
@@ -541,6 +648,9 @@ fn atk_rs7_snapshot() -> DeviceSnapshot {
         rgb: Some(atk_rs7_rgb()),
         battery: None,
         profiles: None,
+        keymap: Some(atk_rs7_keymap()),
+        macros: Some(atk_rs7_macros()),
+        keyboard_config: Some(atk_rs7_keyboard_config()),
         warnings: Vec::new(),
         is_preview: false,
     }
@@ -595,12 +705,23 @@ fn atk_rs7_hall_effect() -> HallEffectSnapshot {
         SocdMode::LastInputPriority,
     )
     .unwrap_or_else(|_| unreachable!("fixture SOCD keys are distinct"));
+    let rs = RapidSwitchPair::new(atk::row_col_to_key(2, 2), atk::row_col_to_key(3, 2))
+        .unwrap_or_else(|_| unreachable!("fixture RS keys are distinct"));
     HallEffectSnapshot::new(keys, vec![dks], vec![socd], CalibrationStatus::Calibrated)
+        .with_rapid_switch_pairs(vec![rs])
+        .with_calibrated_keys(vec![true; usize::from(atk::RS7_KEY_COUNT)])
 }
 
 fn atk_rs7_rgb() -> RgbState {
     let rgb_capabilities = RgbCapabilities::new(
-        vec![RgbZoneInfo::new(RgbZoneId::new(0), "Key Backlight")],
+        vec![
+            RgbZoneInfo::new(RgbZoneId::new(0), "Back Lamp")
+                .with_presets(atk::back_lamp_presets())
+                .with_max_speed(255),
+            RgbZoneInfo::new(RgbZoneId::new(1), "Logo Light")
+                .with_presets(atk::logo_light_presets())
+                .with_max_speed(40),
+        ],
         vec![
             RgbEffectKind::Off,
             RgbEffectKind::Static,
@@ -608,20 +729,109 @@ fn atk_rs7_rgb() -> RgbState {
             RgbEffectKind::SpectrumCycle,
             RgbEffectKind::Wave,
             RgbEffectKind::Reactive,
+            RgbEffectKind::Preset,
         ],
         true,
     );
     let brightness =
         Brightness::new(80).unwrap_or_else(|_| unreachable!("fixture brightness is a percentage"));
+    let logo_brightness =
+        Brightness::new(75).unwrap_or_else(|_| unreachable!("fixture brightness is a percentage"));
     RgbState {
         capabilities: rgb_capabilities,
-        snapshot: RgbSnapshot::new(vec![RgbZoneState::new(
-            RgbZoneId::new(0),
-            RgbEffect::Static {
-                color: RgbColor::new(255, 255, 255),
-            },
-            brightness,
-        )]),
+        snapshot: RgbSnapshot::new(vec![
+            RgbZoneState::new(
+                RgbZoneId::new(0),
+                RgbEffect::Preset {
+                    id: 2,
+                    color: RgbColor::new(255, 255, 255),
+                    speed: 128,
+                    colorful: false,
+                },
+                brightness,
+            ),
+            RgbZoneState::new(
+                RgbZoneId::new(1),
+                RgbEffect::Preset {
+                    id: 3,
+                    color: RgbColor::new(255, 255, 255),
+                    speed: 20,
+                    colorful: false,
+                },
+                logo_brightness,
+            ),
+        ]),
+    }
+}
+
+fn atk_rs7_keymap() -> KeymapState {
+    let base_layer: Vec<KeyCode> = (0..atk::RS7_KEY_COUNT)
+        .map(|ix| KeyCode::standard(u8::try_from(ix).unwrap_or(0)))
+        .collect();
+    let transparent = vec![KeyCode::TRANSPARENT; usize::from(atk::RS7_KEY_COUNT)];
+    KeymapState {
+        capabilities: KeymapCapabilities::new(
+            vec![
+                "Win Base".to_owned(),
+                "Win Fn".to_owned(),
+                "Mac Base".to_owned(),
+                "Mac Fn".to_owned(),
+            ],
+            atk::RS7_ROWS,
+            atk::RS7_COLS,
+            true,
+        ),
+        snapshot: KeymapSnapshot::new(
+            vec![
+                base_layer.clone(),
+                transparent.clone(),
+                base_layer,
+                transparent,
+            ],
+            0,
+        ),
+    }
+}
+
+fn atk_rs7_macros() -> MacroState {
+    let mut slots: Vec<MacroSlot> = (0..atk::RS7_MAX_MACRO_SLOTS)
+        .map(|ix| MacroSlot::new(ix, format!("M{}", ix + 1), Vec::new()))
+        .collect();
+    slots[0].steps = vec![
+        MacroStep::new(MacroActionKind::KeyDown, 0x04, 25),
+        MacroStep::new(MacroActionKind::KeyUp, 0x04, 0),
+    ];
+    MacroState {
+        capabilities: MacroCapabilities::new(atk::RS7_MAX_MACRO_SLOTS, 512),
+        slots,
+    }
+}
+
+fn atk_rs7_keyboard_config() -> KeyboardConfigState {
+    KeyboardConfigState {
+        capabilities: KeyboardConfigCapabilities::new(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            vec![
+                PollingRateHz::Hz1000,
+                PollingRateHz::Hz2000,
+                PollingRateHz::Hz4000,
+                PollingRateHz::Hz8000,
+            ],
+        ),
+        snapshot: KeyboardConfigSnapshot::new(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            PollingRateHz::Hz8000,
+        ),
     }
 }
 
