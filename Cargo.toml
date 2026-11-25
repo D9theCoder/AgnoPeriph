@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/transport",
+    "crates/drivers/driver-logitech",
+    "crates/drivers/driver-lamzu",
+    "crates/cli",
+]
+# Phase 3: "crates/drivers/driver-atk"
+# Phase 4: "crates/ui"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["AgnoPeriph Contributors"]
+
+[workspace.dependencies]
+agnoperiph-core = { path = "crates/core" }
+agnoperiph-driver-lamzu = { path = "crates/drivers/driver-lamzu" }
+agnoperiph-driver-logitech = { path = "crates/drivers/driver-logitech" }
+agnoperiph-transport = { path = "crates/transport" }
+
+anyhow = "1.0.105"
+clap = { version = "4.6.10", features = ["derive"] }
+hex = "0.4.3"
+hidapi = "2.6.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+struct_excessive_bools = "allow"

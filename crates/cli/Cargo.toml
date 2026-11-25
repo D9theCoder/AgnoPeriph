@@ -1,0 +1,26 @@
+[package]
+name = "agnoperiph-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "agnoperiph-cli"
+path = "src/main.rs"
+
+[dependencies]
+agnoperiph-core = { workspace = true }
+agnoperiph-driver-lamzu = { workspace = true }
+agnoperiph-driver-logitech = { workspace = true }
+agnoperiph-transport = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
