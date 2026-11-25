@@ -450,8 +450,13 @@ pub fn req_socd_set(slot: u8, pair: Option<&SocdPair>) -> CoreResult<[u8; RS7_PA
             SocdMode::KeyBPriority => socd_wire::SOCD_KEY2,
             SocdMode::Neutral => socd_wire::SOCD_BALANCE,
         };
-        // Default global actuation & layer 0
-        p[11] = 1; // withGlobal
+        let [pt_hi, pt_lo] = pair.trigger_point.as_hundredths().to_be_bytes();
+        p[9] = pt_hi;
+        p[10] = pt_lo;
+        // Verified in useTglLogic-yjkMKXkT.js: DuckBread SOCD/RS pairs always send withGlobal = 0
+        // and carry their own per-pair trigger travel (`point`) and Rapid Trigger flag (`rt`).
+        p[11] = 0; // withGlobal
+        p[12] = u8::from(pair.rapid_trigger); // rt (0 = off, 1 = on)
         p[13] = r1;
         p[14] = c1;
         p[15] = r2;
@@ -472,9 +477,19 @@ pub fn decode_socd_slot(p: &[u8; RS7_PAYLOAD_LEN]) -> Option<SocdPair> {
         socd_wire::SOCD_BALANCE => SocdMode::Neutral,
         _ => return None,
     };
+    let raw_point = u16::from_be_bytes([p[9], p[10]]);
+    let trigger_point = if raw_point > 0 {
+        TravelHundredthsMm::from_hundredths(raw_point)
+    } else {
+        agnoperiph_core::DEFAULT_PAIR_TRIGGER_POINT
+    };
+    let rapid_trigger = p[12] != 0;
     let key_a = row_col_to_key(p[13], p[14]);
     let key_b = row_col_to_key(p[15], p[16]);
-    SocdPair::new(key_a, key_b, mode).ok()
+    SocdPair::new(key_a, key_b, mode).ok().map(|pair| {
+        pair.with_trigger_point(trigger_point)
+            .with_rapid_trigger(rapid_trigger)
+    })
 }
 
 pub fn req_backlight_get() -> [u8; RS7_PAYLOAD_LEN] {
@@ -659,7 +674,11 @@ pub fn req_rs_pair_set(
         let (r1, c1) = key_to_row_col(pair.key_a)?;
         let (r2, c2) = key_to_row_col(pair.key_b)?;
         p[7] = socd_wire::RS;
-        p[11] = 1; // withGlobal
+        let [pt_hi, pt_lo] = pair.trigger_point.as_hundredths().to_be_bytes();
+        p[9] = pt_hi;
+        p[10] = pt_lo;
+        p[11] = 0; // withGlobal = 0 (per-pair travel + RT)
+        p[12] = u8::from(pair.rapid_trigger);
         p[13] = r1;
         p[14] = c1;
         p[15] = r2;
@@ -675,9 +694,19 @@ pub fn decode_rs_slot(p: &[u8; RS7_PAYLOAD_LEN]) -> Option<RapidSwitchPair> {
     if p[7] != socd_wire::RS {
         return None;
     }
+    let raw_point = u16::from_be_bytes([p[9], p[10]]);
+    let trigger_point = if raw_point > 0 {
+        TravelHundredthsMm::from_hundredths(raw_point)
+    } else {
+        agnoperiph_core::DEFAULT_PAIR_TRIGGER_POINT
+    };
+    let rapid_trigger = p[12] != 0;
     let key_a = row_col_to_key(p[13], p[14]);
     let key_b = row_col_to_key(p[15], p[16]);
-    RapidSwitchPair::new(key_a, key_b).ok()
+    RapidSwitchPair::new(key_a, key_b).ok().map(|pair| {
+        pair.with_trigger_point(trigger_point)
+            .with_rapid_trigger(rapid_trigger)
+    })
 }
 
 pub fn req_tap_dance_get(slot: u8) -> [u8; RS7_PAYLOAD_LEN] {

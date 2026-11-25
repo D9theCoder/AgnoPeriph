@@ -1,58 +1,180 @@
 //! Profile selector shown at the top of every device page.
 //!
 //! Devices with onboard profiles (Lamzu, Logitech) switch slots in hardware. Keyboards with
-//! a single onboard slot (ATK RS7) get four host-managed presets whose saved settings are
-//! pushed through [`crate::backend::PeripheralService`] when the preset is activated.
+//! a single onboard slot (ATK RS7) get four host-managed presets whose full state (per-key
+//! actuation & Rapid Trigger, dead zones, paired/advanced keys, lighting, and keyboard config)
+//! is diffed and pushed through [`crate::backend::PeripheralService`] when switched.
 
-use agnoperiph_core::{DeviceId, ProfileSlot};
+use agnoperiph_core::{DeviceId, KeyIndex, ProfileSlot};
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable, WindowExt,
-    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants},
+    ActiveTheme, Disableable, Selectable, Sizable,
+    button::{Button, ButtonGroup, ButtonVariants},
     h_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, mm};
+use crate::app::AgnoPeriphApp;
 use crate::backend::{ActuationTarget, DeviceSnapshot, SettingChange};
 use crate::game_profiles::SavedKeyboardPreset;
 
-/// Settings changes that restore `preset`, in a safe order: dead zones, lighting,
-/// keyboard config and, last, the flash-rewriting all-keys actuation table.
-pub(crate) fn preset_changes(
+/// Computes the exact ordered diff that transitions `current` into `preset`.
+///
+/// Clearing removed paired/advanced keys runs BEFORE adding new ones so switching between
+/// profiles that reuse the same key (e.g. SOCD A+D in Profile 1 and RS A+D in Profile 2)
+/// never trips exclusive-key validation. Per-key actuation and Rapid Trigger changes use
+/// single-key writes for only the differing keys—fast and without erasing flash.
+pub(crate) fn preset_changes_for(
     preset: &SavedKeyboardPreset,
-    include_actuation: bool,
+    current: &DeviceSnapshot,
 ) -> Vec<SettingChange> {
     let mut changes = Vec::new();
-    if let (Some(top), Some(bottom)) = (preset.top_deadzone, preset.bottom_deadzone) {
-        changes.push(SettingChange::Deadzones { top, bottom });
+
+    if let Some(he) = &current.hall_effect {
+        let cur = &he.snapshot;
+
+        // 1. Clear advanced/paired functions that do not belong in the target preset.
+        //    Even when `preset` is brand-new/unconfigured, switching into it clears
+        //    leftover SOCD / RS / DKS / MT / TGL from the previous profile.
+        let mut cleared_socd = false;
+        if !cur.socd_pairs.is_empty() && cur.socd_pairs != preset.socd_pairs {
+            changes.push(SettingChange::Socd(Vec::new()));
+            cleared_socd = true;
+        }
+        let mut cleared_rs = false;
+        if !cur.rapid_switch_pairs.is_empty() && cur.rapid_switch_pairs != preset.rapid_switch_pairs
+        {
+            changes.push(SettingChange::RapidSwitch(Vec::new()));
+            cleared_rs = true;
+        }
+        for existing in &cur.dks_bindings {
+            if !preset.dks_bindings.contains(existing) {
+                changes.push(SettingChange::ClearDks { slot: existing.key });
+            }
+        }
+        for existing in &cur.mod_tap_bindings {
+            if !preset.mod_tap_bindings.contains(existing) {
+                changes.push(SettingChange::ClearModTap {
+                    slot: existing.slot,
+                    key: existing.key,
+                });
+            }
+        }
+        for existing in &cur.toggle_bindings {
+            if !preset.toggle_bindings.contains(existing) {
+                changes.push(SettingChange::ClearToggleKey {
+                    slot: existing.slot,
+                    key: existing.key,
+                });
+            }
+        }
+
+        // 2. Dead zones (only when saved and different from current).
+        if let (Some(top), Some(bottom)) = (preset.top_deadzone, preset.bottom_deadzone) {
+            let cur_top = cur.keys.first().and_then(|k| k.top_deadzone);
+            let cur_bottom = cur.keys.first().and_then(|k| k.bottom_deadzone);
+            if cur_top != Some(top) || cur_bottom != Some(bottom) {
+                changes.push(SettingChange::Deadzones { top, bottom });
+            }
+        }
+
+        // 3. Per-key actuation and Rapid Trigger diffs (single-key writes, no flash erase).
+        if !preset.key_configs.is_empty() {
+            for target_key in &preset.key_configs {
+                let current_key = cur.keys.iter().find(|k| k.key == target_key.key);
+                if current_key.is_none_or(|k| k.actuation != target_key.actuation) {
+                    changes.push(SettingChange::Actuation {
+                        target: ActuationTarget::Key(target_key.key),
+                        point: target_key.actuation,
+                    });
+                }
+                if current_key.is_none_or(|k| k.rapid_trigger != target_key.rapid_trigger) {
+                    changes.push(SettingChange::RapidTrigger {
+                        key: target_key.key,
+                        config: target_key.rapid_trigger,
+                    });
+                }
+            }
+        } else if let Some(point) = preset.global_actuation {
+            // Backward compatibility for older config.json files that only stored global_actuation.
+            let diff_keys: Vec<KeyIndex> = cur
+                .keys
+                .iter()
+                .filter(|k| k.actuation != point)
+                .map(|k| k.key)
+                .collect();
+            if !diff_keys.is_empty() {
+                changes.push(SettingChange::ActuationMany {
+                    keys: diff_keys,
+                    point,
+                });
+            }
+        }
+
+        // 4. Write the target preset's paired / advanced keys (after all clears above).
+        if !preset.socd_pairs.is_empty() && (cleared_socd || cur.socd_pairs != preset.socd_pairs) {
+            changes.push(SettingChange::Socd(preset.socd_pairs.clone()));
+        }
+        if !preset.rapid_switch_pairs.is_empty()
+            && (cleared_rs || cur.rapid_switch_pairs != preset.rapid_switch_pairs)
+        {
+            changes.push(SettingChange::RapidSwitch(
+                preset.rapid_switch_pairs.clone(),
+            ));
+        }
+        for target in &preset.dks_bindings {
+            if !cur.dks_bindings.contains(target) {
+                changes.push(SettingChange::Dks(target.clone()));
+            }
+        }
+        for target in &preset.mod_tap_bindings {
+            if !cur.mod_tap_bindings.contains(target) {
+                changes.push(SettingChange::ModTap(*target));
+            }
+        }
+        for target in &preset.toggle_bindings {
+            if !cur.toggle_bindings.contains(target) {
+                changes.push(SettingChange::ToggleKey(*target));
+            }
+        }
     }
+
+    // 5. Lighting zones (only changed zones).
     for zone in &preset.rgb_zones {
-        changes.push(SettingChange::Rgb {
-            zone: zone.zone,
-            effect: zone.effect,
-            brightness: zone.brightness,
-        });
+        let same = current
+            .rgb
+            .as_ref()
+            .and_then(|rgb| rgb.snapshot.zones.iter().find(|z| z.zone == zone.zone))
+            .is_some_and(|cur| cur.effect == zone.effect && cur.brightness == zone.brightness);
+        if !same {
+            changes.push(SettingChange::Rgb {
+                zone: zone.zone,
+                effect: zone.effect,
+                brightness: zone.brightness,
+            });
+        }
     }
+
+    // 6. Advanced keyboard config (only if different).
     if let Some(config) = preset.keyboard_config {
-        changes.push(SettingChange::KeyboardConfig(config));
+        let same = current
+            .keyboard_config
+            .as_ref()
+            .is_some_and(|kc| kc.snapshot == config);
+        if !same {
+            changes.push(SettingChange::KeyboardConfig(config));
+        }
     }
-    if include_actuation && let Some(point) = preset.global_actuation {
-        changes.push(SettingChange::Actuation {
-            target: ActuationTarget::AllKeys,
-            point,
-        });
-    }
+
     changes
 }
 
-/// Captures the device's current keyboard-wide settings into a preset.
-///
-/// Actuation is stored only when every key shares one depth: a preset holds a single
-/// all-keys value, and restoring it would otherwise flatten per-key tuning.
+/// Captures the device's complete current state into a software preset.
 pub(crate) fn capture_preset(device: &DeviceSnapshot) -> SavedKeyboardPreset {
     let mut preset = SavedKeyboardPreset::default();
     if let Some(he) = &device.hall_effect {
+        preset.has_hall_effect = true;
+        preset.key_configs.clone_from(&he.snapshot.keys);
         let mut depths = he.snapshot.keys.iter().map(|k| k.actuation);
         if let Some(first) = depths.next()
             && depths.all(|d| d == first)
@@ -63,6 +185,17 @@ pub(crate) fn capture_preset(device: &DeviceSnapshot) -> SavedKeyboardPreset {
             preset.top_deadzone = key.top_deadzone;
             preset.bottom_deadzone = key.bottom_deadzone;
         }
+        preset.socd_pairs.clone_from(&he.snapshot.socd_pairs);
+        preset
+            .rapid_switch_pairs
+            .clone_from(&he.snapshot.rapid_switch_pairs);
+        preset.dks_bindings.clone_from(&he.snapshot.dks_bindings);
+        preset
+            .mod_tap_bindings
+            .clone_from(&he.snapshot.mod_tap_bindings);
+        preset
+            .toggle_bindings
+            .clone_from(&he.snapshot.toggle_bindings);
     }
     if let Some(rgb) = &device.rgb {
         preset.rgb_zones.clone_from(&rgb.snapshot.zones);
@@ -73,76 +206,54 @@ pub(crate) fn capture_preset(device: &DeviceSnapshot) -> SavedKeyboardPreset {
     preset
 }
 
-fn describe_preset(preset: &SavedKeyboardPreset) -> String {
+fn describe_preset_short(preset: &SavedKeyboardPreset) -> String {
     if preset.is_empty() {
-        return "Nothing saved yet. Switching keeps the keyboard’s current settings.".to_owned();
+        return "Clean preset — edits auto-save".to_owned();
     }
     let mut parts = Vec::new();
-    match preset.global_actuation {
-        Some(point) => parts.push(format!("actuation {} mm on all keys", mm(point))),
-        None => parts.push("per-key actuation kept as is".to_owned()),
+    let pairs = preset.socd_pairs.len()
+        + preset.rapid_switch_pairs.len()
+        + preset.dks_bindings.len()
+        + preset.mod_tap_bindings.len()
+        + preset.toggle_bindings.len();
+    if pairs > 0 {
+        parts.push(if pairs == 1 {
+            "1 adv key".to_owned()
+        } else {
+            format!("{pairs} adv keys")
+        });
     }
-    if let (Some(top), Some(bottom)) = (preset.top_deadzone, preset.bottom_deadzone) {
-        parts.push(format!("dead zones {} / {} mm", mm(top), mm(bottom)));
+    let rt_keys = preset
+        .key_configs
+        .iter()
+        .filter(|k| k.rapid_trigger.is_enabled())
+        .count();
+    if rt_keys > 0 {
+        parts.push(format!("RT ×{rt_keys}"));
     }
     if !preset.rgb_zones.is_empty() {
-        parts.push("lighting".to_owned());
+        parts.push("RGB".to_owned());
     }
-    if preset.keyboard_config.is_some() {
-        parts.push("advanced settings".to_owned());
+    if parts.is_empty() {
+        "Saved · auto-saves edits".to_owned()
+    } else {
+        format!("Saved: {}", parts.join(" · "))
     }
-    let mut text = parts.join(", ");
-    if let Some(first) = text.get_mut(0..1) {
-        first.make_ascii_uppercase();
-    }
-    format!("Saved: {text}.")
 }
 
 impl AgnoPeriphApp {
-    /// Activates `slot` on the selected device, confirming first when a live switch
-    /// would rewrite the onboard actuation table.
+    /// Activates `slot` on `device`.
     pub(crate) fn request_profile_switch(
         &mut self,
-        device: DeviceId,
+        device: &DeviceId,
         slot: u8,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.is_busy() || self.is_loading() {
             return;
         }
-        let rewrites_flash = self.device(&device).is_some_and(|d| d.profiles.is_none())
-            && !self.is_dry_run()
-            && self
-                .config
-                .ensure_software_profiles(&device)
-                .slots
-                .iter()
-                .find(|s| s.slot == slot)
-                .is_some_and(|s| s.saved.global_actuation.is_some());
-        if !rewrites_flash {
-            self.switch_profile(&device, slot, cx);
-            return;
-        }
-        let name = self.config.preset_name(&device, ProfileSlot::new(slot));
-        let app = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let app = app.clone();
-            let device = device.clone();
-            alert
-                .confirm()
-                .title(format!("Switch to “{name}”?"))
-                .description(
-                    "This preset sets one actuation depth for every key, which erases and rewrites the keyboard’s onboard actuation table.",
-                )
-                .ok_text("Switch preset")
-                .ok_variant(ButtonVariant::Warning)
-                .cancel_text("Cancel")
-                .on_ok(move |_, _, cx| {
-                    let _ = app.update(cx, |this, cx| this.switch_profile(&device, slot, cx));
-                    true
-                })
-        });
+        self.switch_profile(device, slot, cx);
     }
 
     fn switch_profile(&mut self, device: &DeviceId, slot: u8, cx: &mut Context<Self>) {
@@ -153,10 +264,20 @@ impl AgnoPeriphApp {
         }
     }
 
-    pub(crate) fn save_current_to_preset(&mut self, device: &DeviceId, cx: &mut Context<Self>) {
+    /// Saves the device's current live state into its currently active software preset slot.
+    pub(crate) fn snapshot_active_software_preset(&mut self, device: &DeviceId) {
         let Some(snapshot) = self.device(device) else {
             return;
         };
+        if snapshot.profiles.is_some()
+            || !snapshot.capabilities.has_hall_effect()
+            || snapshot
+                .warnings
+                .iter()
+                .any(|w| crate::backend::is_disconnect_message(&w.message))
+        {
+            return;
+        }
         let preset = capture_preset(snapshot);
         let profiles = self.config.ensure_software_profiles(device);
         let active = profiles.active_slot;
@@ -164,7 +285,6 @@ impl AgnoPeriphApp {
             entry.saved = preset;
         }
         self.save_config();
-        cx.notify();
     }
 
     pub(crate) fn rename_preset(
@@ -243,7 +363,7 @@ pub(crate) fn render(
             .disabled(busy)
             .on_click(cx.listener(move |this, _, window, cx| {
                 if slot != active {
-                    this.request_profile_switch(device.clone(), slot, window, cx);
+                    this.request_profile_switch(&device, slot, window, cx);
                 }
             }))
     });
@@ -253,12 +373,11 @@ pub(crate) fn render(
             .get(id.as_str())
             .and_then(|sw| sw.slots.iter().find(|s| s.slot == active))
             .map_or_else(
-                || describe_preset(&SavedKeyboardPreset::default()),
-                |s| describe_preset(&s.saved),
+                || describe_preset_short(&SavedKeyboardPreset::default()),
+                |s| describe_preset_short(&s.saved),
             )
     });
     let rename_device = id.clone();
-    let save_device = id.clone();
     let theme = cx.theme();
     let caption = if hardware.is_some() {
         "Onboard profile"
@@ -292,28 +411,11 @@ pub(crate) fn render(
                     this.open_rename_preset(rename_device.clone(), active, window, cx);
                 })),
         )
-        .when(hardware.is_none(), |this| {
-            this.child(
-                Button::new("save-preset")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Check)
-                    .label("Save current settings")
-                    .disabled(busy)
-                    .tooltip("Store the keyboard’s current dead zones, lighting, advanced settings and (when uniform) actuation in this preset")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.save_current_to_preset(&save_device, cx);
-                    })),
-            )
-        })
         .when_some(saved, |this, saved| {
             this.child(
                 div()
-                    .flex_1()
-                    .min_w_40()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .truncate()
                     .child(saved),
             )
         })

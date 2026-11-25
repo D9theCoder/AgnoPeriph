@@ -598,10 +598,7 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
     }
 
     fn set_rapid_switch_pairs(&mut self, pairs: &[RapidSwitchPair]) -> CoreResult<()> {
-        for pair in pairs {
-            self.he_caps.validate_key(pair.key_a)?;
-            self.he_caps.validate_key(pair.key_b)?;
-        }
+        self.he_caps.validate_rapid_switch_pairs(pairs)?;
         if self.rs_slots.is_none() && !self.transport.is_dry_run() {
             let scan = self.scan_paired_slots()?;
             self.socd_slots = Some(scan.socd_slots);
@@ -1428,5 +1425,33 @@ mod tests {
         let decoded = decode_macros(&encoded);
         assert_eq!(decoded.len(), usize::from(RS7_MAX_MACRO_SLOTS));
         assert_eq!(decoded[0].steps, macros[0].steps);
+
+        // SOCD and RS per-pair trigger travel + Rapid Trigger wire roundtrip (`withGlobal = 0`)
+        let socd = SocdPair::new(
+            protocol::row_col_to_key(3, 1),
+            protocol::row_col_to_key(3, 3),
+            SocdMode::LastInputPriority,
+        )
+        .unwrap()
+        .with_trigger_point(TravelHundredthsMm::from_hundredths(40))
+        .with_rapid_trigger(true);
+        let socd_frame = req_socd_set(2, Some(&socd)).unwrap();
+        assert_eq!(socd_frame[9..11], [0x00, 0x28]); // 0.40 mm BE
+        assert_eq!(socd_frame[11], 0); // withGlobal = 0
+        assert_eq!(socd_frame[12], 1); // rt = on
+        assert_eq!(decode_socd_slot(&socd_frame), Some(socd));
+
+        let rs = RapidSwitchPair::new(
+            protocol::row_col_to_key(2, 2),
+            protocol::row_col_to_key(3, 2),
+        )
+        .unwrap()
+        .with_trigger_point(TravelHundredthsMm::from_hundredths(80))
+        .with_rapid_trigger(true);
+        let rs_frame = req_rs_pair_set(5, Some(&rs)).unwrap();
+        assert_eq!(rs_frame[9..11], [0x00, 0x50]); // 0.80 mm BE
+        assert_eq!(rs_frame[11], 0); // withGlobal = 0
+        assert_eq!(rs_frame[12], 1); // rt = on
+        assert_eq!(decode_rs_slot(&rs_frame), Some(rs));
     }
 }

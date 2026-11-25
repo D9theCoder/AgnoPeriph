@@ -102,7 +102,7 @@ Before designing or writing any UI code, **read both normative guides in full**:
 - **`gpui-kit`** skill (`references/coding-guides.md`, `references/usage.md`, `references/conventions.md`)
 - **`gpui-kit-design-guides`** skill (`references/design-guides.md` — visual hierarchy, spacing, density, desktop conventions, interaction states, overlays, data-heavy views, interface copy, and the Design Review Checklist)
 
-- **Single UI Dependency:** Depend only on `gpui-kit = "0.11.0"`. Import GPUI via `use gpui_kit::*;` and layers via `gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`, `gpui_kit::platform`. Never add separate `gpui` or `gpui-component` crate entries.
+- **Single UI Dependency:** Depend only on `gpui-kit = "0.11.0"`. Import GPUI via `use gpui_kit::*;` and layers via `gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`, `gpui_kit::platform`. Never add separate `gpui` or `gpui-component` crate entries. (Sole exception: the test-only `gpui-pre-wgpu` dev-dependency for screenshots, §6.1.)
 - **Bootstrap:** Call `gpui_kit::init(cx)` first inside `gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(...)` and open windows via `gpui_kit::open_window(...)` so `Root` mounts dialog/sheet/notification/tooltip layers properly.
 - **Never Invent APIs:** Always verify component constructors and methods against `gpui-kit` docs/source before writing code.
 - **State & Rendering:**
@@ -117,6 +117,20 @@ Before designing or writing any UI code, **read both normative guides in full**:
   - Use `Button` (with `ghost`/`outline` when quiet) for all in-app commands; reserve `Link` strictly for external URLs.
   - Use `AlertDialog` only for consequential/destructive actions (never reversible toggles).
 - **Testing:** Verify UI interactions using `#[gpui_kit::test]` and `VisualTestContext` against real production views.
+- **Engine:** `gpui-kit` here builds on **`gpui-pre`** (its `gpui-fast` feature is off). Read `gpui-pre-*` sources when checking framework behavior, not `gpui-fast-*`.
+
+### 6.1 Visual Verification (Headless Screenshots)
+Behavior tests (`tests/ui.rs`) cannot show what the UI looks like. Any change with a visible surface (layout, spacing, color, theme, copy) must also be checked by rendering screenshots and **actually viewing them** before the work is reported done. Never launch the real binary for this: it enumerates live HID devices.
+
+1. **Run:** `cargo test -p agnoperiph --test visual -- --ignored --nocapture`. It renders the production `AgnoPeriphApp` against `MockPeripheralService` at 1240×820 with dev tools off, in light and dark themes, and writes PNGs to `target/ui-screenshots/` (`<view>-<theme>.png`, 2× scale).
+2. **View:** open each PNG that your change affects with the image Read tool and review it against the design guides and any reference screenshots. Check text, truncation, overlap, clipping at the window edge, alignment and both themes.
+3. **Extend:** add views or states in `crates/ui/tests/visual.rs` by driving the UI first, with the same helpers as `tests/ui.rs` (`click`, `open_tab`, `set_theme`), then calling `save(cx, handle, "name")`. Use the mock only.
+4. **Report:** say which screenshots you viewed and what you fixed. If the renderer is unavailable (no GPU adapter, CI), say the visual check was skipped. Do not claim it passed.
+
+How it works, so nobody has to rediscover it:
+- **Renderer:** gpui supplies no headless renderer on Windows (`current_headless_renderer()` returns `None`). `tests/visual.rs` therefore builds a `HeadlessAppContext` with `gpui_wgpu::WgpuHeadlessRenderer` from the dev-dependency `gpui-pre-wgpu`, pinned to the exact `gpui-pre` version `gpui-kit` uses. This dev-dependency (plus `image` and `anyhow`) is the one allowed exception to "single UI dependency". It is test-only and must never move into `[dependencies]`. When upgrading `gpui-kit`, bump the pin to match, or the build fails with "multiple versions of crate `gpui`".
+- **Text:** `gpui_kit::platform::current_platform(true)` returns a **no-op** text system on Windows. Text lays out at the right size but every glyph is empty, so screenshots show boxes with no text. Use `current_platform(false).text_system()` (real DirectWrite), wrapped to force grayscale glyphs as the test does.
+- **Cost:** the first build compiles `wgpu`, which takes several minutes at the workspace's dependency `opt-level = 3`. Later builds reuse the cache. The test is `#[ignore]`d so `cargo test --workspace` stays GPU-free and fast.
 
 ---
 
@@ -132,4 +146,8 @@ Before completing any phase or milestone, run and verify:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+```
+For UI changes, also run and view the screenshots (§6.1):
+```powershell
+cargo test -p agnoperiph --test visual -- --ignored --nocapture
 ```

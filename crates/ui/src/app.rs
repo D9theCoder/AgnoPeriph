@@ -877,14 +877,18 @@ impl AgnoPeriphApp {
 
     fn finish_origin(&mut self, device: &DeviceId, origin: &JobOrigin) {
         match origin {
-            JobOrigin::User(scope) => match scope {
-                DraftScope::DpiStages => self.dpi_draft = None,
-                DraftScope::Actuation => self.key_draft.actuation = None,
-                DraftScope::RapidTrigger => self.key_draft.rapid_trigger = None,
-                DraftScope::Deadzones => self.deadzone_draft = DeadzoneDraft::default(),
-                DraftScope::Macros => self.macros_ui.clear_draft(),
-                DraftScope::None => {}
-            },
+            JobOrigin::User(scope) => {
+                match scope {
+                    DraftScope::DpiStages => self.dpi_draft = None,
+                    DraftScope::Actuation => self.key_draft.actuation = None,
+                    DraftScope::RapidTrigger => self.key_draft.rapid_trigger = None,
+                    DraftScope::Deadzones => self.deadzone_draft = DeadzoneDraft::default(),
+                    DraftScope::Macros => self.macros_ui.clear_draft(),
+                    DraftScope::None => {}
+                }
+                // Keep the active software preset synchronized with every confirmed user edit.
+                self.snapshot_active_software_preset(device);
+            }
             JobOrigin::ProfileSwitch {
                 slot,
                 is_software,
@@ -1062,9 +1066,17 @@ impl AgnoPeriphApp {
 
     /// Triggers matrix click: adds an unselected key, removes a selected one.
     ///
-    /// Mirrors ATK HUB, where every click accumulates; the last key may be removed too.
+    /// Keys owned by RS or SOCD are managed by their pair's dedicated travel and Rapid Trigger
+    /// settings, so clicking them outside a pick focuses that mode instead of selecting them
+    /// for regular per-key actuation edits.
     pub fn toggle_key(&mut self, key: KeyIndex, cx: &mut Context<Self>) {
         if self.route_pick(key, cx) {
+            return;
+        }
+        if let Some(pair_mode) = self.pair_managed_mode(key) {
+            self.paired.mode = pair_mode;
+            self.selected_keys.remove(&key);
+            cx.notify();
             return;
         }
         if self.selected_keys.remove(&key) {
@@ -1080,6 +1092,28 @@ impl AgnoPeriphApp {
         self.key_draft = KeyDraft::default();
         self.request_sync(cx);
         cx.notify();
+    }
+
+    /// Returns the paired mode (`Socd` or `RapidSwitch`) owning `key`, if any.
+    pub(crate) fn pair_managed_mode(&self, key: KeyIndex) -> Option<hall_effect_panel::PairedMode> {
+        let he = self.hall_effect_state()?;
+        if he
+            .snapshot
+            .socd_pairs
+            .iter()
+            .any(|p| p.key_a == key || p.key_b == key)
+        {
+            return Some(hall_effect_panel::PairedMode::Socd);
+        }
+        if he
+            .snapshot
+            .rapid_switch_pairs
+            .iter()
+            .any(|p| p.key_a == key || p.key_b == key)
+        {
+            return Some(hall_effect_panel::PairedMode::RapidSwitch);
+        }
+        None
     }
 
     /// Selects `key` alone, or toggles it in a multi-key selection when `extend` is set.
@@ -1314,15 +1348,16 @@ impl AgnoPeriphApp {
 
     /// Builds the job that activates `slot` on `device`, or `None` when nothing needs writing.
     ///
-    /// An unattended switch never sends the flash-erasing all-keys actuation write in live
-    /// mode; that part of a software preset needs the user's confirmation.
+    /// For software-profile keyboards (e.g. ATK RS7), automatically saves the currently active
+    /// slot's live state before switching away and computes a full diff (including clearing any
+    /// SOCD/RS/DKS/MT/TGL bindings not present in the target preset).
     pub(crate) fn profile_switch_job(
         &mut self,
         device: &DeviceId,
         slot: u8,
         is_automatic: bool,
     ) -> Option<WriteJob> {
-        let snapshot = self.device(device)?;
+        let snapshot = self.device(device)?.clone();
         if snapshot.profiles.is_some() {
             return Some(WriteJob {
                 device: device.clone(),
@@ -1334,7 +1369,10 @@ impl AgnoPeriphApp {
                 },
             });
         }
-        let model_name = snapshot.info.model_name.clone();
+        let current_active = self.config.ensure_software_profiles(device).active_slot;
+        if current_active != slot {
+            self.snapshot_active_software_preset(device);
+        }
         let preset = self
             .config
             .ensure_software_profiles(device)
@@ -1342,16 +1380,7 @@ impl AgnoPeriphApp {
             .iter()
             .find(|s| s.slot == slot)
             .map_or_default(|s| s.saved.clone());
-        let skip_actuation = is_automatic && !self.dry_run;
-        let changes = profile_bar::preset_changes(&preset, !skip_actuation);
-        if skip_actuation && preset.global_actuation.is_some() {
-            self.auto_switch_note = Some(
-                format!(
-                    "{model_name}: the preset’s actuation depth wasn’t written automatically. Switch the preset from the device page to write it."
-                )
-                .into(),
-            );
-        }
+        let changes = profile_bar::preset_changes_for(&preset, &snapshot);
         if changes.is_empty() {
             self.config.ensure_software_profiles(device).active_slot = slot;
             self.save_config();

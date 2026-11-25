@@ -18,6 +18,7 @@ mod controls;
 pub mod game_profiles;
 mod game_profiles_view;
 mod hall_effect_panel;
+pub mod icons;
 mod inspector_drawer;
 mod key_matrix;
 mod keyboard_config_panel;

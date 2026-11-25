@@ -42,7 +42,7 @@ fn main() {
     let system = Arc::new(WindowsSystem::new(config_path));
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(agnoperiph::icons::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             // The process outlives its window while it sits in the notification area.

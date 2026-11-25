@@ -23,10 +23,14 @@ use gpui_kit::{
     WindowOptions, px, size,
 };
 
-/// W on the RS7 matrix (row 2, column 2): Rapid Trigger on, 0.80 mm actuation.
+/// W on the RS7 matrix (row 2, column 2): owned by the fixture's Rapid Switch pair (W + S).
 const KEY_W: u16 = 2 * 16 + 2;
-/// Q on the RS7 matrix (row 2, column 1): Rapid Trigger off, 1.20 mm actuation.
+/// S on the RS7 matrix (row 3, column 2): owned by the fixture's Rapid Switch pair (W + S).
+const KEY_S: u16 = 3 * 16 + 2;
+/// Q on the RS7 matrix (row 2, column 1): regular key, Rapid Trigger off, 1.20 mm actuation.
 const KEY_Q: u16 = 2 * 16 + 1;
+/// E on the RS7 matrix (row 2, column 3): regular key, Rapid Trigger off, 1.20 mm actuation.
+const KEY_E: u16 = 2 * 16 + 3;
 
 fn open_app(
     cx: &mut TestAppContext,
@@ -182,8 +186,8 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
 
-    click(cx, handle, key_id(KEY_W));
-    cx.update(|cx| assert_eq!(app.read(cx).selected_key(), KeyIndex::new(KEY_W)));
+    click(cx, handle, key_id(KEY_E));
+    cx.update(|cx| assert_eq!(app.read(cx).selected_key(), KeyIndex::new(KEY_E)));
 
     click(cx, handle, "actuation-inc");
     click(cx, handle, "actuation-inc");
@@ -191,7 +195,7 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
     cx.update(|cx| {
         let app = app.read(cx);
         let he = app.selected_device().unwrap().hall_effect.as_ref().unwrap();
-        assert_eq!(he.key(KeyIndex::new(KEY_W)).unwrap().actuation, travel(84));
+        assert_eq!(he.key(KeyIndex::new(KEY_E)).unwrap().actuation, travel(124));
         assert_eq!(he.key(KeyIndex::new(KEY_Q)).unwrap().actuation, travel(120));
         assert_eq!(
             app.packets().last().unwrap().outcome,
@@ -248,7 +252,7 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
             .hall_effect
             .as_ref()
             .unwrap();
-        assert_eq!(he.key(KeyIndex::new(KEY_W)).unwrap().actuation, travel(80));
+        assert_eq!(he.key(KeyIndex::new(KEY_E)).unwrap().actuation, travel(120));
     });
 
     click(cx, handle, "apply-actuation-all");
@@ -261,7 +265,7 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
             .hall_effect
             .as_ref()
             .unwrap();
-        assert_eq!(he.key(KeyIndex::new(KEY_W)).unwrap().actuation, travel(122));
+        assert_eq!(he.key(KeyIndex::new(KEY_E)).unwrap().actuation, travel(122));
         assert_eq!(he.key(KeyIndex::new(KEY_Q)).unwrap().actuation, travel(122));
     });
 }
@@ -514,13 +518,13 @@ fn triggers_select_many_keys_and_restore_defaults(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
 
     // Plain clicks accumulate, as in ATK HUB; no modifier is needed.
-    click(cx, handle, key_id(KEY_W));
+    click(cx, handle, key_id(KEY_E));
     click(cx, handle, key_id(KEY_Q));
     cx.update(|cx| {
         let app = app.read(cx);
         assert_eq!(
             app.selected_keys().clone(),
-            [KeyIndex::new(KEY_Q), KeyIndex::new(KEY_W)].into()
+            [KeyIndex::new(KEY_Q), KeyIndex::new(KEY_E)].into()
         );
         assert_eq!(app.selected_key(), KeyIndex::new(KEY_Q));
     });
@@ -529,21 +533,21 @@ fn triggers_select_many_keys_and_restore_defaults(cx: &mut TestAppContext) {
     click(cx, handle, key_id(KEY_Q));
     cx.update(|cx| {
         let app = app.read(cx);
-        assert_eq!(app.selected_keys().clone(), [KeyIndex::new(KEY_W)].into());
-        assert_eq!(app.selected_key(), KeyIndex::new(KEY_W));
+        assert_eq!(app.selected_keys().clone(), [KeyIndex::new(KEY_E)].into());
+        assert_eq!(app.selected_key(), KeyIndex::new(KEY_E));
     });
-    click(cx, handle, key_id(KEY_W));
+    click(cx, handle, key_id(KEY_E));
     cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
     assert!(is_disabled(cx, handle, "apply-actuation-all"));
     assert!(is_disabled(cx, handle, "restore-default-keys"));
 
-    click(cx, handle, key_id(KEY_W));
+    click(cx, handle, key_id(KEY_E));
     click(cx, handle, key_id(KEY_Q));
 
     click(cx, handle, "restore-default-keys");
     let snapshot = keyboard_snapshot(cx, &app);
     let he = snapshot.hall_effect.as_ref().unwrap();
-    for key in [KEY_W, KEY_Q] {
+    for key in [KEY_E, KEY_Q] {
         let config = he.key(KeyIndex::new(key)).unwrap();
         assert_eq!(config.actuation, travel(120));
         assert!(!config.rapid_trigger.is_enabled());
@@ -780,63 +784,76 @@ fn software_preset_restores_saved_lighting(cx: &mut TestAppContext) {
     click(cx, handle, device_element_id(&keyboard()));
     open_tab(cx, handle, KeyboardTab::Lighting);
 
+    // Every confirmed edit auto-saves to the active software preset (no manual Save button).
+    assert!(!exists(cx, handle, "save-preset"));
     click(cx, handle, "rgb-0-preset-5");
-    click(cx, handle, "save-preset");
     cx.update(|cx| {
         let saved = &app.read(cx).config().software_profiles[keyboard().as_str()].slots[0].saved;
         assert_ne!(saved.rgb_zones, []);
+        assert_eq!(saved.socd_pairs.len(), 1);
     });
 
-    // An empty preset activates without writing anything.
+    // Switching to an unconfigured preset clears leftover SOCD pairs instead of retaining them.
     click(cx, handle, ("preset", 1u64));
     cx.update(|cx| assert_eq!(app.read(cx).current_slot(&keyboard()), Some(1)));
+    assert_eq!(
+        keyboard_snapshot(cx, &app)
+            .hall_effect
+            .unwrap()
+            .snapshot
+            .socd_pairs,
+        Vec::new(),
+        "switching to unconfigured preset must clear previous SOCD pairs"
+    );
     click(cx, handle, "rgb-0-preset-7");
     assert!(matches!(
         zone_effect(&keyboard_snapshot(cx, &app), 0),
         RgbEffect::Preset { id: 7, .. }
     ));
 
-    // Switching back pushes the saved lighting.
+    // Switching back restores both the saved lighting and the saved SOCD pair.
     click(cx, handle, ("preset", 0u64));
     cx.update(|cx| assert_eq!(app.read(cx).current_slot(&keyboard()), Some(0)));
     assert!(matches!(
         zone_effect(&keyboard_snapshot(cx, &app), 0),
         RgbEffect::Preset { id: 5, .. }
     ));
+    assert_eq!(
+        keyboard_snapshot(cx, &app)
+            .hall_effect
+            .unwrap()
+            .snapshot
+            .socd_pairs
+            .len(),
+        1
+    );
 }
 
 #[gpui_kit::test]
-fn live_preset_actuation_needs_confirmation_and_is_never_auto_written(cx: &mut TestAppContext) {
+fn software_preset_auto_saves_per_key_and_clears_unconfigured_pairs(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
     click(cx, handle, "dry-run");
     click(cx, handle, "ok");
 
-    // Make actuation uniform (1.22 mm) and save it into preset 1.
-    click(cx, handle, key_id(KEY_Q));
-    click(cx, handle, "actuation-inc");
-    click(cx, handle, "apply-actuation-all");
-    click(cx, handle, "ok");
-    click(cx, handle, "save-preset");
-    cx.update(|cx| {
-        let saved = &app.read(cx).config().software_profiles[keyboard().as_str()].slots[0].saved;
-        assert_eq!(saved.global_actuation, Some(travel(122)));
-    });
-
-    // Move to the empty preset 2, then make W differ.
-    click(cx, handle, ("preset", 1u64));
-    click(cx, handle, key_id(KEY_W));
+    // Tune E actuation on Preset 0 (auto-saves into Preset 0, keeping its SOCD A+D & RS W+S pairs).
+    click(cx, handle, key_id(KEY_E));
     click(cx, handle, "actuation-inc");
     click(cx, handle, "apply-actuation-key");
-    assert_eq!(key_actuation(cx, &app, KEY_W), 124);
+    let preset0_e = key_actuation(cx, &app, KEY_E);
 
-    // A manual switch that rewrites the actuation table asks first.
-    click(cx, handle, ("preset", 0u64));
-    assert!(exists(cx, handle, "cancel"));
-    click(cx, handle, "cancel");
-    cx.update(|cx| assert_eq!(app.read(cx).current_slot(&keyboard()), Some(1)));
+    // Move to unconfigured Preset 1: SOCD and RS are cleared cleanly, and editing E auto-saves to Preset 1.
+    click(cx, handle, ("preset", 1u64));
+    let p1_he = keyboard_snapshot(cx, &app).hall_effect.unwrap().snapshot;
+    assert_eq!(p1_he.socd_pairs, Vec::new());
+    assert_eq!(p1_he.rapid_switch_pairs, Vec::new());
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, "apply-actuation-key");
+    let preset1_e = key_actuation(cx, &app, KEY_E);
+    assert_ne!(preset1_e, preset0_e);
 
-    // The unattended switcher applies the preset without the actuation write.
+    // Switching back via Game Profile restores E's per-key actuation and Preset 0's SOCD & RS pairs
+    // without a flash-erase confirmation or lost settings.
     app.update(cx, |app, cx| {
         let id = app.add_game_profile("Valorant", "VALORANT-Win64-Shipping.exe", "", cx);
         app.set_game_target(Some(&id), &keyboard(), Some(0), cx);
@@ -847,9 +864,72 @@ fn live_preset_actuation_needs_confirmation_and_is_never_auto_written(cx: &mut T
     cx.update(|cx| {
         let app = app.read(cx);
         assert_eq!(app.current_slot(&keyboard()), Some(0));
-        assert!(app.auto_switch_note().is_some());
     });
-    assert_eq!(key_actuation(cx, &app, KEY_W), 124);
+    assert_eq!(key_actuation(cx, &app, KEY_E), preset0_e);
+    let restored = keyboard_snapshot(cx, &app).hall_effect.unwrap().snapshot;
+    assert_eq!(restored.socd_pairs.len(), 1);
+    assert_eq!(restored.rapid_switch_pairs.len(), 1);
+}
+
+#[gpui_kit::test]
+fn paired_keys_have_separate_travel_and_rt_and_disable_matrix_selection(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+
+    // W/S (RS) and A/D (SOCD) are owned by pairs: clicking them on the trigger map must NOT select
+    // them for regular per-key actuation/RT edits (it focuses their paired mode instead), and
+    // Select All skips them too.
+    for paired in [KEY_W, KEY_S, KEY_A, KEY_D] {
+        click(cx, handle, key_id(paired));
+    }
+    cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
+
+    click(cx, handle, "select-all-keys");
+    cx.update(|cx| {
+        let sel = app.read(cx).selected_keys();
+        for paired in [KEY_A, KEY_D, KEY_W, KEY_S] {
+            assert!(!sel.contains(&KeyIndex::new(paired)));
+        }
+        assert!(sel.contains(&KeyIndex::new(KEY_Q)));
+        assert!(sel.contains(&KeyIndex::new(KEY_E)));
+    });
+    click(cx, handle, "clear-keys");
+
+    // Existing SOCD pair exposes its own independent travel and Rapid Trigger controls.
+    let before = keyboard_snapshot(cx, &app)
+        .hall_effect
+        .unwrap()
+        .snapshot
+        .socd_pairs[0];
+    assert_eq!(before.trigger_point, travel(150));
+    assert!(!before.rapid_trigger);
+
+    click(cx, handle, "socd-travel-inc-49-51-p");
+    click(cx, handle, "socd-rt-49-51-sw");
+    let after = keyboard_snapshot(cx, &app)
+        .hall_effect
+        .unwrap()
+        .snapshot
+        .socd_pairs[0];
+    assert_eq!(after.trigger_point, travel(152));
+    assert!(after.rapid_trigger);
+
+    // Creating a new RS pair on free keys (Q + E) saves its dedicated travel and Rapid Trigger state.
+    click(cx, handle, "paired-mode-rs");
+    click(cx, handle, "paired-pick-first");
+    click(cx, handle, key_id(KEY_Q));
+    click(cx, handle, key_id(KEY_E));
+    click(cx, handle, "paired-travel-dec");
+    click(cx, handle, "paired-rt");
+    click(cx, handle, "paired-add");
+    let rs_pairs = keyboard_snapshot(cx, &app)
+        .hall_effect
+        .unwrap()
+        .snapshot
+        .rapid_switch_pairs;
+    assert_eq!(rs_pairs.len(), 2);
+    assert_eq!(rs_pairs[1].trigger_point, travel(148));
+    assert!(rs_pairs[1].rapid_trigger);
 }
 
 #[gpui_kit::test]
@@ -873,11 +953,17 @@ fn workspace_scrolls_at_the_default_window_size(cx: &mut TestAppContext) {
     settle(cx, handle);
     click(cx, handle, device_element_id(&keyboard()));
 
+    // With dev tools (packet inspector) open at 1240x820, the bottom trigger deck sits below the fold.
     let visible = |cx: &mut TestAppContext| {
-        cx.update_window(handle, |_, window, _| window.find("paired-add").visible())
-            .unwrap()
+        cx.update_window(handle, |_, window, _| {
+            window.find("apply-rapid-trigger").visible()
+        })
+        .unwrap()
     };
-    assert!(!visible(cx), "paired keys start below the fold");
+    assert!(
+        !visible(cx),
+        "bottom deck starts below the fold with inspector open"
+    );
     cx.update_window(handle, |_, window, cx| {
         window.scroll(
             key_id(KEY_W),
@@ -887,7 +973,7 @@ fn workspace_scrolls_at_the_default_window_size(cx: &mut TestAppContext) {
     })
     .unwrap();
     settle(cx, handle);
-    assert!(visible(cx), "precise scrolling reaches the paired keys");
+    assert!(visible(cx), "precise scrolling reaches the bottom deck");
 }
 
 #[gpui_kit::test]
@@ -1138,10 +1224,13 @@ fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
         );
     };
 
-    // The matrix, its selection tools and the whole trigger deck share one screen.
+    // The matrix, its selection tools, the paired-keys card and the whole trigger deck share one screen.
     for id in [
         ElementId::from(key_id(KEY_W)),
         "restore-default-keys".into(),
+        "paired-mode-tgl".into(),
+        "socd-remove-49-51-x".into(),
+        "socd-rt-49-51-sw".into(),
         "apply-deadzones".into(),
         "deadzone-bottom-inc".into(),
         "release-sensitivity-inc".into(),

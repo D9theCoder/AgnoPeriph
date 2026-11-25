@@ -578,8 +578,7 @@ fn render_effects(
                          is_current: bool,
                          next: RgbEffect,
                          cx: &mut Context<AgnoPeriphApp>| {
-        Button::new(id)
-            .outline()
+        let button = Button::new(id)
             .small()
             .flex_1()
             .min_w_0()
@@ -591,8 +590,13 @@ fn render_effects(
                 if !is_current {
                     this.write_zone(next, brightness, cx);
                 }
-            }))
-            .into_any_element()
+            }));
+        if is_current {
+            button.primary()
+        } else {
+            button.outline()
+        }
+        .into_any_element()
     };
 
     let buttons: Vec<AnyElement> = if info.presets.is_empty() {

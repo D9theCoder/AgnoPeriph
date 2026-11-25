@@ -8,7 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agnoperiph_core::{
-    DeviceId, KeyboardConfigSnapshot, ProfileSlot, RgbZoneState, TravelHundredthsMm,
+    DeviceId, DksBinding, KeyHallEffectConfig, KeyboardConfigSnapshot, ModTapBinding, ProfileSlot,
+    RapidSwitchPair, RgbZoneState, SocdPair, ToggleKeyBinding, TravelHundredthsMm,
 };
 use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessesToUpdate, System};
@@ -115,9 +116,18 @@ impl GameProfile {
 #[serde(default)]
 #[non_exhaustive]
 pub struct SavedKeyboardPreset {
+    /// `true` once Hall Effect state (per-key tuning & paired/advanced keys) has been saved here.
+    pub has_hall_effect: bool,
     pub global_actuation: Option<TravelHundredthsMm>,
     pub top_deadzone: Option<TravelHundredthsMm>,
     pub bottom_deadzone: Option<TravelHundredthsMm>,
+    /// Per-key actuation and Rapid Trigger configuration across the keyboard matrix.
+    pub key_configs: Vec<KeyHallEffectConfig>,
+    pub socd_pairs: Vec<SocdPair>,
+    pub rapid_switch_pairs: Vec<RapidSwitchPair>,
+    pub dks_bindings: Vec<DksBinding>,
+    pub mod_tap_bindings: Vec<ModTapBinding>,
+    pub toggle_bindings: Vec<ToggleKeyBinding>,
     pub rgb_zones: Vec<RgbZoneState>,
     pub keyboard_config: Option<KeyboardConfigSnapshot>,
 }
@@ -125,9 +135,16 @@ pub struct SavedKeyboardPreset {
 impl SavedKeyboardPreset {
     /// Returns `true` when nothing has been saved into this preset yet.
     pub fn is_empty(&self) -> bool {
-        self.global_actuation.is_none()
+        !self.has_hall_effect
+            && self.global_actuation.is_none()
             && self.top_deadzone.is_none()
             && self.bottom_deadzone.is_none()
+            && self.key_configs.is_empty()
+            && self.socd_pairs.is_empty()
+            && self.rapid_switch_pairs.is_empty()
+            && self.dks_bindings.is_empty()
+            && self.mod_tap_bindings.is_empty()
+            && self.toggle_bindings.is_empty()
             && self.rgb_zones.is_empty()
             && self.keyboard_config.is_none()
     }

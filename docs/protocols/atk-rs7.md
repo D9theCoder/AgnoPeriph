@@ -184,7 +184,10 @@ TRAVEL_INFO_MAP["ATK RS7"] = {
 // Bulk RT (js): p[0]=2|3, p[1]=150, p[2]=14, p[5..7]=offset, p[7]=size(4), get: p[8..8+size*5]
 // Deadzone (Xs): p[0]=2|3, p[1]=150, p[2]=11, p[3..5]=top*100, p[5..7]=bottom*100
 // DKS (Wt): p[0]=2|3, p[1]=150, p[2]=15, p[5]=1(get)|3(set), p[6]=index, p[7..23]=4 * [status_u16_be, keyClass, keyId]
-// SOCD/RS (rs): p[0]=2|3, p[1]=150, p[2]=32, p[5]=1|3, p[6]=index, p[7]=mode, p[8]=id, p[9..11]=point*100, p[11]=withGlobal, p[12]=rt, p[13..17]=k1r,k1c,k2r,k2c, p[17]=layer
+// SOCD/RS (rs): p[0]=2|3, p[1]=150, p[2]=32, p[5]=1|3, p[6]=index, p[7]=mode, p[8]=id, p[9..11]=point*100, p[11]=withGlobal(0), p[12]=rt(0|1), p[13..17]=k1r,k1c,k2r,k2c, p[17]=layer
+// Verified in useTglLogic-yjkMKXkT.js & AdvanceKeySetting-BYKnWd2X.js:
+//   SOCD/RS pairs always send withGlobal=0 and use their own per-pair trigger travel (`point`, default 1.50 mm) and `rt` (0=off, 1=on).
+//   In TriggerSetting-Dx1B3mUC.js, keys owned by RS/SOCD are disabled on the normal trigger map (`[RS, SOCD].includes(n.keyType)`).
 // Calibration status (Qt.getInitStatusBuffer): p[0]=2, p[1]=150, p[2]=31, p[5..7]=offset, p[7]=size(24), p[8..8+size]
 // Backlight RGB (Ys): p[0]=8|7, p[1]=65, p[2]=effect, p[4]=speed, p[5..8]=r,g,b, p[8]=brightness
 // Logo Light (Js): p[0]=2|3, p[1]=150, p[2]=33, p[3]=mode, p[4]=colorful, p[5]=brightness, p[6]=speed, p[7..10]=r,g,b

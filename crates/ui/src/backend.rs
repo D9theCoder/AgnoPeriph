@@ -580,10 +580,9 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
         }
         SettingChange::RapidSwitch(pairs) => {
             let he = require(snapshot.hall_effect.as_ref(), "hall_effect")?;
+            he.capabilities.validate_rapid_switch_pairs(pairs)?;
             let mut seen = std::collections::BTreeSet::new();
             for pair in pairs {
-                he.capabilities.validate_key(pair.key_a)?;
-                he.capabilities.validate_key(pair.key_b)?;
                 if !seen.insert(pair.key_a) || !seen.insert(pair.key_b) {
                     return Err(CoreError::Validation(
                         "a key cannot appear in more than one RS pair".to_owned(),

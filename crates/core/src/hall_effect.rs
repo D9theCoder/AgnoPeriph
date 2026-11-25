@@ -145,6 +145,13 @@ impl DksBinding {
     }
 }
 
+/// Default trigger travel distance for newly created RS/SOCD pairs (`1.50 mm`, matching ATK HUB).
+pub const DEFAULT_PAIR_TRIGGER_POINT: TravelHundredthsMm = TravelHundredthsMm::from_hundredths(150);
+
+const fn default_pair_trigger_point() -> TravelHundredthsMm {
+    DEFAULT_PAIR_TRIGGER_POINT
+}
+
 /// Simultaneous Opposing Cardinal Directions (SOCD / Snap Tap) resolution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SocdMode {
@@ -161,17 +168,39 @@ pub struct SocdPair {
     pub key_a: KeyIndex,
     pub key_b: KeyIndex,
     pub mode: SocdMode,
+    /// Dedicated trigger actuation depth for this pair (independent of per-key actuation).
+    #[serde(default = "default_pair_trigger_point")]
+    pub trigger_point: TravelHundredthsMm,
+    /// Dedicated Rapid Trigger toggle for this pair (independent of per-key Rapid Trigger).
+    #[serde(default)]
+    pub rapid_trigger: bool,
 }
 
 impl SocdPair {
-    /// Creates a validated SOCD pair (keys must be distinct).
+    /// Creates a validated SOCD pair (keys must be distinct) with default trigger travel (`1.50 mm`).
     pub fn new(key_a: KeyIndex, key_b: KeyIndex, mode: SocdMode) -> CoreResult<Self> {
         if key_a == key_b {
             return Err(CoreError::Validation(format!(
                 "SOCD pair requires two distinct keys, got {key_a}"
             )));
         }
-        Ok(Self { key_a, key_b, mode })
+        Ok(Self {
+            key_a,
+            key_b,
+            mode,
+            trigger_point: DEFAULT_PAIR_TRIGGER_POINT,
+            rapid_trigger: false,
+        })
+    }
+
+    pub const fn with_trigger_point(mut self, point: TravelHundredthsMm) -> Self {
+        self.trigger_point = point;
+        self
+    }
+
+    pub const fn with_rapid_trigger(mut self, enabled: bool) -> Self {
+        self.rapid_trigger = enabled;
+        self
     }
 }
 
@@ -181,6 +210,12 @@ impl SocdPair {
 pub struct RapidSwitchPair {
     pub key_a: KeyIndex,
     pub key_b: KeyIndex,
+    /// Dedicated trigger actuation depth for this pair (independent of per-key actuation).
+    #[serde(default = "default_pair_trigger_point")]
+    pub trigger_point: TravelHundredthsMm,
+    /// Dedicated Rapid Trigger toggle for this pair (independent of per-key Rapid Trigger).
+    #[serde(default)]
+    pub rapid_trigger: bool,
 }
 
 impl RapidSwitchPair {
@@ -190,7 +225,22 @@ impl RapidSwitchPair {
                 "Rapid Switch pair requires two distinct keys, got {key_a}"
             )));
         }
-        Ok(Self { key_a, key_b })
+        Ok(Self {
+            key_a,
+            key_b,
+            trigger_point: DEFAULT_PAIR_TRIGGER_POINT,
+            rapid_trigger: false,
+        })
+    }
+
+    pub const fn with_trigger_point(mut self, point: TravelHundredthsMm) -> Self {
+        self.trigger_point = point;
+        self
+    }
+
+    pub const fn with_rapid_trigger(mut self, enabled: bool) -> Self {
+        self.rapid_trigger = enabled;
+        self
     }
 }
 
@@ -452,6 +502,30 @@ impl HallEffectCapabilities {
                     pair.key_a
                 )));
             }
+            self.validate_actuation(pair.trigger_point)?;
+        }
+        Ok(())
+    }
+
+    /// Validates a slice of Rapid Switch (RS) pairs against key and travel bounds.
+    pub fn validate_rapid_switch_pairs(&self, pairs: &[RapidSwitchPair]) -> CoreResult<()> {
+        if pairs.len() > usize::from(self.max_socd_pairs.max(20)) {
+            return Err(CoreError::OutOfRange {
+                field: "rapid_switch_pairs",
+                actual: pairs.len().to_string(),
+                expected: format!("0..={}", self.max_socd_pairs.max(20)),
+            });
+        }
+        for pair in pairs {
+            self.validate_key(pair.key_a)?;
+            self.validate_key(pair.key_b)?;
+            if pair.key_a == pair.key_b {
+                return Err(CoreError::Validation(format!(
+                    "Rapid Switch pair cannot reference the same key {}",
+                    pair.key_a
+                )));
+            }
+            self.validate_actuation(pair.trigger_point)?;
         }
         Ok(())
     }

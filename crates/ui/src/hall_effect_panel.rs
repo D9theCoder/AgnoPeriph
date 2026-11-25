@@ -4,12 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agnoperiph_core::{
-    DksBinding, DksStageAction, DksTriggerDirection, KeyCode, KeyIndex, ModTapBinding,
-    RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair, ToggleKeyBinding, TravelHundredthsMm,
+    DEFAULT_PAIR_TRIGGER_POINT, DksBinding, DksStageAction, DksTriggerDirection, KeyCode, KeyIndex,
+    ModTapBinding, RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair, ToggleKeyBinding,
+    TravelHundredthsMm,
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable, Theme, WindowExt,
-    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
@@ -20,11 +21,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{
-    AgnoPeriphApp, DraftScope, JobOrigin, field, group, mm, muted_note, readout, section,
-};
+use crate::app::{AgnoPeriphApp, DraftScope, JobOrigin, field, mm, muted_note, readout, section};
 use crate::backend::{ActuationTarget, DeviceSnapshot, HallEffectState, SettingChange};
 use crate::controls::{SliderRole, sync_slider, to_units};
+use crate::icons::{AdvancedIcon, advanced_svg};
 use crate::key_matrix::{self, KeyFace, KeyTone};
 use crate::keycodes::{HID_KEYS, KeyGroup, hid_name};
 use crate::keymap::KeyLayout;
@@ -122,6 +122,16 @@ impl PairedMode {
         }
     }
 
+    const fn icon(self) -> AdvancedIcon {
+        match self {
+            Self::RapidSwitch => AdvancedIcon::Rs,
+            Self::Socd => AdvancedIcon::Socd,
+            Self::Dks => AdvancedIcon::Dks,
+            Self::ModTap => AdvancedIcon::Mt,
+            Self::Toggle => AdvancedIcon::Tgl,
+        }
+    }
+
     fn summary(self) -> &'static str {
         match self {
             Self::RapidSwitch => "Two keys; the deeper press wins.",
@@ -156,6 +166,10 @@ pub(crate) struct PairedKeysUi {
     pub(crate) first: Option<KeyIndex>,
     pub(crate) second: Option<KeyIndex>,
     pub(crate) socd_mode: SocdMode,
+    /// Per-pair trigger actuation depth for new RS / SOCD pairs.
+    pub(crate) pair_trigger_point: TravelHundredthsMm,
+    /// Per-pair Rapid Trigger toggle for new RS / SOCD pairs.
+    pub(crate) pair_rapid_trigger: bool,
     pub(crate) dks_stages: [DksStageDraft; 4],
     pub(crate) primary_usage: u8,
     pub(crate) secondary_usage: u8,
@@ -167,11 +181,13 @@ pub(crate) struct PairedKeysUi {
 impl Default for PairedKeysUi {
     fn default() -> Self {
         Self {
-            mode: PairedMode::default(),
+            mode: PairedMode::Socd,
             pick: None,
             first: None,
             second: None,
             socd_mode: SocdMode::LastInputPriority,
+            pair_trigger_point: DEFAULT_PAIR_TRIGGER_POINT,
+            pair_rapid_trigger: false,
             dks_stages: [
                 DksStageDraft {
                     enabled: true,
@@ -501,15 +517,25 @@ impl AgnoPeriphApp {
             .collect()
     }
 
+    fn selectable_layout_keys(&self) -> Vec<KeyIndex> {
+        self.layout_keys()
+            .into_iter()
+            .filter(|&key| self.pair_managed_mode(key).is_none())
+            .collect()
+    }
+
     fn select_all_keys(&mut self, cx: &mut Context<Self>) {
-        self.selected_keys = self.layout_keys().into_iter().collect();
+        self.selected_keys = self.selectable_layout_keys().into_iter().collect();
+        if let Some(&first) = self.selected_keys.iter().next() {
+            self.selected_key = first;
+        }
         self.key_draft = crate::app::KeyDraft::default();
         self.request_sync(cx);
         cx.notify();
     }
 
     fn invert_key_selection(&mut self, cx: &mut Context<Self>) {
-        let all: BTreeSet<KeyIndex> = self.layout_keys().into_iter().collect();
+        let all: BTreeSet<KeyIndex> = self.selectable_layout_keys().into_iter().collect();
         self.selected_keys = all.difference(&self.selected_keys).copied().collect();
         if let Some(first) = self.selected_keys.iter().next() {
             self.selected_key = *first;
@@ -595,6 +621,11 @@ impl AgnoPeriphApp {
                 let Ok(pair) = RapidSwitchPair::new(first, second) else {
                     return;
                 };
+                let pair = pair
+                    .with_trigger_point(ui.pair_trigger_point)
+                    .with_rapid_trigger(ui.pair_rapid_trigger);
+                self.selected_keys.remove(&first);
+                self.selected_keys.remove(&second);
                 let mut pairs = snapshot.rapid_switch_pairs;
                 pairs.push(pair);
                 vec![SettingChange::RapidSwitch(pairs)]
@@ -606,6 +637,11 @@ impl AgnoPeriphApp {
                 let Ok(pair) = SocdPair::new(first, second, ui.socd_mode) else {
                     return;
                 };
+                let pair = pair
+                    .with_trigger_point(ui.pair_trigger_point)
+                    .with_rapid_trigger(ui.pair_rapid_trigger);
+                self.selected_keys.remove(&first);
+                self.selected_keys.remove(&second);
                 let mut pairs = snapshot.socd_pairs;
                 pairs.push(pair);
                 vec![SettingChange::Socd(pairs)]
@@ -706,23 +742,139 @@ impl AgnoPeriphApp {
         self.apply_change(change, cx);
     }
 
-    fn set_socd_mode(&mut self, target: SocdPair, mode: SocdMode, cx: &mut Context<Self>) {
+    fn set_pair_trigger_point(&mut self, value: i32, cx: &mut Context<Self>) {
         let Some(he) = self.hall_effect_state() else {
             return;
         };
+        let caps = &he.capabilities;
+        self.paired.pair_trigger_point = snap_travel(
+            value,
+            caps.actuation_min,
+            caps.actuation_max,
+            caps.actuation_step,
+        );
+        self.request_sync(cx);
+        cx.notify();
+    }
+
+    fn step_pair_trigger_point(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let Some(he) = self.hall_effect_state() else {
+            return;
+        };
+        let step = i32::from(he.capabilities.actuation_step.as_hundredths().max(1));
+        self.set_pair_trigger_point(
+            i32::from(self.paired.pair_trigger_point.as_hundredths()) + direction * step,
+            cx,
+        );
+    }
+
+    fn update_socd_pair(
+        &mut self,
+        target: SocdPair,
+        mutate: impl FnOnce(SocdPair) -> SocdPair,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(he) = self.hall_effect_state() else {
+            return;
+        };
+        let mut mutate = Some(mutate);
         let pairs = he
             .snapshot
             .socd_pairs
             .iter()
-            .map(|pair| {
+            .map(|&pair| {
                 if pair.key_a == target.key_a && pair.key_b == target.key_b {
-                    SocdPair::new(pair.key_a, pair.key_b, mode).unwrap_or(*pair)
+                    mutate.take().map_or(pair, |f| f(pair))
                 } else {
-                    *pair
+                    pair
                 }
             })
             .collect();
         self.apply_change(SettingChange::Socd(pairs), cx);
+    }
+
+    fn set_socd_mode(&mut self, target: SocdPair, mode: SocdMode, cx: &mut Context<Self>) {
+        self.update_socd_pair(
+            target,
+            |pair| {
+                SocdPair::new(pair.key_a, pair.key_b, mode).map_or(pair, |p| {
+                    p.with_trigger_point(pair.trigger_point)
+                        .with_rapid_trigger(pair.rapid_trigger)
+                })
+            },
+            cx,
+        );
+    }
+
+    fn step_socd_travel(&mut self, target: SocdPair, direction: i32, cx: &mut Context<Self>) {
+        let Some(he) = self.hall_effect_state() else {
+            return;
+        };
+        let caps = &he.capabilities;
+        let step = i32::from(caps.actuation_step.as_hundredths().max(1));
+        let next = snap_travel(
+            i32::from(target.trigger_point.as_hundredths()) + direction * step,
+            caps.actuation_min,
+            caps.actuation_max,
+            caps.actuation_step,
+        );
+        if next != target.trigger_point {
+            self.update_socd_pair(target, |p| p.with_trigger_point(next), cx);
+        }
+    }
+
+    fn set_socd_rt(&mut self, target: SocdPair, enabled: bool, cx: &mut Context<Self>) {
+        if target.rapid_trigger != enabled {
+            self.update_socd_pair(target, |p| p.with_rapid_trigger(enabled), cx);
+        }
+    }
+
+    fn update_rs_pair(
+        &mut self,
+        target: RapidSwitchPair,
+        mutate: impl FnOnce(RapidSwitchPair) -> RapidSwitchPair,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(he) = self.hall_effect_state() else {
+            return;
+        };
+        let mut mutate = Some(mutate);
+        let pairs = he
+            .snapshot
+            .rapid_switch_pairs
+            .iter()
+            .map(|&pair| {
+                if pair.key_a == target.key_a && pair.key_b == target.key_b {
+                    mutate.take().map_or(pair, |f| f(pair))
+                } else {
+                    pair
+                }
+            })
+            .collect();
+        self.apply_change(SettingChange::RapidSwitch(pairs), cx);
+    }
+
+    fn step_rs_travel(&mut self, target: RapidSwitchPair, direction: i32, cx: &mut Context<Self>) {
+        let Some(he) = self.hall_effect_state() else {
+            return;
+        };
+        let caps = &he.capabilities;
+        let step = i32::from(caps.actuation_step.as_hundredths().max(1));
+        let next = snap_travel(
+            i32::from(target.trigger_point.as_hundredths()) + direction * step,
+            caps.actuation_min,
+            caps.actuation_max,
+            caps.actuation_step,
+        );
+        if next != target.trigger_point {
+            self.update_rs_pair(target, |p| p.with_trigger_point(next), cx);
+        }
+    }
+
+    fn set_rs_rt(&mut self, target: RapidSwitchPair, enabled: bool, cx: &mut Context<Self>) {
+        if target.rapid_trigger != enabled {
+            self.update_rs_pair(target, |p| p.with_rapid_trigger(enabled), cx);
+        }
     }
 
     pub(crate) fn set_paired_usage(&mut self, is_primary: bool, usage: u8, cx: &mut Context<Self>) {
@@ -823,23 +975,28 @@ pub(crate) fn render(
 
     v_flex()
         .id("hall-effect-panel")
-        .gap_4()
+        .gap_3()
         .child(
             h_flex()
                 .items_start()
-                .gap_4()
-                .child(render_matrix(app, he, &layout, &occupied, cx))
-                .child(render_selection_rail(app, &layout, cx)),
+                .gap_3()
+                .child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .gap_2()
+                        .child(render_matrix(app, he, &layout, &occupied, cx))
+                        .child(render_selection_bar(app, &layout, cx)),
+                )
+                .when(has_paired, |this| {
+                    this.child(render_paired(app, he, &layout, &occupied, cx))
+                }),
         )
         .child(render_deck(app, he, &layout, cx))
-        .when(has_paired, |this| {
-            this.child(render_paired(app, he, &layout, &occupied, cx))
-        })
 }
 
-/// Selection commands beside the matrix, as in ATK HUB: what is selected, then the
-/// bulk selection tools, then the one command that writes.
-fn render_selection_rail(
+/// Compact single-row selection bar tucked directly under the keyboard matrix, freeing
+/// the entire right-hand side of the workspace for Paired & Advanced Keys.
+fn render_selection_bar(
     app: &AgnoPeriphApp,
     layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
@@ -852,61 +1009,67 @@ fn render_selection_rail(
         n => format!("{n} keys selected").into(),
     };
     let theme = cx.theme();
-    v_flex()
+    h_flex()
         .id("selection-rail")
-        .flex_1()
-        .min_w_32()
-        .max_w_48()
-        .gap_1()
+        .w_full()
+        .justify_between()
+        .gap_2()
         .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(summary),
-        )
-        .child(muted_note("Click keys to select or deselect them.", theme))
-        .child(div().h_2())
-        .child(
-            Button::new("select-all-keys")
-                .ghost()
-                .small()
-                .w_full()
-                .justify_start()
-                .label("Select all")
-                .on_click(cx.listener(|this, _, _, cx| this.select_all_keys(cx))),
-        )
-        .child(
-            Button::new("invert-keys")
-                .ghost()
-                .small()
-                .w_full()
-                .justify_start()
-                .label("Invert")
-                .on_click(cx.listener(|this, _, _, cx| this.invert_key_selection(cx))),
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(summary),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child("Click keys to toggle"),
+                ),
         )
         .child(
-            Button::new("clear-keys")
-                .ghost()
-                .small()
-                .w_full()
-                .justify_start()
-                .label("Clear selection")
-                .disabled(count == 0)
-                .on_click(cx.listener(|this, _, _, cx| this.clear_key_selection(cx))),
-        )
-        .child(div().my_2().h_px().w_full().bg(theme.border))
-        .child(
-            Button::new("restore-default-keys")
-                .outline()
-                .small()
-                .w_full()
-                .label("Restore default")
-                .tooltip(format!(
-                    "Set the selected keys to {} mm with Rapid Trigger off",
-                    mm(DEFAULT_ACTUATION)
-                ))
-                .disabled(busy || count == 0)
-                .on_click(cx.listener(|this, _, _, cx| this.restore_default_keys(cx))),
+            h_flex()
+                .flex_shrink_0()
+                .gap_1()
+                .child(
+                    Button::new("select-all-keys")
+                        .ghost()
+                        .xsmall()
+                        .label("Select all")
+                        .on_click(cx.listener(|this, _, _, cx| this.select_all_keys(cx))),
+                )
+                .child(
+                    Button::new("invert-keys")
+                        .ghost()
+                        .xsmall()
+                        .label("Invert")
+                        .on_click(cx.listener(|this, _, _, cx| this.invert_key_selection(cx))),
+                )
+                .child(
+                    Button::new("clear-keys")
+                        .ghost()
+                        .xsmall()
+                        .label("Clear")
+                        .disabled(count == 0)
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_key_selection(cx))),
+                )
+                .child(
+                    Button::new("restore-default-keys")
+                        .outline()
+                        .xsmall()
+                        .label("Restore default")
+                        .tooltip(format!(
+                            "Set the selected keys to {} mm with Rapid Trigger off",
+                            mm(DEFAULT_ACTUATION)
+                        ))
+                        .disabled(busy || count == 0)
+                        .on_click(cx.listener(|this, _, _, cx| this.restore_default_keys(cx))),
+                ),
         )
 }
 
@@ -940,21 +1103,55 @@ fn render_matrix(
         |cap| {
             let config = keys.iter().find(|k| k.key == cap.index);
             let owner = occupied.get(&cap.index).copied();
+            let badge = owner.and_then(AdvancedIcon::from_owner);
+            let pair_point = he
+                .snapshot
+                .socd_pairs
+                .iter()
+                .find(|p| p.key_a == cap.index || p.key_b == cap.index)
+                .map(|p| (p.trigger_point, p.rapid_trigger))
+                .or_else(|| {
+                    he.snapshot
+                        .rapid_switch_pairs
+                        .iter()
+                        .find(|p| p.key_a == cap.index || p.key_b == cap.index)
+                        .map(|p| (p.trigger_point, p.rapid_trigger))
+                });
+            let is_pair_managed = pair_point.is_some();
             let tone = if paired.is_picked(cap.index) {
                 KeyTone::Picked
             } else if picking && owner.is_some() {
                 KeyTone::Locked
+            } else if is_pair_managed {
+                KeyTone::Paired
             } else if !picking && selected.contains(&cap.index) {
                 KeyTone::Selected
             } else {
                 KeyTone::Normal
             };
-            KeyFace {
-                detail: Some(config.map_or_else(|| "–".into(), |c| mm(c.actuation).into())),
-                fill: Some(config.map_or(0.0, |c| f32::from(c.actuation.as_hundredths()) / max)),
-                marker: config.is_some_and(|c| c.rapid_trigger.is_enabled()),
-                badge: owner,
-                tone,
+            if let Some((point, rt)) = pair_point {
+                // RS/SOCD pairs use their own trigger travel and RT rather than regular per-key settings.
+                KeyFace {
+                    detail: Some(if rt {
+                        format!("{} RT", mm(point)).into()
+                    } else {
+                        mm(point).into()
+                    }),
+                    fill: None,
+                    marker: false,
+                    badge,
+                    tone,
+                }
+            } else {
+                KeyFace {
+                    detail: Some(config.map_or_else(|| "–".into(), |c| mm(c.actuation).into())),
+                    fill: Some(
+                        config.map_or(0.0, |c| f32::from(c.actuation.as_hundredths()) / max),
+                    ),
+                    marker: config.is_some_and(|c| c.rapid_trigger.is_enabled()),
+                    badge,
+                    tone,
+                }
             }
         },
         trigger_select,
@@ -1170,7 +1367,7 @@ fn slider_row(
         .child(
             h_flex()
                 .justify_between()
-                .gap_2()
+                .gap_1()
                 .child(
                     div()
                         .min_w_0()
@@ -1220,7 +1417,7 @@ fn render_deck(
     h_flex()
         .id("trigger-deck")
         .items_stretch()
-        .gap_4()
+        .gap_5()
         .p_4()
         .rounded(theme.radius_lg)
         .border_1()
@@ -1247,7 +1444,7 @@ fn render_travel_column(
     ));
     let caps = &he.capabilities;
     let range_note = format!(
-        "{}–{} mm, {} mm steps",
+        "{}–{} · {} mm",
         mm(caps.actuation_min),
         mm(caps.actuation_max),
         mm(caps.actuation_step)
@@ -1311,7 +1508,11 @@ fn render_travel_column(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(muted_note(range_note, theme)),
+                        .whitespace_nowrap()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(range_note),
                 )
                 .child(
                     Button::new("apply-actuation-all")
@@ -1348,7 +1549,7 @@ fn render_travel_column(
         .child(
             h_flex()
                 .items_start()
-                .gap_4()
+                .gap_2()
                 .child(div().flex_1().min_w_0().child(slider_row(
                     "Top",
                     top_slider,
@@ -1524,45 +1725,47 @@ fn render_paired(
         })
         .map(|&m| {
             let used = counts.iter().find(|(c, _)| *c == m).map_or(0, |(_, n)| *n);
+            let selected = m == mode;
             let theme = cx.theme();
-            Button::new(SharedString::from(format!("paired-mode-{}", m.id())))
-                .outline()
-                .small()
-                .selected(m == mode)
+            let icon_color = if selected {
+                theme.primary_foreground
+            } else {
+                theme.foreground
+            };
+            let count_color = if selected {
+                theme.primary_foreground.opacity(0.8)
+            } else {
+                theme.muted_foreground
+            };
+            let button = Button::new(SharedString::from(format!("paired-mode-{}", m.id())))
+                .xsmall()
+                .selected(selected)
                 .flex_1()
                 .min_w_0()
-                .tooltip(m.summary())
+                .tooltip(format!("{} — {}", m.title(), m.summary()))
                 .child(
                     h_flex()
                         .w_full()
                         .min_w_0()
-                        .gap_2()
+                        .justify_center()
+                        .items_center()
+                        .gap_1()
+                        .child(advanced_svg(m.icon(), rems(0.95), icon_color))
                         .child(
                             div()
                                 .flex_shrink_0()
                                 .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .font_family(theme.mono_font_family.clone())
-                                .child(m.badge()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .child(m.title()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{used}/{PAIRED_SLOT_LIMIT}")),
+                                .text_color(count_color)
+                                .child(format!("{used}")),
                         ),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.set_paired_mode(m, cx)))
-                .into_any_element()
+                .on_click(cx.listener(move |this, _, _, cx| this.set_paired_mode(m, cx)));
+            if selected {
+                button.primary()
+            } else {
+                button.outline()
+            }
+            .into_any_element()
         })
         .collect();
 
@@ -1571,26 +1774,38 @@ fn render_paired(
     let theme = cx.theme();
     v_flex()
         .id("paired-keys")
-        .gap_3()
-        .pt_4()
-        .border_t_1()
+        .flex_1()
+        .min_w_64()
+        .h(rems(21.25))
+        .gap_1p5()
+        .px_3()
+        .py_2p5()
+        .rounded(theme.radius_lg)
+        .border_1()
         .border_color(theme.border)
+        .bg(theme.group_box)
         .child(
             h_flex()
-                .gap_3()
+                .justify_between()
+                .gap_2()
                 .child(
                     div()
-                        .text_base()
+                        .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Paired & advanced keys"),
                 )
-                .child(muted_note(
-                    "Each key can belong to one function at a time.",
-                    theme,
-                )),
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(mode.title()),
+                ),
         )
-        .child(h_flex().gap_2().children(pills))
-        .child(h_flex().items_start().gap_4().child(flow).child(list))
+        .child(h_flex().gap_1().children(pills))
+        .child(flow)
+        .child(div().h_px().w_full().bg(theme.border))
+        .child(list)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1605,20 +1820,19 @@ fn pick_button(
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let text: SharedString = match (is_waiting, picked) {
-        (true, _) => "Click a key…".into(),
+        (true, _) => "Click key…".into(),
         (false, Some(key)) => layout.label(key),
-        (false, None) => "Pick key".into(),
+        (false, None) => label.into(),
     };
-    let theme = cx.theme();
-    field(label, theme).child(
-        Button::new(id)
-            .outline()
-            .small()
-            .selected(is_waiting)
-            .label(text)
-            .disabled(disabled)
-            .on_click(cx.listener(move |this, _, _, cx| this.start_pick(target, cx))),
-    )
+    Button::new(id)
+        .outline()
+        .xsmall()
+        .flex_1()
+        .min_w_0()
+        .selected(is_waiting)
+        .label(text)
+        .disabled(disabled)
+        .on_click(cx.listener(move |this, _, _, cx| this.start_pick(target, cx)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1649,47 +1863,105 @@ fn render_flow(
     let ready = taken.is_none()
         && ui.first.is_some()
         && (!needs_two || ui.second.is_some_and(|second| Some(second) != ui.first));
-    let first_label = if needs_two { "First key" } else { "Key" };
-    let mut body = v_flex().gap_2().child(pick_button(
-        "paired-pick-first",
-        first_label,
-        ui.first,
-        ui.pick == Some(PickTarget::First),
-        PickTarget::First,
-        layout,
-        busy,
-        cx,
-    ));
-    if needs_two {
-        body = body.child(pick_button(
-            "paired-pick-second",
-            "Second key",
-            ui.second,
-            ui.pick == Some(PickTarget::Second),
-            PickTarget::Second,
+    let first_label = if needs_two { "Key 1" } else { "Pick key" };
+    let pick_row = h_flex()
+        .gap_2()
+        .child(pick_button(
+            "paired-pick-first",
+            first_label,
+            ui.first,
+            ui.pick == Some(PickTarget::First),
+            PickTarget::First,
             layout,
             busy,
             cx,
-        ));
-    }
+        ))
+        .when(needs_two, |this| {
+            this.child(pick_button(
+                "paired-pick-second",
+                "Key 2",
+                ui.second,
+                ui.pick == Some(PickTarget::Second),
+                PickTarget::Second,
+                layout,
+                busy,
+                cx,
+            ))
+        });
+    let mut body = v_flex().gap_1().child(pick_row);
     match mode {
-        PairedMode::Socd => {
-            let buttons = SOCD_MODES.iter().map(|&(socd, label)| {
-                Button::new(SharedString::from(format!("paired-socd-{label}")))
-                    .label(label)
-                    .selected(ui.socd_mode == socd)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.paired.socd_mode = socd;
-                        cx.notify();
-                    }))
-            });
-            body = body.child(
-                field("Winner", cx.theme()).child(
-                    ButtonGroup::new("paired-socd-modes")
-                        .outline()
+        PairedMode::Socd | PairedMode::RapidSwitch => {
+            if mode == PairedMode::Socd {
+                let make_btn = |(socd, label): (SocdMode, &'static str),
+                                cx: &mut Context<AgnoPeriphApp>| {
+                    let selected = ui.socd_mode == socd;
+                    let btn = Button::new(SharedString::from(format!("paired-socd-{label}")))
                         .xsmall()
-                        .children(buttons),
-                ),
+                        .flex_1()
+                        .min_w_0()
+                        .label(label)
+                        .selected(selected)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.paired.socd_mode = socd;
+                            cx.notify();
+                        }));
+                    if selected {
+                        btn.primary()
+                    } else {
+                        btn.outline()
+                    }
+                };
+                body = body.child(
+                    v_flex()
+                        .id("paired-socd-modes")
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(make_btn(SOCD_MODES[0], cx))
+                                .child(make_btn(SOCD_MODES[1], cx)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(make_btn(SOCD_MODES[2], cx))
+                                .child(make_btn(SOCD_MODES[3], cx)),
+                        ),
+                );
+            }
+            let pair_stepper = stepper(
+                "paired-travel",
+                ui.pair_trigger_point,
+                busy,
+                AgnoPeriphApp::step_pair_trigger_point,
+                cx,
+            );
+            let theme = cx.theme();
+            body = body.child(
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(pair_stepper)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("RT"),
+                            )
+                            .child(
+                                Switch::new("paired-rt")
+                                    .small()
+                                    .checked(ui.pair_rapid_trigger)
+                                    .disabled(busy)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.paired.pair_rapid_trigger = *checked;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             );
         }
         PairedMode::Dks => {
@@ -1726,7 +1998,7 @@ fn render_flow(
                 );
                 body = body.child(
                     h_flex()
-                        .gap_3()
+                        .gap_2()
                         .child(
                             Checkbox::new(("dks-stage-enabled", ix))
                                 .label(dks_stage_label(ix))
@@ -1735,7 +2007,7 @@ fn render_flow(
                                     this.paired.dks_stages[ix].enabled = *checked;
                                     cx.notify();
                                 }))
-                                .w_40(),
+                                .flex_1(),
                         )
                         .child(travel)
                         .child(
@@ -1815,19 +2087,17 @@ fn render_flow(
                 ),
             );
         }
-        PairedMode::RapidSwitch => {}
     }
     let theme = cx.theme();
-    group("paired-flow", format!("New {}", mode.title()), theme)
-        .flex_1()
-        .min_w_0()
-        .child(muted_note(mode.summary(), theme))
+    v_flex()
+        .id("paired-flow")
+        .gap_1()
         .child(body)
         .when_some(conflict, |this, conflict| {
             this.child(
                 div()
                     .id("paired-conflict")
-                    .text_sm()
+                    .text_xs()
                     .text_color(theme.danger)
                     .child(conflict)
                     .test_support(),
@@ -1835,7 +2105,7 @@ fn render_flow(
         })
         .when(mode == PairedMode::Dks, |this| {
             this.child(muted_note(
-                "The key is rebound to the DKS slot on the Win Base layer.",
+                "Rebinds the key to the DKS slot on Win Base.",
                 cx.theme(),
             ))
         })
@@ -1845,7 +2115,7 @@ fn render_flow(
                 .child(
                     Button::new("paired-add")
                         .primary()
-                        .small()
+                        .xsmall()
                         .label(format!("Add {}", mode.badge()))
                         .loading(busy)
                         .disabled(!ready)
@@ -1854,7 +2124,7 @@ fn render_flow(
                 .child(
                     Button::new("paired-cancel")
                         .ghost()
-                        .small()
+                        .xsmall()
                         .label("Reset")
                         .disabled(ui.first.is_none() && ui.second.is_none() && ui.pick.is_none())
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_paired_flow(cx))),
@@ -1863,6 +2133,17 @@ fn render_flow(
 }
 
 fn socd_element_id(prefix: &str, pair: SocdPair, suffix: &str) -> ElementId {
+    ElementId::Name(
+        format!(
+            "{prefix}-{}-{}-{suffix}",
+            pair.key_a.value(),
+            pair.key_b.value()
+        )
+        .into(),
+    )
+}
+
+fn rs_element_id(prefix: &str, pair: RapidSwitchPair, suffix: &str) -> ElementId {
     ElementId::Name(
         format!(
             "{prefix}-{}-{}-{suffix}",
@@ -1912,27 +2193,23 @@ fn render_configured(
             .disabled(busy)
             .on_click(cx.listener(move |this, _, _, cx| this.remove_paired(entry, cx)))
     };
-    let row = |badge: &'static str,
+    let row = |icon: AdvancedIcon,
                title: String,
                detail: Option<String>,
                action: AnyElement,
                theme: &Theme| {
         h_flex()
-            .gap_3()
+            .gap_2()
+            .items_center()
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .child(
                         h_flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .child(badge),
-                            )
+                            .gap_1p5()
+                            .items_center()
+                            .child(advanced_svg(icon, rems(0.9), theme.muted_foreground))
                             .child(
                                 div()
                                     .min_w_0()
@@ -1955,188 +2232,287 @@ fn render_configured(
             .child(action)
             .into_any_element()
     };
-    for mode in PairedMode::ALL {
-        let badge = mode.badge();
-        match mode {
-            PairedMode::RapidSwitch => {
-                for pair in &snapshot.rapid_switch_pairs {
-                    let id = ElementId::Name(
-                        format!("rs-remove-{}-{}", pair.key_a.value(), pair.key_b.value()).into(),
-                    );
-                    let action = remove(id, PairedEntry::RapidSwitch(*pair), cx).into_any_element();
-                    rows.push(row(
-                        badge,
-                        format!(
-                            "{} + {}",
-                            layout.label(pair.key_a),
-                            layout.label(pair.key_b)
-                        ),
-                        None,
-                        action,
-                        cx.theme(),
-                    ));
-                }
-            }
-            PairedMode::Socd => {
-                for &pair in &snapshot.socd_pairs {
-                    let modes = SOCD_MODES
-                        .iter()
-                        .map(|&(socd, label)| {
-                            Button::new(socd_element_id("socd-mode", pair, label))
-                                .label(label)
-                                .selected(pair.mode == socd)
-                                .disabled(busy)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if pair.mode != socd {
-                                        this.set_socd_mode(pair, socd, cx);
-                                    }
-                                }))
-                        })
-                        .collect::<Vec<_>>();
-                    // Two lines: the pair and its Remove on top, the winner choice below,
-                    // so the mode buttons never crowd the key names.
-                    let action = remove(
-                        socd_element_id("socd-remove", pair, "x"),
-                        PairedEntry::Socd(pair),
-                        cx,
-                    )
-                    .into_any_element();
-                    let head = row(
-                        badge,
-                        format!(
-                            "{} + {}",
-                            layout.label(pair.key_a),
-                            layout.label(pair.key_b)
-                        ),
-                        None,
-                        action,
-                        cx.theme(),
-                    );
-                    rows.push(
-                        v_flex()
+    let active_mode = app.paired.mode;
+    let icon = active_mode.icon();
+    match active_mode {
+        PairedMode::RapidSwitch => {
+            for &pair in &snapshot.rapid_switch_pairs {
+                let id = ElementId::Name(
+                    format!("rs-remove-{}-{}", pair.key_a.value(), pair.key_b.value()).into(),
+                );
+                let action = remove(id, PairedEntry::RapidSwitch(pair), cx).into_any_element();
+                let head = row(
+                    icon,
+                    format!(
+                        "{} + {}",
+                        layout.label(pair.key_a),
+                        layout.label(pair.key_b)
+                    ),
+                    None,
+                    action,
+                    cx.theme(),
+                );
+                let tuning = h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
                             .gap_1()
-                            .child(head)
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(muted_note("Winner", cx.theme()))
-                                    .child(
-                                        ButtonGroup::new(socd_element_id(
-                                            "socd-modes",
-                                            pair,
-                                            "group",
-                                        ))
-                                        .outline()
-                                        .xsmall()
-                                        .children(modes),
-                                    ),
+                                Button::new(rs_element_id("rs-travel-dec", pair, "m"))
+                                    .outline()
+                                    .xsmall()
+                                    .label("−")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.step_rs_travel(pair, -1, cx);
+                                    })),
                             )
-                            .into_any_element(),
+                            .child(readout(
+                                format!("{} mm", mm(pair.trigger_point)),
+                                cx.theme(),
+                            ))
+                            .child(
+                                Button::new(rs_element_id("rs-travel-inc", pair, "p"))
+                                    .outline()
+                                    .xsmall()
+                                    .label("+")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.step_rs_travel(pair, 1, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex().gap_1().child(muted_note("RT", cx.theme())).child(
+                            Switch::new(rs_element_id("rs-rt", pair, "sw"))
+                                .small()
+                                .checked(pair.rapid_trigger)
+                                .disabled(busy)
+                                .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                                    this.set_rs_rt(pair, *checked, cx);
+                                })),
+                        ),
                     );
-                }
+                rows.push(
+                    v_flex()
+                        .gap_1()
+                        .child(head)
+                        .child(tuning)
+                        .into_any_element(),
+                );
             }
-            PairedMode::Dks => {
-                let keymap = app
-                    .selected_device()
-                    .and_then(|d| d.keymap.as_ref())
-                    .and_then(|km| km.snapshot.layers.first().cloned());
-                for binding in &snapshot.dks_bindings {
-                    let slot = binding.key;
-                    let bound_key = keymap.as_ref().and_then(|layer| {
-                        let code_id = DKS_KEY_ID_BASE + u8::try_from(slot.value()).ok()?;
-                        let ix = layer
-                            .iter()
-                            .position(|c| c.class == DKS_KEY_CLASS && c.id == code_id)?;
-                        Some(layout.label(KeyIndex::new(u16::try_from(ix).ok()?)))
-                    });
-                    let title = match bound_key {
-                        Some(key) => format!("Slot {} on {key}", slot.value() + 1),
-                        None => format!("Slot {}", slot.value() + 1),
+        }
+        PairedMode::Socd => {
+            for &pair in &snapshot.socd_pairs {
+                let make_mode_btn =
+                    |(socd, label): (SocdMode, &'static str), cx: &mut Context<AgnoPeriphApp>| {
+                        let selected = pair.mode == socd;
+                        let btn = Button::new(socd_element_id("socd-mode", pair, label))
+                            .xsmall()
+                            .flex_1()
+                            .min_w_0()
+                            .label(label)
+                            .selected(selected)
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if pair.mode != socd {
+                                    this.set_socd_mode(pair, socd, cx);
+                                }
+                            }));
+                        if selected {
+                            btn.primary()
+                        } else {
+                            btn.outline()
+                        }
                     };
-                    let action = remove(
-                        ElementId::Name(format!("dks-remove-{}", slot.value()).into()),
-                        PairedEntry::Dks(slot),
-                        cx,
+                let mode_grid = v_flex()
+                    .id(socd_element_id("socd-modes", pair, "group"))
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(make_mode_btn(SOCD_MODES[0], cx))
+                            .child(make_mode_btn(SOCD_MODES[1], cx)),
                     )
-                    .into_any_element();
-                    rows.push(row(
-                        badge,
-                        title,
-                        Some(describe_dks(binding)),
-                        action,
-                        cx.theme(),
-                    ));
-                }
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(make_mode_btn(SOCD_MODES[2], cx))
+                            .child(make_mode_btn(SOCD_MODES[3], cx)),
+                    );
+                let action = remove(
+                    socd_element_id("socd-remove", pair, "x"),
+                    PairedEntry::Socd(pair),
+                    cx,
+                )
+                .into_any_element();
+                let head = row(
+                    icon,
+                    format!(
+                        "{} + {}",
+                        layout.label(pair.key_a),
+                        layout.label(pair.key_b)
+                    ),
+                    None,
+                    action,
+                    cx.theme(),
+                );
+                let tuning = h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(socd_element_id("socd-travel-dec", pair, "m"))
+                                    .outline()
+                                    .xsmall()
+                                    .label("−")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.step_socd_travel(pair, -1, cx);
+                                    })),
+                            )
+                            .child(readout(
+                                format!("{} mm", mm(pair.trigger_point)),
+                                cx.theme(),
+                            ))
+                            .child(
+                                Button::new(socd_element_id("socd-travel-inc", pair, "p"))
+                                    .outline()
+                                    .xsmall()
+                                    .label("+")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.step_socd_travel(pair, 1, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex().gap_1().child(muted_note("RT", cx.theme())).child(
+                            Switch::new(socd_element_id("socd-rt", pair, "sw"))
+                                .small()
+                                .checked(pair.rapid_trigger)
+                                .disabled(busy)
+                                .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                                    this.set_socd_rt(pair, *checked, cx);
+                                })),
+                        ),
+                    );
+                rows.push(
+                    v_flex()
+                        .gap_1()
+                        .child(head)
+                        .child(mode_grid)
+                        .child(tuning)
+                        .into_any_element(),
+                );
             }
-            PairedMode::ModTap => {
-                for binding in &snapshot.mod_tap_bindings {
-                    let action = remove(
-                        ElementId::Name(format!("mt-remove-{}", binding.slot).into()),
-                        PairedEntry::ModTap {
-                            slot: binding.slot,
-                            key: binding.key,
-                        },
-                        cx,
-                    )
-                    .into_any_element();
-                    rows.push(row(
-                        badge,
-                        layout.label(binding.key).to_string(),
-                        Some(format!(
-                            "Tap {}, hold {} after {} ms",
-                            hid_name(u16::from(binding.tap_keycode.1)),
-                            hid_name(u16::from(binding.hold_keycode.1)),
-                            binding.hold_delay_ms
-                        )),
-                        action,
-                        cx.theme(),
-                    ));
-                }
+        }
+        PairedMode::Dks => {
+            let keymap = app
+                .selected_device()
+                .and_then(|d| d.keymap.as_ref())
+                .and_then(|km| km.snapshot.layers.first().cloned());
+            for binding in &snapshot.dks_bindings {
+                let slot = binding.key;
+                let bound_key = keymap.as_ref().and_then(|layer| {
+                    let code_id = DKS_KEY_ID_BASE + u8::try_from(slot.value()).ok()?;
+                    let ix = layer
+                        .iter()
+                        .position(|c| c.class == DKS_KEY_CLASS && c.id == code_id)?;
+                    Some(layout.label(KeyIndex::new(u16::try_from(ix).ok()?)))
+                });
+                let title = match bound_key {
+                    Some(key) => format!("Slot {} on {key}", slot.value() + 1),
+                    None => format!("Slot {}", slot.value() + 1),
+                };
+                let action = remove(
+                    ElementId::Name(format!("dks-remove-{}", slot.value()).into()),
+                    PairedEntry::Dks(slot),
+                    cx,
+                )
+                .into_any_element();
+                rows.push(row(
+                    icon,
+                    title,
+                    Some(describe_dks(binding)),
+                    action,
+                    cx.theme(),
+                ));
             }
-            PairedMode::Toggle => {
-                for binding in &snapshot.toggle_bindings {
-                    let action = remove(
-                        ElementId::Name(format!("tgl-remove-{}", binding.slot).into()),
-                        PairedEntry::Toggle {
-                            slot: binding.slot,
-                            key: binding.key,
-                        },
-                        cx,
-                    )
-                    .into_any_element();
-                    rows.push(row(
-                        badge,
-                        layout.label(binding.key).to_string(),
-                        Some(format!(
-                            "Latches {} (tap within {} ms)",
-                            hid_name(u16::from(binding.keycode.1)),
-                            binding.delay_ms
-                        )),
-                        action,
-                        cx.theme(),
-                    ));
-                }
+        }
+        PairedMode::ModTap => {
+            for binding in &snapshot.mod_tap_bindings {
+                let action = remove(
+                    ElementId::Name(format!("mt-remove-{}", binding.slot).into()),
+                    PairedEntry::ModTap {
+                        slot: binding.slot,
+                        key: binding.key,
+                    },
+                    cx,
+                )
+                .into_any_element();
+                rows.push(row(
+                    icon,
+                    layout.label(binding.key).to_string(),
+                    Some(format!(
+                        "Tap {}, hold {} after {} ms",
+                        hid_name(u16::from(binding.tap_keycode.1)),
+                        hid_name(u16::from(binding.hold_keycode.1)),
+                        binding.hold_delay_ms
+                    )),
+                    action,
+                    cx.theme(),
+                ));
+            }
+        }
+        PairedMode::Toggle => {
+            for binding in &snapshot.toggle_bindings {
+                let action = remove(
+                    ElementId::Name(format!("tgl-remove-{}", binding.slot).into()),
+                    PairedEntry::Toggle {
+                        slot: binding.slot,
+                        key: binding.key,
+                    },
+                    cx,
+                )
+                .into_any_element();
+                rows.push(row(
+                    icon,
+                    layout.label(binding.key).to_string(),
+                    Some(format!(
+                        "Latches {} (tap within {} ms)",
+                        hid_name(u16::from(binding.keycode.1)),
+                        binding.delay_ms
+                    )),
+                    action,
+                    cx.theme(),
+                ));
             }
         }
     }
     let used = rows.len();
     let theme = cx.theme();
-    group(
-        "paired-configured",
-        format!("Advanced keys configured ({used})"),
-        theme,
-    )
-    .flex_1()
-    .min_w_0()
-    .child(muted_note(
-        format!("Each type holds up to {PAIRED_SLOT_LIMIT} entries."),
-        theme,
-    ))
-    .when(rows.is_empty(), |this| {
-        this.child(muted_note("Nothing configured yet.", theme))
-    })
-    .children(rows)
-    .test_support()
+    v_flex()
+        .id("paired-configured")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child(format!("Configured {} ({used})", active_mode.badge())),
+        )
+        .when(rows.is_empty(), |this| {
+            this.child(muted_note("Nothing configured for this mode.", theme))
+        })
+        .children(rows)
+        .test_support()
 }
 
 #[cfg(test)]

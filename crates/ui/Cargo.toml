@@ -28,9 +28,10 @@ winreg = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
-# Test-only: gpui-fast wires no headless renderer on Windows, so screenshot tests
-# (tests/visual.rs) supply the wgpu one directly. Pinned to gpui-kit's gpui-fast version.
-gpui-fast-wgpu = { version = "=0.1.19", features = ["test-support"] }
+# Test-only: gpui-pre wires no headless renderer on Windows, so screenshot tests
+# (tests/visual.rs) supply the wgpu one directly. Pinned to the gpui-pre version gpui-kit uses.
+gpui-pre-wgpu = { version = "=0.3.14", features = ["test-support"] }
+anyhow = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]

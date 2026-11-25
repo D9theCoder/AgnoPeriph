@@ -21,9 +21,10 @@ pub use device::{
 };
 pub use error::{CoreError, CoreResult};
 pub use hall_effect::{
-    CalibrationStatus, DksBinding, DksStageAction, DksTriggerDirection, HallEffectCapabilities,
-    HallEffectKeyboard, HallEffectSnapshot, KeyHallEffectConfig, KeyIndex, ModTapBinding,
-    RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair, ToggleKeyBinding, TravelHundredthsMm,
+    CalibrationStatus, DEFAULT_PAIR_TRIGGER_POINT, DksBinding, DksStageAction, DksTriggerDirection,
+    HallEffectCapabilities, HallEffectKeyboard, HallEffectSnapshot, KeyHallEffectConfig, KeyIndex,
+    ModTapBinding, RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair, ToggleKeyBinding,
+    TravelHundredthsMm,
 };
 pub use keyboard::{
     KeyCode, KeyboardConfigCapabilities, KeyboardConfigController, KeyboardConfigSnapshot,

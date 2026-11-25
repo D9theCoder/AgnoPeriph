@@ -11,10 +11,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::AgnoPeriphApp;
+use crate::icons::{AdvancedIcon, advanced_svg};
 use crate::keymap::{KeyLayout, LayoutKey};
 
-/// Width of one key unit in rem; keycaps and gaps scale with the theme's base font.
-const KEY_UNIT_REM: f32 = 2.8;
+/// Width of one key unit in rem; sized so the board sits cleanly beside Paired & Advanced Keys
+/// at the default 1240×820 window width without clipping either column.
+const KEY_UNIT_REM: f32 = 2.30;
 /// Space between neighbouring keycaps in rem (matches `gap_1`).
 const KEY_GAP_REM: f32 = 0.25;
 
@@ -28,7 +30,9 @@ pub(crate) enum KeyTone {
     Picked,
     /// A positive per-key state, such as calibrated.
     Done,
-    /// Unavailable for the current action, e.g. already bound to an advanced function.
+    /// Managed by RS or SOCD: per-key actuation/RT on the keyboard map is disabled.
+    Paired,
+    /// Unavailable for the current action, e.g. already bound while picking another function.
     Locked,
 }
 
@@ -40,8 +44,8 @@ pub(crate) struct KeyFace {
     pub(crate) fill: Option<f32>,
     /// Small dot in the top corner, e.g. Rapid Trigger on.
     pub(crate) marker: bool,
-    /// Short tag in the top corner naming what owns the key, e.g. `SOCD`.
-    pub(crate) badge: Option<&'static str>,
+    /// Compact SVG glyph in the top-right corner showing which advanced function owns this key.
+    pub(crate) badge: Option<AdvancedIcon>,
     pub(crate) tone: KeyTone,
 }
 
@@ -160,7 +164,7 @@ fn keycap(
             theme.success.opacity(0.18),
             theme.success.opacity(0.26),
         ),
-        KeyTone::Locked => (
+        KeyTone::Paired | KeyTone::Locked => (
             theme.muted_foreground,
             theme.border,
             theme.muted,
@@ -171,28 +175,33 @@ fn keycap(
         Some(detail) => format!("{} key, {detail}", cap.label),
         None => format!("{} key", cap.label),
     };
-    let is_locked = face.tone == KeyTone::Locked;
+    let is_dimmed = matches!(face.tone, KeyTone::Locked | KeyTone::Paired);
+    let label_color = if is_dimmed {
+        theme.muted_foreground
+    } else {
+        theme.foreground
+    };
 
     let top = h_flex()
         .w_full()
         .justify_between()
+        .items_center()
         .gap_0p5()
         .child(
             div()
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
+                .text_color(label_color)
                 .truncate()
                 .child(cap.label.clone()),
         )
-        .when_some(face.badge, |this, badge| {
-            this.child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(rems(0.55))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.muted_foreground)
-                    .child(badge),
-            )
+        .when_some(face.badge, |this, icon| {
+            let icon_color = if face.tone == KeyTone::Picked {
+                theme.warning
+            } else {
+                theme.muted_foreground
+            };
+            this.child(advanced_svg(icon, rems(0.70), icon_color))
         })
         .when(face.marker && face.badge.is_none(), |this| {
             this.child(div().flex_shrink_0().size_1p5().rounded_full().bg(accent))
@@ -205,7 +214,7 @@ fn keycap(
         .ml(rems(gap))
         .w(rems(width))
         .h_11()
-        .px_1()
+        .px_0p5()
         .py_0p5()
         .flex()
         .flex_col()
@@ -214,9 +223,10 @@ fn keycap(
         .border_1()
         .border_color(border)
         .bg(background)
-        .when(is_locked, |this| this.opacity(0.55))
+        .when(face.tone == KeyTone::Locked, |this| this.opacity(0.45))
+        .when(face.tone == KeyTone::Paired, |this| this.opacity(0.68))
         .when_some(on_click, |this, on_click| {
-            this.cursor_pointer()
+            this.when(face.tone != KeyTone::Locked, Styled::cursor_pointer)
                 .hover(move |style| style.bg(hover))
                 .on_click(on_click)
         })
@@ -224,7 +234,7 @@ fn keycap(
         .when_some(face.detail.clone(), |this, detail| {
             this.child(
                 div()
-                    .text_size(rems(0.65))
+                    .text_size(rems(0.625))
                     .truncate()
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
