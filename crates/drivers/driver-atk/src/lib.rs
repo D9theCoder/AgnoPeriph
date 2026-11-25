@@ -55,6 +55,10 @@ pub struct AtkRs7Device<T: HidTransport> {
     he_caps: HallEffectCapabilities,
     extreme_mode: bool,
     polling_rate: Option<PollingRateHz>,
+    /// Hardware SOCD slot indices (`0..RS7_MAX_SOCD_SLOTS`) observed on the last read/write.
+    socd_slots: Option<Vec<u8>>,
+    /// Hardware slots occupied by non-SOCD modes (e.g. Rappy Snappy / OKS) that must never be overwritten.
+    reserved_rs_slots: Vec<u8>,
 }
 
 impl<T: HidTransport> fmt::Debug for AtkRs7Device<T> {
@@ -116,6 +120,8 @@ impl<T: HidTransport> AtkRs7Device<T> {
             he_caps: build_he_caps(false),
             extreme_mode: false,
             polling_rate: None,
+            socd_slots: None,
+            reserved_rs_slots: Vec::new(),
         };
 
         dev.discover_readonly()?;
@@ -189,6 +195,22 @@ impl<T: HidTransport> AtkRs7Device<T> {
         }
 
         Ok(())
+    }
+
+    fn scan_socd_slots(&mut self) -> CoreResult<(Vec<SocdPair>, Vec<u8>, Vec<u8>)> {
+        let mut pairs = Vec::new();
+        let mut socd_slots = Vec::new();
+        let mut reserved_rs_slots = Vec::new();
+        for slot in 0..RS7_MAX_SOCD_SLOTS {
+            let resp = self.exchange(req_socd_get(slot), false)?;
+            if let Some(pair) = decode_socd_slot(&resp) {
+                pairs.push(pair);
+                socd_slots.push(slot);
+            } else if resp[7] != protocol::socd_wire::NONE {
+                reserved_rs_slots.push(slot);
+            }
+        }
+        Ok((pairs, socd_slots, reserved_rs_slots))
     }
 }
 
@@ -283,15 +305,11 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
             })
             .collect();
 
-        // 4. Read active SOCD pairs across hardware slots (0..20)
-        let mut socd_pairs = Vec::new();
-        for slot in 0..RS7_MAX_SOCD_SLOTS {
-            if let Ok(resp) = self.exchange(req_socd_get(slot), false)
-                && let Some(pair) = decode_socd_slot(&resp)
-            {
-                socd_pairs.push(pair);
-            }
-        }
+        // 4. Read active SOCD pairs across hardware slots (0..20), remembering occupied and
+        // non-SOCD (RS/OKS) slots so writes update in place and clear removed pairs safely.
+        let (socd_pairs, socd_slots, reserved_rs_slots) = self.scan_socd_slots()?;
+        self.socd_slots = Some(socd_slots);
+        self.reserved_rs_slots = reserved_rs_slots;
 
         // 5. Read active DKS bindings across hardware slots (0..20)
         let mut dks_bindings = Vec::new();
@@ -400,12 +418,72 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
 
     fn set_socd_pairs(&mut self, pairs: &[SocdPair]) -> CoreResult<()> {
         self.he_caps.validate_socd_pairs(pairs)?;
-        for (ix, pair) in pairs.iter().enumerate() {
-            let slot = u8::try_from(ix).unwrap_or(0);
-            let payload = req_socd_set(slot, Some(pair))?;
-            self.exchange(payload, true)?;
+
+        // Before mutating real hardware, ensure we know which slots hold SOCD pairs and which
+        // hold non-SOCD modes (RS/OKS) so we never duplicate pairs or overwrite RS/OKS slots.
+        if self.socd_slots.is_none() && !self.transport.is_dry_run() {
+            let (_, socd_slots, reserved_rs_slots) = self.scan_socd_slots()?;
+            self.socd_slots = Some(socd_slots);
+            self.reserved_rs_slots = reserved_rs_slots;
         }
-        Ok(())
+
+        let previous_slots = self.socd_slots.clone().unwrap_or_default();
+        let mut target_slots: Vec<u8> = Vec::with_capacity(pairs.len());
+
+        // Reuse previously occupied SOCD slots in order first, then claim lowest free non-reserved slots.
+        for &slot in &previous_slots {
+            if target_slots.len() < pairs.len() {
+                target_slots.push(slot);
+            }
+        }
+        for slot in 0..RS7_MAX_SOCD_SLOTS {
+            if target_slots.len() >= pairs.len() {
+                break;
+            }
+            if !target_slots.contains(&slot) && !self.reserved_rs_slots.contains(&slot) {
+                target_slots.push(slot);
+            }
+        }
+        if target_slots.len() < pairs.len() {
+            return Err(CoreError::OutOfRange {
+                field: "socd_pairs",
+                actual: pairs.len().to_string(),
+                expected: format!(
+                    "at most {} free SOCD slots ({} occupied by non-SOCD modes)",
+                    usize::from(RS7_MAX_SOCD_SLOTS).saturating_sub(self.reserved_rs_slots.len()),
+                    self.reserved_rs_slots.len()
+                ),
+            });
+        }
+
+        // Write updated/new pairs, then clear any previously occupied SOCD slots no longer used.
+        let write_result = (|| -> CoreResult<()> {
+            for (&slot, pair) in target_slots.iter().zip(pairs.iter()) {
+                let payload = req_socd_set(slot, Some(pair))?;
+                self.exchange(payload, true)?;
+            }
+            for &old_slot in &previous_slots {
+                if !target_slots.contains(&old_slot) {
+                    let payload = req_socd_set(old_slot, None)?;
+                    self.exchange(payload, true)?;
+                }
+            }
+            Ok(())
+        })();
+
+        match write_result {
+            Ok(()) => {
+                if !self.transport.is_dry_run() {
+                    self.socd_slots = Some(target_slots);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                // Force a fresh slot scan on the next attempt since partial writes may have landed.
+                self.socd_slots = None;
+                Err(err)
+            }
+        }
     }
 }
 
@@ -724,5 +802,87 @@ mod tests {
             .filter(|e| e.outcome == PacketOutcome::DryRunSuppressed)
             .count();
         assert_eq!(suppressed, 3);
+    }
+
+    #[test]
+    fn socd_preserves_sparse_slots_skips_non_socd_and_clears_removed_slots() {
+        let mut mock = MockHidTransport::new(rs7_descriptor());
+        push_open_replies(&mut mock, false);
+
+        // Scan 20 slots:
+        // - slot 0 holds non-SOCD Rappy Snappy (mode=1) -> must never be overwritten
+        // - slot 4 holds SOCD A(3,1) + D(3,3) LastInputPriority -> must be updated in place
+        for slot in 0..20u8 {
+            let mut s = vec![0u8; RS7_PAYLOAD_LEN];
+            s[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+            if slot == 0 {
+                s[7] = protocol::socd_wire::RS;
+            } else if slot == 4 {
+                s[7] = protocol::socd_wire::SOCD_LAST;
+                s[13] = 3;
+                s[14] = 1;
+                s[15] = 3;
+                s[16] = 3;
+            }
+            mock.push_input_response(s);
+        }
+
+        // Replies for adding W/S (writes slot 4 + slot 1, skipping reserved slot 0)
+        for _ in 0..2 {
+            let mut ack = vec![0u8; RS7_PAYLOAD_LEN];
+            ack[0] = protocol::cmd::SET_KEYBOARD_VALUE;
+            mock.push_input_response(ack);
+        }
+        // Replies for removing W/S (writes slot 4 + clears slot 1 with mode=NONE)
+        for _ in 0..2 {
+            let mut ack = vec![0u8; RS7_PAYLOAD_LEN];
+            ack[0] = protocol::cmd::SET_KEYBOARD_VALUE;
+            mock.push_input_response(ack);
+        }
+
+        let mut dev = AtkRs7Device::open(mock, false, None).unwrap();
+        let ad = SocdPair::new(
+            protocol::row_col_to_key(3, 1),
+            protocol::row_col_to_key(3, 3),
+            SocdMode::Neutral,
+        )
+        .unwrap();
+        let ws = SocdPair::new(
+            protocol::row_col_to_key(2, 2),
+            protocol::row_col_to_key(3, 2),
+            SocdMode::LastInputPriority,
+        )
+        .unwrap();
+
+        // 1. Add W/S and change A/D mode -> updates slot 4 in place and claims slot 1 (skipping slot 0)
+        dev.set_socd_pairs(&[ad, ws]).unwrap();
+        // 2. Remove W/S -> keeps slot 4 and clears slot 1 with mode=NONE
+        dev.set_socd_pairs(&[ad]).unwrap();
+
+        let writes = dev.transport().inner().recorded_writes();
+        // Filter SET_KEYBOARD_VALUE + RS_SOCD frames (byte 0 = Report ID 0x00, byte 1 = cmd 0x03)
+        let socd_sets: Vec<&[u8]> = writes
+            .iter()
+            .map(|w| w.bytes.as_slice())
+            .filter(|w| {
+                w.len() == RS7_TX_REPORT_LEN
+                    && w[1] == protocol::cmd::SET_KEYBOARD_VALUE
+                    && w[2] == protocol::sub::CUSTOM_ID
+                    && w[3] == protocol::sub::RS_SOCD
+            })
+            .collect();
+        assert_eq!(socd_sets.len(), 4);
+        // Write 0: slot 4 updated to Neutral (mode=5)
+        assert_eq!(socd_sets[0][7], 4);
+        assert_eq!(socd_sets[0][8], protocol::socd_wire::SOCD_BALANCE);
+        // Write 1: slot 1 claimed for W/S (slot 0 preserved for RS!)
+        assert_eq!(socd_sets[1][7], 1);
+        assert_eq!(socd_sets[1][8], protocol::socd_wire::SOCD_LAST);
+        // Write 2: slot 4 rewritten with A/D
+        assert_eq!(socd_sets[2][7], 4);
+        assert_eq!(socd_sets[2][8], protocol::socd_wire::SOCD_BALANCE);
+        // Write 3: slot 1 explicitly cleared with NONE (0)
+        assert_eq!(socd_sets[3][7], 1);
+        assert_eq!(socd_sets[3][8], protocol::socd_wire::NONE);
     }
 }

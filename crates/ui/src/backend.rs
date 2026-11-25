@@ -71,6 +71,53 @@ pub struct ProfileState {
     pub snapshot: ProfileSnapshot,
 }
 
+/// Per-capability read warning that did not prevent the device from loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceWarning {
+    pub capability: &'static str,
+    pub message: String,
+}
+
+impl DeviceWarning {
+    pub fn new(capability: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            capability,
+            message: message.into(),
+        }
+    }
+}
+
+/// Failure returned by [`PeripheralService::apply`], distinguishing pre-send validation errors
+/// from mid-flight transport errors and carrying a best-effort live re-read when available.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ApplyError {
+    pub error: CoreError,
+    /// `true` when validation rejected the change before any HID report was sent.
+    pub rejected_before_send: bool,
+    /// Best-effort snapshot re-read from hardware after a failed live write.
+    pub refreshed_snapshot: Option<Box<DeviceSnapshot>>,
+}
+
+impl ApplyError {
+    pub fn rejected(error: CoreError) -> Self {
+        Self {
+            error,
+            rejected_before_send: true,
+            refreshed_snapshot: None,
+        }
+    }
+
+    pub fn failed_after_send(error: CoreError, refreshed_snapshot: Option<DeviceSnapshot>) -> Self {
+        Self {
+            error,
+            rejected_before_send: false,
+            refreshed_snapshot: refreshed_snapshot.map(Box::new),
+        }
+    }
+}
+
 /// Readonly presentation of one connected peripheral, prepared for rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -83,7 +130,7 @@ pub struct DeviceSnapshot {
     pub battery: Option<BatteryStatus>,
     pub profiles: Option<ProfileState>,
     /// Per-capability read failures that did not prevent the device from loading.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<DeviceWarning>,
     /// `true` when values include dry-run edits that were validated and logged but never
     /// written to the device. Cleared by the next refresh.
     pub is_preview: bool,
@@ -154,7 +201,8 @@ pub trait PeripheralService: Send + Sync {
     fn refresh(&self) -> CoreResult<Vec<DeviceSnapshot>>;
 
     /// Validates and applies one change, returning the device's resulting snapshot.
-    fn apply(&self, device: &DeviceId, change: SettingChange) -> CoreResult<DeviceSnapshot>;
+    fn apply(&self, device: &DeviceId, change: SettingChange)
+    -> Result<DeviceSnapshot, ApplyError>;
 
     /// Returns the most recent traced HID frames, oldest first.
     fn packet_log(&self) -> Vec<PacketTraceEntry>;
@@ -165,7 +213,7 @@ pub trait PeripheralService: Send + Sync {
         &self,
         device: &DeviceId,
         change: PointerChange,
-    ) -> CoreResult<DeviceSnapshot> {
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(device, SettingChange::Pointer(change))
     }
 
@@ -174,7 +222,7 @@ pub trait PeripheralService: Send + Sync {
         device: &DeviceId,
         target: ActuationTarget,
         point: TravelHundredthsMm,
-    ) -> CoreResult<DeviceSnapshot> {
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(device, SettingChange::Actuation { target, point })
     }
 
@@ -183,15 +231,23 @@ pub trait PeripheralService: Send + Sync {
         device: &DeviceId,
         key: KeyIndex,
         config: RapidTriggerConfig,
-    ) -> CoreResult<DeviceSnapshot> {
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(device, SettingChange::RapidTrigger { key, config })
     }
 
-    fn apply_socd(&self, device: &DeviceId, pairs: Vec<SocdPair>) -> CoreResult<DeviceSnapshot> {
+    fn apply_socd(
+        &self,
+        device: &DeviceId,
+        pairs: Vec<SocdPair>,
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(device, SettingChange::Socd(pairs))
     }
 
-    fn apply_dks(&self, device: &DeviceId, binding: DksBinding) -> CoreResult<DeviceSnapshot> {
+    fn apply_dks(
+        &self,
+        device: &DeviceId,
+        binding: DksBinding,
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(device, SettingChange::Dks(binding))
     }
 
@@ -201,7 +257,7 @@ pub trait PeripheralService: Send + Sync {
         zone: RgbZoneId,
         effect: RgbEffect,
         brightness: Brightness,
-    ) -> CoreResult<DeviceSnapshot> {
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(
             device,
             SettingChange::Rgb {
@@ -212,7 +268,11 @@ pub trait PeripheralService: Send + Sync {
         )
     }
 
-    fn switch_profile(&self, device: &DeviceId, slot: ProfileSlot) -> CoreResult<DeviceSnapshot> {
+    fn switch_profile(
+        &self,
+        device: &DeviceId,
+        slot: ProfileSlot,
+    ) -> Result<DeviceSnapshot, ApplyError> {
         self.apply(device, SettingChange::Profile(slot))
     }
 }
@@ -428,8 +488,9 @@ fn apply_pointer_change(snapshot: &mut PointerSnapshot, change: &PointerChange) 
 /// Reads every advertised capability with readonly queries, mirroring `agnoperiph-cli probe`.
 fn collect_snapshot(peripheral: &mut dyn Peripheral) -> DeviceSnapshot {
     let mut warnings = Vec::new();
-    let mut record =
-        |capability: &str, err: CoreError| warnings.push(format!("{capability}: {err}"));
+    let mut record = |capability: &'static str, err: CoreError| {
+        warnings.push(DeviceWarning::new(capability, err.to_string()));
+    };
 
     let battery = peripheral
         .as_battery_mut()
@@ -612,6 +673,7 @@ struct LiveState {
 /// mode closes every handle under the same lock, so a write can never reach a handle
 /// opened in the other mode.
 pub struct LiveHidService {
+    enumerator: Arc<dyn HidEnumerator>,
     state: Mutex<LiveState>,
     sink: Arc<SequencedSink>,
 }
@@ -634,7 +696,14 @@ impl Default for LiveHidService {
 
 impl LiveHidService {
     pub fn new() -> Self {
+        Self::with_enumerator(Arc::new(HidapiEnumerator::new()))
+    }
+
+    /// Creates a [`LiveHidService`] backed by a custom [`HidEnumerator`] (used by real-driver
+    /// integration tests with scripted `MockHidTransport` replies).
+    pub fn with_enumerator(enumerator: Arc<dyn HidEnumerator>) -> Self {
         Self {
+            enumerator,
             state: Mutex::new(LiveState {
                 dry_run: true,
                 devices: Vec::new(),
@@ -659,8 +728,7 @@ impl PeripheralService for LiveHidService {
         let mut state = lock(&self.state);
         state.devices.clear();
 
-        let enumerator = HidapiEnumerator::new();
-        let descriptors = enumerator.enumerate()?;
+        let descriptors = self.enumerator.enumerate()?;
         let registry = build_registry();
         let sink: Arc<dyn PacketSink> = self.sink.clone();
 
@@ -670,7 +738,7 @@ impl PeripheralService for LiveHidService {
             };
             // A device that fails to open (busy, asleep, vendor app holding it) is skipped
             // so one unresponsive interface does not hide every other device.
-            let Ok(transport) = enumerator.open_path(descriptor) else {
+            let Ok(transport) = self.enumerator.open_path(descriptor) else {
                 continue;
             };
             let Ok(mut peripheral) =
@@ -695,17 +763,33 @@ impl PeripheralService for LiveHidService {
         Ok(state.devices.iter().map(|d| d.snapshot.clone()).collect())
     }
 
-    fn apply(&self, device: &DeviceId, change: SettingChange) -> CoreResult<DeviceSnapshot> {
+    fn apply(
+        &self,
+        device: &DeviceId,
+        change: SettingChange,
+    ) -> Result<DeviceSnapshot, ApplyError> {
         let mut state = lock(&self.state);
         let dry_run = state.dry_run;
         let target = state
             .devices
             .iter_mut()
             .find(|d| d.snapshot.info.id == *device)
-            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+            .ok_or_else(|| ApplyError::rejected(CoreError::DeviceNotFound(device.to_string())))?;
 
-        validate_change(&target.snapshot, &change)?;
-        apply_to_peripheral(target.peripheral.as_mut(), &change)?;
+        if let Err(err) = validate_change(&target.snapshot, &change) {
+            return Err(ApplyError::rejected(err));
+        }
+
+        if let Err(err) = apply_to_peripheral(target.peripheral.as_mut(), &change) {
+            if dry_run {
+                return Err(ApplyError::rejected(err));
+            }
+            // Frames may have already reached hardware before the failure (e.g. a timeout
+            // mid-chunk during a global actuation write); re-read best-effort live state.
+            let refreshed = collect_snapshot(target.peripheral.as_mut());
+            target.snapshot = refreshed.clone();
+            return Err(ApplyError::failed_after_send(err, Some(refreshed)));
+        }
 
         if dry_run {
             apply_change_to_snapshot(&mut target.snapshot, &change);
@@ -722,5 +806,229 @@ impl PeripheralService for LiveHidService {
 
     fn clear_packet_log(&self) {
         self.sink.log.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use agnoperiph_core::{RgbColor, TravelHundredthsMm};
+    use agnoperiph_driver_atk::protocol as atk;
+    use agnoperiph_transport::{MockHidTransport, PacketOutcome, TransportError};
+
+    use super::*;
+
+    struct ScriptedEnumerator {
+        descriptor: HidDeviceDescriptor,
+        transports: Mutex<VecDeque<MockHidTransport>>,
+    }
+
+    impl ScriptedEnumerator {
+        fn new(descriptor: HidDeviceDescriptor, transports: Vec<MockHidTransport>) -> Self {
+            Self {
+                descriptor,
+                transports: Mutex::new(VecDeque::from(transports)),
+            }
+        }
+    }
+
+    impl HidEnumerator for ScriptedEnumerator {
+        fn enumerate(&self) -> TransportResult<Vec<HidDeviceDescriptor>> {
+            Ok(vec![self.descriptor.clone()])
+        }
+
+        fn open_path(
+            &self,
+            _descriptor: &HidDeviceDescriptor,
+        ) -> TransportResult<Box<dyn HidTransport>> {
+            lock(&self.transports)
+                .pop_front()
+                .map(|t| Box::new(t) as Box<dyn HidTransport>)
+                .ok_or_else(|| TransportError::OpenFailed {
+                    path: self.descriptor.path.clone(),
+                    reason: "no scripted transport remaining".to_owned(),
+                })
+        }
+    }
+
+    fn rs7_descriptor() -> HidDeviceDescriptor {
+        HidDeviceDescriptor::new(
+            atk::ATK_VID,
+            atk::ATK_RS7_PID,
+            atk::ATK_RS7_USAGE_PAGE,
+            atk::ATK_RS7_USAGE_ID,
+            1,
+            "mock://live/atk-rs7",
+        )
+        .with_strings(
+            Some("Shenzhen Yizhita Technology".to_owned()),
+            Some("ATK RS7 RGB".to_owned()),
+            Some("ATK-LIVE-TEST".to_owned()),
+        )
+    }
+
+    fn push_rs7_open(mock: &mut MockHidTransport) {
+        let mut fw = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        fw[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        fw[1] = atk::sub::CUSTOM_ID;
+        fw[5] = 0x01;
+        fw[6] = 0x07;
+        mock.push_input_response(fw);
+
+        let mut gm = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        gm[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        gm[1] = atk::sub::CUSTOM_ID;
+        gm[2] = atk::sub::GAME_MODE;
+        mock.push_input_response(gm);
+
+        let mut rr = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        rr[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        rr[1] = atk::sub::CUSTOM_ID;
+        rr[2] = atk::sub::REPORT_RATE;
+        rr[3] = 4;
+        mock.push_input_response(rr);
+    }
+
+    fn push_rs7_snapshot(mock: &mut MockHidTransport, actuation_hundredths: u16) {
+        let mut dz = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        dz[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        dz[3..5].copy_from_slice(&10u16.to_be_bytes());
+        dz[5..7].copy_from_slice(&10u16.to_be_bytes());
+        mock.push_input_response(dz);
+
+        for _ in 0..8 {
+            let mut chunk = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            chunk[0] = atk::cmd::GET_KEYBOARD_VALUE;
+            for k in 0..12 {
+                chunk[8 + k * 2..10 + k * 2].copy_from_slice(&actuation_hundredths.to_be_bytes());
+            }
+            mock.push_input_response(chunk);
+        }
+
+        for _ in 0..24 {
+            let mut chunk = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            chunk[0] = atk::cmd::GET_KEYBOARD_VALUE;
+            mock.push_input_response(chunk);
+        }
+
+        for _ in 0..20 {
+            let mut s = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            s[0] = atk::cmd::GET_KEYBOARD_VALUE;
+            mock.push_input_response(s);
+        }
+
+        for _ in 0..20 {
+            let mut d = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            d[0] = atk::cmd::GET_KEYBOARD_VALUE;
+            mock.push_input_response(d);
+        }
+
+        for _ in 0..4 {
+            let mut c = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            c[0] = atk::cmd::GET_KEYBOARD_VALUE;
+            for k in 0..24 {
+                c[8 + k] = 1;
+            }
+            mock.push_input_response(c);
+        }
+
+        let mut rgb = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        rgb[0] = atk::cmd::LIGHTING_GET_VALUE;
+        rgb[2] = 2;
+        rgb[5] = RgbColor::WHITE.r;
+        rgb[6] = RgbColor::WHITE.g;
+        rgb[7] = RgbColor::WHITE.b;
+        rgb[8] = 80;
+        mock.push_input_response(rgb);
+    }
+
+    #[test]
+    fn live_service_exercises_real_driver_and_rereads_after_failed_live_write() {
+        let desc = rs7_descriptor();
+        let mut dry_transport = MockHidTransport::new(desc.clone());
+        push_rs7_open(&mut dry_transport);
+        push_rs7_snapshot(&mut dry_transport, 120);
+
+        let mut live_transport = MockHidTransport::new(desc.clone());
+        push_rs7_open(&mut live_transport);
+        push_rs7_snapshot(&mut live_transport, 120);
+        // Live single-key actuation write succeeds on the driver, then re-read returns 140.
+        let mut ack = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        ack[0] = atk::cmd::SET_KEYBOARD_VALUE;
+        live_transport.push_input_response(ack);
+        push_rs7_snapshot(&mut live_transport, 140);
+        // Next live write sends a frame, gets NO matching reply (timeout -> NotConnected),
+        // and the post-failure re-read reports 160 so the UI gets the actual live device state.
+        // Push a wrong-command byte 8 times to trigger Protocol failure after send, then fresh snapshot.
+        for _ in 0..8 {
+            let mut bogus = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            bogus[0] = 0xFE;
+            live_transport.push_input_response(bogus);
+        }
+        push_rs7_snapshot(&mut live_transport, 160);
+
+        let enumerator = Arc::new(ScriptedEnumerator::new(
+            desc,
+            vec![dry_transport, live_transport],
+        ));
+        let service = LiveHidService::with_enumerator(enumerator);
+
+        // 1. Starts in dry-run: real driver opens, reads, validates, and suppresses writes.
+        let devices = service.refresh().unwrap();
+        assert_eq!(devices.len(), 1);
+        let id = devices[0].id().clone();
+        assert_eq!(
+            devices[0].hall_effect.as_ref().unwrap().snapshot.keys[0].actuation,
+            TravelHundredthsMm::from_hundredths(120)
+        );
+
+        let preview = service
+            .apply_actuation(
+                &id,
+                ActuationTarget::Key(KeyIndex::new(0)),
+                TravelHundredthsMm::from_hundredths(140),
+            )
+            .unwrap();
+        assert!(preview.is_preview);
+        assert!(
+            service
+                .packet_log()
+                .iter()
+                .any(|e| e.outcome == PacketOutcome::DryRunSuppressed)
+        );
+
+        // 2. Switch to live mode: handle reopens, real driver transmits and re-reads 140.
+        service.set_dry_run(false);
+        service.refresh().unwrap();
+        let updated = service
+            .apply_actuation(
+                &id,
+                ActuationTarget::Key(KeyIndex::new(0)),
+                TravelHundredthsMm::from_hundredths(140),
+            )
+            .unwrap();
+        assert!(!updated.is_preview);
+        assert_eq!(
+            updated.hall_effect.as_ref().unwrap().snapshot.keys[0].actuation,
+            TravelHundredthsMm::from_hundredths(140)
+        );
+
+        // 3. Mid-flight live failure: rejected_before_send is false AND refreshed_snapshot carries 160.
+        let failure = service
+            .apply_actuation(
+                &id,
+                ActuationTarget::Key(KeyIndex::new(0)),
+                TravelHundredthsMm::from_hundredths(180),
+            )
+            .unwrap_err();
+        assert!(!failure.rejected_before_send);
+        let refreshed = failure
+            .refreshed_snapshot
+            .expect("failed live write must re-read live device state");
+        assert_eq!(
+            refreshed.hall_effect.as_ref().unwrap().snapshot.keys[0].actuation,
+            TravelHundredthsMm::from_hundredths(160)
+        );
     }
 }

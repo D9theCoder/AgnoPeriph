@@ -1,14 +1,17 @@
 //! UI integration tests: the production `AgnoPeriphApp` in a headless window, driven
-//! by real pointer events against the deterministic `MockPeripheralService`.
+//! by real pointer events against deterministic peripheral services.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agnoperiph::backend::{
-    MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MockPeripheralService, PeripheralService,
+    ApplyError, DeviceSnapshot, MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MockPeripheralService,
+    PeripheralService, SettingChange,
 };
 use agnoperiph::{AgnoPeriphApp, device_element_id};
-use agnoperiph_core::{DeviceId, KeyIndex, PollingRateHz, TravelHundredthsMm};
-use agnoperiph_transport::PacketOutcome;
+use agnoperiph_core::{
+    CoreError, CoreResult, DeviceId, KeyIndex, PollingRateHz, TravelHundredthsMm,
+};
+use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     AnyWindowHandle, AppContext, Bounds, ElementId, Entity, Point, TestAppContext, WindowBounds,
@@ -22,7 +25,7 @@ const KEY_Q: u16 = 2 * 16 + 1;
 
 fn open_app(
     cx: &mut TestAppContext,
-    service: MockPeripheralService,
+    service: impl PeripheralService + 'static,
 ) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
     cx.update(gpui_kit::init);
     let service: Arc<dyn PeripheralService> = Arc::new(service);
@@ -131,8 +134,15 @@ fn dry_run_is_default_and_writes_are_traced(cx: &mut TestAppContext) {
         assert_eq!(last.outcome, PacketOutcome::DryRunSuppressed);
     });
 
-    // Turning dry run off reopens the devices and discards the preview.
+    // Turning dry run off opens a confirmation AlertDialog; cancelling keeps dry run active.
     click(cx, handle, "dry-run");
+    assert!(exists(cx, handle, "cancel"));
+    click(cx, handle, "cancel");
+    cx.update(|cx| assert!(app.read(cx).is_dry_run()));
+
+    // Confirming the dialog reopens devices in live mode and discards the preview.
+    click(cx, handle, "dry-run");
+    click(cx, handle, "ok");
     cx.update(|cx| {
         let app = app.read(cx);
         assert!(!app.is_dry_run());
@@ -190,12 +200,52 @@ fn edits_actuation_and_rapid_trigger_from_the_key_matrix(cx: &mut TestAppContext
         assert_eq!(rt.release_sensitivity, travel(2));
     });
 
-    // Removing an SOCD pair stays unavailable until the driver can clear its slot.
+    // Removing an SOCD pair works via slot-aware clearing.
     let pair_remove = "socd-remove-49-51-x";
     let disabled = cx
         .update_window(handle, |_, window, _| window.find(pair_remove).disabled())
         .unwrap();
-    assert_eq!(disabled, Some(true));
+    assert_ne!(disabled, Some(true));
+    click(cx, handle, pair_remove);
+    cx.update(|cx| {
+        let app = app.read(cx);
+        let he = app.selected_device().unwrap().hall_effect.as_ref().unwrap();
+        assert_eq!(he.snapshot.socd_pairs, []);
+    });
+
+    // Switching to live mode requires confirmation, and "Apply to all keys" also confirms
+    // before erasing and rewriting the onboard flash actuation table.
+    click(cx, handle, "dry-run");
+    click(cx, handle, "ok");
+    click(cx, handle, key_id(KEY_Q));
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, "apply-actuation-all");
+    assert!(exists(cx, handle, "cancel"));
+    click(cx, handle, "cancel");
+    cx.update(|cx| {
+        let he = app
+            .read(cx)
+            .selected_device()
+            .unwrap()
+            .hall_effect
+            .as_ref()
+            .unwrap();
+        assert_eq!(he.key(KeyIndex::new(KEY_W)).unwrap().actuation, travel(80));
+    });
+
+    click(cx, handle, "apply-actuation-all");
+    click(cx, handle, "ok");
+    cx.update(|cx| {
+        let he = app
+            .read(cx)
+            .selected_device()
+            .unwrap()
+            .hall_effect
+            .as_ref()
+            .unwrap();
+        assert_eq!(he.key(KeyIndex::new(KEY_W)).unwrap().actuation, travel(122));
+        assert_eq!(he.key(KeyIndex::new(KEY_Q)).unwrap().actuation, travel(122));
+    });
 }
 
 #[gpui_kit::test]
@@ -262,6 +312,83 @@ fn dpi_draft_survives_unrelated_writes_and_keeps_axes_linked(cx: &mut TestAppCon
         let stage = pointer.snapshot.dpi_stages[1];
         assert_eq!(stage.x.value(), 900);
         assert_eq!(stage.y, None, "a linked stage keeps Y following X");
+        assert_eq!(pointer.snapshot.polling_rate, PollingRateHz::Hz500);
+    });
+}
+
+/// Service wrapper that simulates a failed live write after frames have already been sent,
+/// returning a refreshed live snapshot reflecting the hardware's partial update.
+struct FailingLiveWriteService {
+    inner: MockPeripheralService,
+    fail_live_write: Mutex<bool>,
+}
+
+impl PeripheralService for FailingLiveWriteService {
+    fn is_dry_run(&self) -> bool {
+        self.inner.is_dry_run()
+    }
+
+    fn set_dry_run(&self, dry_run: bool) {
+        self.inner.set_dry_run(dry_run);
+    }
+
+    fn refresh(&self) -> CoreResult<Vec<DeviceSnapshot>> {
+        self.inner.refresh()
+    }
+
+    fn apply(
+        &self,
+        device: &DeviceId,
+        change: SettingChange,
+    ) -> Result<DeviceSnapshot, ApplyError> {
+        let should_fail = !self.inner.is_dry_run() && *self.fail_live_write.lock().unwrap();
+        if should_fail {
+            // Apply to inner so we get a realistic post-failure re-read showing what landed.
+            let partial = self.inner.apply(device, change)?;
+            return Err(ApplyError::failed_after_send(
+                CoreError::NotConnected("timed out waiting for chunk reply".to_owned()),
+                Some(partial),
+            ));
+        }
+        self.inner.apply(device, change)
+    }
+
+    fn packet_log(&self) -> Vec<PacketTraceEntry> {
+        self.inner.packet_log()
+    }
+
+    fn clear_packet_log(&self) {
+        self.inner.clear_packet_log();
+    }
+}
+
+#[gpui_kit::test]
+fn failed_live_write_refreshes_view_and_does_not_claim_nothing_was_written(
+    cx: &mut TestAppContext,
+) {
+    let service = FailingLiveWriteService {
+        inner: MockPeripheralService::new(),
+        fail_live_write: Mutex::new(true),
+    };
+    let (handle, app) = open_app(cx, service);
+
+    // Enable live mode via the confirmation dialog.
+    click(cx, handle, "dry-run");
+    click(cx, handle, "ok");
+
+    // Trigger a live polling-rate write that fails after transmitting frames.
+    click(cx, handle, ("polling-rate", 500u64));
+    cx.update(|cx| {
+        let app = app.read(cx);
+        let banner = app.banner().expect("failed live write must show a banner");
+        assert!(
+            !banner.message().contains("Nothing was written"),
+            "banner must not claim nothing was written after a live failure: {}",
+            banner.message()
+        );
+        assert!(banner.message().contains("refreshed"));
+        // The device view reflects the re-read live snapshot.
+        let pointer = app.selected_device().unwrap().pointer.as_ref().unwrap();
         assert_eq!(pointer.snapshot.polling_rate, PollingRateHz::Hz500);
     });
 }

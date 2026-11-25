@@ -1,15 +1,16 @@
-//! Physical ATK RS7 75% layout on its `6 x 16` switch matrix.
+//! Capability-driven keymap layouts for Hall Effect keyboards.
 //!
-//! Widths and leading gaps are in hundredths of a key unit (`100` = 1u) so layout data
-//! stays integral; rows are rendered verbatim and left-aligned, so their total widths
-//! differ slightly, exactly as the source layout specifies.
+//! Devices with a known physical layout (such as the ATK RS7 75% on its `6 x 16` switch matrix)
+//! render their physical keycaps; any other Hall Effect keyboard automatically falls back to a
+//! generic grid driven by `HallEffectCapabilities::key_count`.
 
-use agnoperiph_core::KeyIndex;
+use agnoperiph_core::{DeviceInfo, HallEffectCapabilities, KeyIndex};
+use agnoperiph_driver_atk::protocol::{ATK_RS7_PID, ATK_VID, RS7_KEY_COUNT};
 
-/// Matrix columns per row; `KeyIndex = row * MATRIX_COLS + col`.
+/// Matrix columns per row for the RS7 layout and generic fallback grid.
 pub const MATRIX_COLS: u16 = 16;
 
-/// One physical keycap.
+/// One physical keycap in a static layout table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyCap {
@@ -25,6 +26,91 @@ pub struct KeyCap {
 impl KeyCap {
     pub const fn index(&self) -> KeyIndex {
         KeyIndex::new(self.row as u16 * MATRIX_COLS + self.col as u16)
+    }
+}
+
+/// Resolved keycap rendered by the Hall Effect matrix for any keyboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LayoutKey {
+    pub index: KeyIndex,
+    pub label: String,
+    /// Keycap width in hundredths of a unit (`100` = 1u).
+    pub width: u16,
+    /// Empty space before the keycap in hundredths of a unit.
+    pub gap: u16,
+}
+
+/// Resolved visual matrix layout for a connected Hall Effect keyboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyLayout {
+    pub rows: Vec<Vec<LayoutKey>>,
+}
+
+impl KeyLayout {
+    /// Builds the best layout for `info` and `caps`, falling back to a generic capability-driven
+    /// grid whenever the device has no dedicated physical layout.
+    pub fn for_device(info: &DeviceInfo, caps: &HallEffectCapabilities) -> Self {
+        if info.vid == ATK_VID && info.pid == ATK_RS7_PID && caps.key_count == RS7_KEY_COUNT {
+            return Self::rs7();
+        }
+        Self::generic(caps.key_count)
+    }
+
+    /// Physical ATK RS7 75% layout.
+    pub fn rs7() -> Self {
+        let rows = RS7_LAYOUT
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cap| LayoutKey {
+                        index: cap.index(),
+                        label: cap.label.to_owned(),
+                        width: cap.width,
+                        gap: cap.gap,
+                    })
+                    .collect()
+            })
+            .collect();
+        Self { rows }
+    }
+
+    /// Generic grid layout covering `0..key_count` in rows of [`MATRIX_COLS`].
+    pub fn generic(key_count: u16) -> Self {
+        let mut rows = Vec::new();
+        let mut current = Vec::new();
+        for ix in 0..key_count {
+            let row = ix / MATRIX_COLS;
+            let col = ix % MATRIX_COLS;
+            if col == 0 && !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+            }
+            current.push(LayoutKey {
+                index: KeyIndex::new(ix),
+                label: format!("R{row}C{col}"),
+                width: 100,
+                gap: 0,
+            });
+        }
+        if !current.is_empty() {
+            rows.push(current);
+        }
+        Self { rows }
+    }
+
+    /// Human-readable label for `key` within this layout, falling back to matrix coordinates.
+    pub fn label(&self, key: KeyIndex) -> String {
+        for row in &self.rows {
+            if let Some(cap) = row.iter().find(|cap| cap.index == key) {
+                return cap.label.clone();
+            }
+        }
+        format!(
+            "R{}C{}",
+            key.value() / MATRIX_COLS,
+            key.value() % MATRIX_COLS
+        )
     }
 }
 
@@ -183,9 +269,12 @@ pub fn key_label(key: KeyIndex) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use agnoperiph_core::KeyIndex;
+    use agnoperiph_core::{
+        ConnectionKind, DeviceId, DeviceInfo, HallEffectCapabilities, KeyIndex, TravelHundredthsMm,
+        VendorKind,
+    };
 
-    use super::{RS7_LAYOUT, key_label};
+    use super::{KeyLayout, RS7_LAYOUT, key_label};
 
     #[test]
     fn matrix_positions_are_unique_and_in_range() {
@@ -197,5 +286,33 @@ mod tests {
         assert_eq!(seen.len(), 80);
         assert_eq!(key_label(KeyIndex::new(2 * 16 + 2)), "W");
         assert_eq!(key_label(KeyIndex::new(4 * 16 + 1)), "R4C1");
+    }
+
+    #[test]
+    fn unknown_hall_effect_device_uses_generic_capability_grid() {
+        let info = DeviceInfo::new(
+            DeviceId::new("other:1234:5678"),
+            VendorKind::Unknown(0x1234),
+            "Generic 60% HE",
+            ConnectionKind::WiredUsb,
+            0x1234,
+            0x5678,
+        );
+        let caps = HallEffectCapabilities::new(
+            61,
+            TravelHundredthsMm::from_hundredths(10),
+            TravelHundredthsMm::from_hundredths(400),
+            TravelHundredthsMm::from_hundredths(10),
+        );
+        let layout = KeyLayout::for_device(&info, &caps);
+        let keys: Vec<KeyIndex> = layout
+            .rows
+            .iter()
+            .flat_map(|r| r.iter().map(|k| k.index))
+            .collect();
+        assert_eq!(keys.len(), 61);
+        assert_eq!(keys[0], KeyIndex::new(0));
+        assert_eq!(keys[60], KeyIndex::new(60));
+        assert_eq!(layout.label(KeyIndex::new(17)), "R1C1");
     }
 }

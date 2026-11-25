@@ -19,7 +19,7 @@ use agnoperiph_transport::{
 };
 
 use super::{
-    ActuationTarget, DeviceSnapshot, HallEffectState, PeripheralService, PointerChange,
+    ActuationTarget, ApplyError, DeviceSnapshot, HallEffectState, PeripheralService, PointerChange,
     PointerState, ProfileState, RgbState, SequencedSink, SettingChange, apply_change_to_snapshot,
     lock, validate_change,
 };
@@ -44,10 +44,15 @@ impl MockCodec {
     }
 
     /// Encodes the exact frame sequence the matching driver sends for `change`.
-    fn encode(self, change: &SettingChange, key_count: u16) -> CoreResult<Vec<Vec<u8>>> {
+    fn encode(
+        self,
+        change: &SettingChange,
+        key_count: u16,
+        previous_socd_len: usize,
+    ) -> CoreResult<Vec<Vec<u8>>> {
         match self {
             Self::LamzuAtlantis(family) => encode_lamzu(family, change),
-            Self::AtkRs7 => encode_atk(change, key_count),
+            Self::AtkRs7 => encode_atk(change, key_count, previous_socd_len),
         }
     }
 }
@@ -105,7 +110,11 @@ fn encode_lamzu(family: AtlantisRateFamily, change: &SettingChange) -> CoreResul
     Ok(frames)
 }
 
-fn encode_atk(change: &SettingChange, key_count: u16) -> CoreResult<Vec<Vec<u8>>> {
+fn encode_atk(
+    change: &SettingChange,
+    key_count: u16,
+    previous_socd_len: usize,
+) -> CoreResult<Vec<Vec<u8>>> {
     let payloads = match change {
         SettingChange::Actuation {
             target: ActuationTarget::Key(key),
@@ -151,11 +160,17 @@ fn encode_atk(change: &SettingChange, key_count: u16) -> CoreResult<Vec<Vec<u8>>
             let slot = u8::try_from(slot.value()).unwrap_or(u8::MAX);
             vec![atk::req_dks_set(slot, &empty)]
         }
-        SettingChange::Socd(pairs) => pairs
-            .iter()
-            .enumerate()
-            .map(|(ix, pair)| atk::req_socd_set(u8::try_from(ix).unwrap_or(0), Some(pair)))
-            .collect::<CoreResult<Vec<_>>>()?,
+        SettingChange::Socd(pairs) => {
+            let mut frames: Vec<[u8; atk::RS7_PAYLOAD_LEN]> = pairs
+                .iter()
+                .enumerate()
+                .map(|(ix, pair)| atk::req_socd_set(u8::try_from(ix).unwrap_or(0), Some(pair)))
+                .collect::<CoreResult<Vec<_>>>()?;
+            for ix in pairs.len()..previous_socd_len {
+                frames.push(atk::req_socd_set(u8::try_from(ix).unwrap_or(0), None)?);
+            }
+            frames
+        }
         SettingChange::Rgb {
             effect, brightness, ..
         } => vec![atk::req_backlight_set(*effect, brightness.percent())],
@@ -327,23 +342,33 @@ impl PeripheralService for MockPeripheralService {
         Ok(state.devices.iter().map(|d| d.presented.clone()).collect())
     }
 
-    fn apply(&self, device: &DeviceId, change: SettingChange) -> CoreResult<DeviceSnapshot> {
+    fn apply(
+        &self,
+        device: &DeviceId,
+        change: SettingChange,
+    ) -> Result<DeviceSnapshot, ApplyError> {
         let mut state = lock(&self.state);
         let dry_run = state.dry_run;
         let target = state
             .devices
             .iter_mut()
             .find(|d| d.presented.info.id == *device)
-            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+            .ok_or_else(|| ApplyError::rejected(CoreError::DeviceNotFound(device.to_string())))?;
 
-        validate_change(&target.presented, &change)?;
-        let key_count = target
-            .presented
-            .hall_effect
-            .as_ref()
-            .map_or(0, |he| he.capabilities.key_count);
-        for frame in target.codec.encode(&change, key_count)? {
-            target.transport.send_output_report(&frame)?;
+        validate_change(&target.presented, &change).map_err(ApplyError::rejected)?;
+        let (key_count, previous_socd_len) =
+            target.presented.hall_effect.as_ref().map_or((0, 0), |he| {
+                (he.capabilities.key_count, he.snapshot.socd_pairs.len())
+            });
+        let frames = target
+            .codec
+            .encode(&change, key_count, previous_socd_len)
+            .map_err(ApplyError::rejected)?;
+        for frame in frames {
+            target
+                .transport
+                .send_output_report(&frame)
+                .map_err(|err| ApplyError::failed_after_send(err.into(), None))?;
         }
 
         if dry_run {
@@ -697,6 +722,7 @@ mod tests {
                     point: travel(150),
                 },
                 atk::RS7_KEY_COUNT,
+                0,
             )
             .unwrap();
         assert_eq!(frames.len(), 9);
@@ -717,7 +743,7 @@ mod tests {
             active: 2,
         });
         let frames = MockCodec::LamzuAtlantis(AtlantisRateFamily::Wired)
-            .encode(&change, 0)
+            .encode(&change, 0, 0)
             .unwrap();
         assert_eq!(frames.len(), 1 + 4 * 2 + 1);
         let validator = atlantis::atlantis_validator();

@@ -5,8 +5,8 @@ use agnoperiph_core::{
     SocdMode, SocdPair, TravelHundredthsMm,
 };
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable, Theme,
-    button::{Button, ButtonGroup, ButtonVariants},
+    ActiveTheme, Disableable, Selectable, Sizable, Theme, WindowExt,
+    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
     scroll::ScrollableElement,
@@ -18,7 +18,7 @@ use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, field, readout, section};
 use crate::backend::{ActuationTarget, DeviceSnapshot, HallEffectState, SettingChange};
-use crate::keymap::{KeyCap, RS7_LAYOUT, key_label};
+use crate::keymap::{KeyLayout, LayoutKey};
 
 /// Width of one key unit in rem; keycaps and gaps scale with the theme's base font.
 const KEY_UNIT_REM: f32 = 3.0;
@@ -100,6 +100,37 @@ impl AgnoPeriphApp {
         if let Some((point, _)) = self.key_values() {
             self.apply_change(SettingChange::Actuation { target, point }, cx);
         }
+    }
+
+    fn request_global_actuation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(he), Some((point, _))) = (self.hall_effect_state(), self.key_values()) else {
+            return;
+        };
+        if self.is_dry_run() {
+            self.apply_actuation(ActuationTarget::AllKeys, cx);
+            return;
+        }
+        let key_count = he.capabilities.key_count;
+        let app = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app = app.clone();
+            alert
+                .confirm()
+                .title("Write actuation to all keys?")
+                .description(format!(
+                    "This erases and rewrites the onboard actuation table for all {key_count} keys to {} mm.",
+                    mm(point)
+                ))
+                .ok_text("Write all keys")
+                .ok_variant(ButtonVariant::Warning)
+                .cancel_text("Cancel")
+                .on_ok(move |_, _, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.apply_actuation(ActuationTarget::AllKeys, cx);
+                    });
+                    true
+                })
+        });
     }
 
     fn rapid_trigger_bounds(
@@ -216,6 +247,20 @@ impl AgnoPeriphApp {
             .collect();
         self.apply_change(SettingChange::Socd(pairs), cx);
     }
+
+    fn remove_socd_pair(&mut self, target: SocdPair, cx: &mut Context<Self>) {
+        let Some(he) = self.hall_effect_state() else {
+            return;
+        };
+        let pairs: Vec<SocdPair> = he
+            .snapshot
+            .socd_pairs
+            .iter()
+            .copied()
+            .filter(|pair| !(pair.key_a == target.key_a && pair.key_b == target.key_b))
+            .collect();
+        self.apply_change(SettingChange::Socd(pairs), cx);
+    }
 }
 
 pub(crate) fn render(
@@ -231,6 +276,7 @@ pub(crate) fn render(
             cx.theme(),
         );
     };
+    let layout = KeyLayout::for_device(&device.info, &he.capabilities);
     let base = section(
         "hall-effect-panel",
         "Switches",
@@ -238,11 +284,11 @@ pub(crate) fn render(
         cx.theme(),
     );
 
-    base.child(render_matrix(app, he, cx)).child(
+    base.child(render_matrix(app, he, &layout, cx)).child(
         h_flex()
             .items_start()
             .gap_8()
-            .child(render_key_editor(app, he, cx))
+            .child(render_key_editor(app, he, &layout, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -250,7 +296,7 @@ pub(crate) fn render(
                     .gap_6()
                     .child(render_calibration(he.snapshot.calibration, cx.theme()))
                     .when(he.capabilities.has_socd(), |this| {
-                        this.child(render_socd(app, he, cx))
+                        this.child(render_socd(app, he, &layout, cx))
                     })
                     .when(he.capabilities.has_dks(), |this| {
                         this.child(render_dks(app, he, cx))
@@ -262,9 +308,11 @@ pub(crate) fn render(
 fn render_matrix(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
+    layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let rows: Vec<AnyElement> = RS7_LAYOUT
+    let rows: Vec<AnyElement> = layout
+        .rows
         .iter()
         .map(|row| {
             h_flex()
@@ -318,11 +366,11 @@ fn render_matrix(
 fn render_keycap(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
-    cap: &KeyCap,
+    cap: &LayoutKey,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
-    let key = cap.index();
+    let key = cap.index;
     let config = he.key(key);
     let is_selected = app.selected_key() == key;
     let max = f32::from(he.capabilities.actuation_max.as_hundredths().max(1));
@@ -353,7 +401,7 @@ fn render_keycap(
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(cap.label),
+                                .child(cap.label.clone()),
                         )
                         .when(has_rt, |this| {
                             this.child(div().size_1p5().rounded_full().bg(bar_fill))
@@ -386,10 +434,11 @@ fn render_keycap(
 fn render_key_editor(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
+    layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let key = app.selected_key();
-    let label = key_label(key);
+    let label = layout.label(key);
     let Some((actuation, rapid_trigger)) = app.key_values() else {
         return v_flex()
             .flex_1()
@@ -528,8 +577,8 @@ fn render_actuation(
                             .small()
                             .label("Apply to all keys")
                             .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.apply_actuation(ActuationTarget::AllKeys, cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.request_global_actuation(window, cx);
                             })),
                     ),
             ),
@@ -609,6 +658,7 @@ fn render_calibration(status: CalibrationStatus, theme: &Theme) -> impl IntoElem
 fn render_socd(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
+    layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let busy = app.is_busy();
@@ -641,8 +691,8 @@ fn render_socd(
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(format!(
                                     "{} and {}",
-                                    key_label(pair.key_a),
-                                    key_label(pair.key_b)
+                                    layout.label(pair.key_a),
+                                    layout.label(pair.key_b)
                                 )),
                         )
                         .child(
@@ -650,8 +700,10 @@ fn render_socd(
                                 .ghost()
                                 .xsmall()
                                 .label("Remove")
-                                .disabled(true)
-                                .tooltip("The keyboard driver can’t clear a pair slot yet"),
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_socd_pair(pair, cx);
+                                })),
                         ),
                 )
                 .child(
@@ -669,7 +721,7 @@ fn render_socd(
             Button::new("socd-start")
                 .outline()
                 .small()
-                .label(format!("Pair {}…", key_label(selected)))
+                .label(format!("Pair {}…", layout.label(selected)))
                 .disabled(busy || is_full)
                 .on_click(cx.listener(|this, _, _, cx| this.start_socd_pair(cx))),
         ),
@@ -681,8 +733,8 @@ fn render_socd(
                     .small()
                     .label(format!(
                         "Pair {} with {}",
-                        key_label(first),
-                        key_label(selected)
+                        layout.label(first),
+                        layout.label(selected)
                     ))
                     .disabled(busy || first == selected)
                     .on_click(cx.listener(|this, _, _, cx| this.add_socd_pair(cx))),

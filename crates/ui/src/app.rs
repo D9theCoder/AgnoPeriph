@@ -7,9 +7,9 @@ use agnoperiph_core::{
 };
 use agnoperiph_transport::PacketTraceEntry;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode, WindowExt,
     alert::Alert,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     h_flex,
     scroll::ScrollableElement,
     spinner::Spinner,
@@ -20,7 +20,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::backend::{DeviceSnapshot, PeripheralService, PointerChange, SettingChange};
+use crate::backend::{ApplyError, DeviceSnapshot, PeripheralService, PointerChange, SettingChange};
 use crate::{hall_effect_panel, inspector_drawer, pointer_panel, rgb_panel, sidebar};
 
 /// Notice shown above the workspace after a failed operation.
@@ -86,6 +86,9 @@ pub struct AgnoPeriphApp {
     is_inspector_open: bool,
     banner: Option<Banner>,
     packets: Vec<PacketTraceEntry>,
+    /// Highest packet sequence number explicitly cleared by the user; any older frames
+    /// arriving from an in-flight refresh or write are dropped.
+    cleared_through_sequence: u64,
     pub(crate) selected_key: KeyIndex,
     pub(crate) key_draft: KeyDraft,
     pub(crate) dpi_draft: Option<Vec<DpiStage>>,
@@ -121,6 +124,7 @@ impl AgnoPeriphApp {
             is_inspector_open: true,
             banner: None,
             packets: Vec::new(),
+            cleared_through_sequence: 0,
             selected_key: KeyIndex::new(0),
             key_draft: KeyDraft::default(),
             dpi_draft: None,
@@ -212,6 +216,13 @@ impl AgnoPeriphApp {
         .detach();
     }
 
+    fn set_packets(&mut self, packets: Vec<PacketTraceEntry>) {
+        self.packets = packets
+            .into_iter()
+            .filter(|entry| entry.sequence > self.cleared_through_sequence)
+            .collect();
+    }
+
     fn finish_refresh(
         &mut self,
         revision: u64,
@@ -224,11 +235,13 @@ impl AgnoPeriphApp {
         self.is_loading = false;
         self.has_loaded = true;
         self.dry_run = dry_run;
-        self.packets = packets;
+        self.set_packets(packets);
         self.dpi_draft = None;
         self.key_draft = KeyDraft::default();
+        self.socd_first = None;
         match devices {
             Ok(devices) => {
+                let previous = self.selected.clone();
                 self.devices = devices;
                 self.banner = None;
                 let still_present = self
@@ -238,10 +251,14 @@ impl AgnoPeriphApp {
                 if !still_present {
                     self.selected = self.devices.first().map(|d| d.id().clone());
                 }
+                if self.selected != previous {
+                    self.selected_key = KeyIndex::new(0);
+                }
             }
             Err(err) => {
                 self.devices.clear();
                 self.selected = None;
+                self.selected_key = KeyIndex::new(0);
                 self.banner = Some(Banner {
                     title: "Couldn’t scan for devices".into(),
                     message: format!(
@@ -281,11 +298,11 @@ impl AgnoPeriphApp {
     fn finish_apply(
         &mut self,
         applied: DraftScope,
-        (result, packets): (CoreResult<DeviceSnapshot>, Vec<PacketTraceEntry>),
+        (result, packets): (Result<DeviceSnapshot, ApplyError>, Vec<PacketTraceEntry>),
         cx: &mut Context<Self>,
     ) {
         self.is_busy = false;
-        self.packets = packets;
+        self.set_packets(packets);
         match result {
             Ok(snapshot) => {
                 if let Some(slot) = self.devices.iter_mut().find(|d| d.id() == snapshot.id()) {
@@ -300,13 +317,38 @@ impl AgnoPeriphApp {
                     DraftScope::None => {}
                 }
             }
-            Err(err) => {
+            Err(failure) => {
+                self.socd_first = None;
+                let refreshed = failure.refreshed_snapshot.is_some();
+                if let Some(snapshot) = failure.refreshed_snapshot
+                    && let Some(slot) = self.devices.iter_mut().find(|d| d.id() == snapshot.id())
+                {
+                    *slot = *snapshot;
+                }
+                let message = if failure.rejected_before_send {
+                    format!(
+                        "{}. Nothing was written. Adjust the value, or refresh if the device was disconnected.",
+                        failure.error
+                    )
+                } else if self.dry_run {
+                    format!(
+                        "{}. Dry run is enabled, so no write reached the device.",
+                        failure.error
+                    )
+                } else if refreshed {
+                    format!(
+                        "{}. Some frames may have already reached the device; the view was refreshed with the device’s current state.",
+                        failure.error
+                    )
+                } else {
+                    format!(
+                        "{}. Some frames may have already reached the device. Refresh to verify its current state.",
+                        failure.error
+                    )
+                };
                 self.banner = Some(Banner {
                     title: "Couldn’t apply the change".into(),
-                    message: format!(
-                        "{err}. Nothing was written. Adjust the value, or refresh if the device was disconnected."
-                    )
-                    .into(),
+                    message: message.into(),
                 });
             }
         }
@@ -318,6 +360,7 @@ impl AgnoPeriphApp {
             return;
         }
         self.selected = Some(device);
+        self.selected_key = KeyIndex::new(0);
         self.dpi_draft = None;
         self.key_draft = KeyDraft::default();
         self.socd_first = None;
@@ -338,12 +381,45 @@ impl AgnoPeriphApp {
     }
 
     pub fn clear_packets(&mut self, cx: &mut Context<Self>) {
+        if let Some(last) = self.packets.last() {
+            self.cleared_through_sequence = self.cleared_through_sequence.max(last.sequence);
+        }
         self.packets.clear();
+        // Clearing only touches the sink's internal log buffer, never the HID state mutex.
+        self.service.clear_packet_log();
         cx.notify();
-        let service = self.service.clone();
-        // The service lock can be held by a slow HID exchange, so never clear on the UI thread.
-        cx.background_spawn(async move { service.clear_packet_log() })
-            .detach();
+    }
+
+    fn request_dry_run_change(
+        &mut self,
+        dry_run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy || self.is_loading || dry_run == self.dry_run {
+            return;
+        }
+        if dry_run {
+            self.set_dry_run(true, cx);
+            return;
+        }
+        let app = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app = app.clone();
+            alert
+                .confirm()
+                .title("Enable live device writes?")
+                .description(
+                    "Changes will be sent directly to connected peripherals. Fully exit G Hub, ATK HUB, and Lamzu software (including system tray icons) before continuing.",
+                )
+                .ok_text("Enable live writes")
+                .ok_variant(ButtonVariant::Warning)
+                .cancel_text("Keep dry run")
+                .on_ok(move |_, _, cx| {
+                    let _ = app.update(cx, |this, cx| this.set_dry_run(false, cx));
+                    true
+                })
+        });
     }
 
     fn toggle_theme(window: &mut Window, cx: &mut Context<Self>) {
@@ -405,8 +481,8 @@ impl AgnoPeriphApp {
                             .checked(self.dry_run)
                             .disabled(self.is_busy || self.is_loading)
                             .tooltip("Validate and log writes without sending them to devices")
-                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                this.set_dry_run(*checked, cx);
+                            .on_change(cx.listener(|this, checked: &bool, window, cx| {
+                                this.request_dry_run_change(*checked, window, cx);
                             })),
                     )
                     .child(write_state)
@@ -547,8 +623,12 @@ impl AgnoPeriphApp {
         v_flex()
             .gap_8()
             .child(header)
-            .children(device.warnings.iter().enumerate().map(|(ix, warning)| {
-                Alert::warning(("device-warning", ix), warning.clone()).title("Partly loaded")
+            .children(device.warnings.iter().map(|warning| {
+                let id = ElementId::Name(
+                    format!("device-warning-{}-{}", device.id(), warning.capability).into(),
+                );
+                Alert::warning(id, warning.message.clone())
+                    .title(format!("{} partly loaded", warning.capability))
             }))
             .when(caps.has_pointer(), |this| {
                 this.child(pointer_panel::render(self, device, cx))
