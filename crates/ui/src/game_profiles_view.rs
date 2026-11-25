@@ -143,8 +143,21 @@ impl AgnoPeriphApp {
         self.config.auto_switch_enabled = enabled;
         self.applied_targets.clear();
         self.auto_switch_note = None;
+        self.pending_switch_notice = None;
         if !enabled {
             self.active_game = None;
+        }
+        self.save_config();
+        cx.notify();
+    }
+
+    pub fn set_notify_on_game_switch(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.config.notify_on_game_switch == enabled {
+            return;
+        }
+        self.config.notify_on_game_switch = enabled;
+        if !enabled {
+            self.pending_switch_notice = None;
         }
         self.save_config();
         cx.notify();
@@ -451,6 +464,7 @@ pub(crate) fn render(
 
 fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl IntoElement + use<> {
     let enabled = app.config.auto_switch_enabled;
+    let notify = app.config.notify_on_game_switch;
     let playing = app.active_game_name().map(str::to_owned);
     let theme = cx.theme();
     let line = match (&playing, enabled) {
@@ -500,14 +514,32 @@ fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl I
         )
         .child(
             h_flex()
-                .gap_2()
-                .child(div().text_sm().child("Switch automatically"))
+                .gap_4()
                 .child(
-                    Switch::new("auto-switch")
-                        .checked(enabled)
-                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                            this.set_auto_switch(*checked, cx);
-                        })),
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_sm().child("Notify on switch"))
+                        .child(
+                            Switch::new("notify-on-switch")
+                                .checked(notify)
+                                .disabled(!enabled)
+                                .tooltip("Show a Windows notification when a game switches presets")
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.set_notify_on_game_switch(*checked, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_sm().child("Switch automatically"))
+                        .child(
+                            Switch::new("auto-switch")
+                                .checked(enabled)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.set_auto_switch(*checked, cx);
+                                })),
+                        ),
                 ),
         )
 }

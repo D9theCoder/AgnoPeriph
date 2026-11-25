@@ -182,6 +182,8 @@ impl Default for DeviceSoftwareProfiles {
 #[non_exhaustive]
 pub struct AppConfig {
     pub auto_switch_enabled: bool,
+    /// Show a Windows toast notification when opening or closing a game switches presets.
+    pub notify_on_game_switch: bool,
     /// Custom user-assigned names for any device's profile slots: `device_id -> slot -> label`.
     pub preset_names: BTreeMap<String, BTreeMap<u8, String>>,
     /// Host-managed software profiles for devices without multi-slot hardware memory.
@@ -200,6 +202,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             auto_switch_enabled: true,
+            notify_on_game_switch: true,
             preset_names: BTreeMap::new(),
             software_profiles: BTreeMap::new(),
             game_profiles: Vec::new(),

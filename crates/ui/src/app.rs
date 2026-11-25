@@ -126,6 +126,13 @@ pub(crate) struct WriteJob {
     pub(crate) origin: JobOrigin,
 }
 
+/// Batches per-device automatic preset switches from one game launch/exit into one notification.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSwitchNotice {
+    game_name: Option<String>,
+    applied: Vec<(String, String)>,
+}
+
 /// Top-level destination shown in the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -288,6 +295,8 @@ pub struct AgnoPeriphApp {
     pub(crate) applied_targets: BTreeMap<String, u8>,
     /// Devices with an automatic switch queued or in flight.
     pending_targets: BTreeSet<String>,
+    /// Coalesced Windows notification waiting for all queued switches of one game change to settle.
+    pub(crate) pending_switch_notice: Option<PendingSwitchNotice>,
     pub(crate) auto_switch_note: Option<SharedString>,
     pub(crate) calibration: calibration::CalibrationUi,
     pub(crate) controls: Option<Controls>,
@@ -361,6 +370,7 @@ impl AgnoPeriphApp {
             active_game: None,
             applied_targets: BTreeMap::new(),
             pending_targets: BTreeSet::new(),
+            pending_switch_notice: None,
             auto_switch_note: None,
             calibration: calibration::CalibrationUi::default(),
             controls: None,
@@ -833,6 +843,7 @@ impl AgnoPeriphApp {
         } = origin
         {
             self.pending_targets.remove(device.as_str());
+            self.maybe_flush_switch_notification(cx);
         }
         self.request_sync(cx);
         self.pump_queue(cx);
@@ -886,6 +897,7 @@ impl AgnoPeriphApp {
                 if *is_automatic {
                     self.applied_targets
                         .insert(device.as_str().to_owned(), *slot);
+                    self.record_auto_switch(device, *slot);
                 }
             }
             JobOrigin::CalibrationStart => {
@@ -1189,11 +1201,28 @@ impl AgnoPeriphApp {
             .config
             .match_running_game(running)
             .map(|p| p.id.clone());
+        let previous_game = self.active_game.clone();
         let mut changed = false;
-        if matched != self.active_game {
+        if matched != previous_game {
             self.active_game = matched;
             self.applied_targets.clear();
             self.auto_switch_note = None;
+            self.pending_switch_notice = if self.config.auto_switch_enabled
+                && self.config.notify_on_game_switch
+                && (self.active_game.is_some() || previous_game.is_some())
+            {
+                let game_name = self
+                    .active_game
+                    .as_deref()
+                    .and_then(|id| self.config.game_profile(id))
+                    .map(|p| p.name.clone());
+                Some(PendingSwitchNotice {
+                    game_name,
+                    applied: Vec::new(),
+                })
+            } else {
+                None
+            };
             changed = true;
         }
         if !self.config.auto_switch_enabled || self.is_loading {
@@ -1228,13 +1257,47 @@ impl AgnoPeriphApp {
                 self.queue.push_back(job);
                 changed = true;
             } else {
+                self.record_auto_switch(&device, slot);
                 self.applied_targets.insert(key, slot);
             }
         }
+        self.maybe_flush_switch_notification(cx);
         if changed {
             self.pump_queue(cx);
             cx.notify();
         }
+    }
+
+    fn record_auto_switch(&mut self, device: &DeviceId, slot: u8) {
+        if self.pending_switch_notice.is_none() {
+            return;
+        }
+        let device_name = self
+            .device(device)
+            .map_or_else(|| device.to_string(), |d| d.info.model_name.clone());
+        let preset_name = self.config.preset_name(device, ProfileSlot::new(slot));
+        if let Some(notice) = self.pending_switch_notice.as_mut() {
+            notice.applied.push((device_name, preset_name));
+        }
+    }
+
+    fn maybe_flush_switch_notification(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_targets.is_empty() {
+            return;
+        }
+        let Some(notice) = self.pending_switch_notice.take() else {
+            return;
+        };
+        if !self.config.notify_on_game_switch || notice.applied.is_empty() {
+            return;
+        }
+        let (title, body) =
+            crate::system::format_switch_notification(notice.game_name.as_deref(), &notice.applied);
+        let system = self.system.clone();
+        cx.background_spawn(async move {
+            let _ = system.send_notification(&title, &body);
+        })
+        .detach();
     }
 
     /// The device's active profile slot: onboard for hardware profiles, host-managed otherwise.

@@ -1223,3 +1223,88 @@ fn configured_socd_entry_keeps_remove_clear_of_its_modes(cx: &mut TestAppContext
     }
     assert!(remove.right() <= card.right());
 }
+
+struct RecordingSystem {
+    notifications: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl RecordingSystem {
+    fn new() -> Self {
+        Self {
+            notifications: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.notifications.lock().unwrap())
+    }
+}
+
+impl agnoperiph::system::SystemIntegration for RecordingSystem {
+    fn set_start_with_windows(&self, _enabled: bool, _minimized: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn is_start_with_windows_enabled(&self) -> bool {
+        false
+    }
+
+    fn save_config(&self, _config: &agnoperiph::game_profiles::AppConfig) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn send_notification(&self, title: &str, body: &str) -> Result<(), String> {
+        self.notifications
+            .lock()
+            .unwrap()
+            .push((title.to_owned(), body.to_owned()));
+        Ok(())
+    }
+}
+
+#[gpui_kit::test]
+fn game_profile_switch_sends_batched_windows_notification(cx: &mut TestAppContext) {
+    let system = Arc::new(RecordingSystem::new());
+    let options = AppOptions::default().with_system(system.clone());
+    let (handle, app) = open_app_with(cx, MockPeripheralService::new(), options);
+
+    click(cx, handle, "nav-game-profiles");
+    type_into(cx, handle, "manual-game-name", "VALORANT");
+    type_into(cx, handle, "manual-game-exe", "VALORANT-Win64-Shipping.exe");
+    click(cx, handle, "add-manual-game");
+
+    // Assign both Lamzu mouse and ATK RS7 keyboard presets for VALORANT, and a default for mouse.
+    click(cx, handle, format!("target-{}-1", mouse()));
+    click(cx, handle, format!("target-{}-3", keyboard()));
+    click(cx, handle, "game-profile-default");
+    click(cx, handle, format!("target-{}-0", mouse()));
+
+    // Opening VALORANT switches both devices and sends one batched notification.
+    let running = HashSet::from(["valorant-win64-shipping.exe".to_owned()]);
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    let sent = system.take();
+    assert_eq!(sent.len(), 1, "expected 1 batched notification: {sent:?}");
+    assert_eq!(sent[0].0, "VALORANT — Presets switched");
+    assert!(sent[0].1.contains("Lamzu Atlantis"), "{}", sent[0].1);
+    assert!(sent[0].1.contains("ATK RS7"), "{}", sent[0].1);
+
+    // Polling again with the same running game does not repeat the notification.
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    assert_eq!(system.take(), Vec::<(String, String)>::new());
+
+    // Closing VALORANT restores the mouse preset and sends one restore notification.
+    app.update(cx, |app, cx| app.handle_running_exes(&HashSet::new(), cx));
+    settle(cx, handle);
+    let sent = system.take();
+    assert_eq!(sent.len(), 1, "expected 1 restore notification: {sent:?}");
+    assert_eq!(sent[0].0, "Desktop / Default — Presets restored");
+    assert!(sent[0].1.contains("Lamzu Atlantis"), "{}", sent[0].1);
+
+    // Disabling "Notify on switch" suppresses future notifications.
+    click(cx, handle, "notify-on-switch");
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    assert_eq!(system.take(), Vec::<(String, String)>::new());
+}
