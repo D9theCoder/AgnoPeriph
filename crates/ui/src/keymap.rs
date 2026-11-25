@@ -1,13 +1,14 @@
 //! Capability-driven keymap layouts for Hall Effect keyboards.
 //!
 //! Devices with a known physical layout (such as the ATK RS7 75% on its `6 x 16` switch matrix)
-//! render their physical keycaps; any other Hall Effect keyboard automatically falls back to a
-//! generic grid driven by `HallEffectCapabilities::key_count`.
+//! render their physical keycaps; any other keyboard falls back to a grid of `key_count` keys
+//! wrapped at the device's matrix width (from its product table or keymap capabilities).
 
 use std::sync::{Arc, LazyLock};
 
 use agnoperiph_core::{DeviceInfo, HallEffectCapabilities, KeyIndex};
 use agnoperiph_driver_atk::protocol::{ATK_RS7_PID, ATK_VID, RS7_KEY_COUNT};
+use agnoperiph_driver_wooting::protocol::{WOOTING_VID, lookup_product as wooting_product};
 use gpui_kit::SharedString;
 
 /// Matrix columns per row for the RS7 layout and generic fallback grid.
@@ -49,6 +50,8 @@ pub struct LayoutKey {
 #[non_exhaustive]
 pub struct KeyLayout {
     pub rows: Vec<Vec<LayoutKey>>,
+    /// Matrix columns per row, used to name keys the layout does not draw.
+    pub cols: u16,
 }
 
 static CACHED_RS7_LAYOUT: LazyLock<Arc<KeyLayout>> = LazyLock::new(|| {
@@ -65,7 +68,10 @@ static CACHED_RS7_LAYOUT: LazyLock<Arc<KeyLayout>> = LazyLock::new(|| {
                 .collect()
         })
         .collect();
-    Arc::new(KeyLayout { rows })
+    Arc::new(KeyLayout {
+        rows,
+        cols: MATRIX_COLS,
+    })
 });
 
 impl KeyLayout {
@@ -74,6 +80,12 @@ impl KeyLayout {
     pub fn for_device(info: &DeviceInfo, caps: &HallEffectCapabilities) -> Arc<Self> {
         if info.vid == ATK_VID && info.pid == ATK_RS7_PID && caps.key_count == RS7_KEY_COUNT {
             return Arc::clone(&CACHED_RS7_LAYOUT);
+        }
+        if info.vid == WOOTING_VID
+            && let Some(product) = wooting_product(info.pid)
+            && product.key_count() == caps.key_count
+        {
+            return Arc::new(Self::grid(caps.key_count, u16::from(product.cols)));
         }
         Arc::new(Self::generic(caps.key_count))
     }
@@ -85,11 +97,17 @@ impl KeyLayout {
 
     /// Generic grid layout covering `0..key_count` in rows of [`MATRIX_COLS`].
     pub fn generic(key_count: u16) -> Self {
+        Self::grid(key_count, MATRIX_COLS)
+    }
+
+    /// Grid layout covering `0..key_count` in rows of `cols` matrix positions.
+    pub fn grid(key_count: u16, cols: u16) -> Self {
+        let cols = cols.max(1);
         let mut rows = Vec::new();
         let mut current = Vec::new();
         for ix in 0..key_count {
-            let row = ix / MATRIX_COLS;
-            let col = ix % MATRIX_COLS;
+            let row = ix / cols;
+            let col = ix % cols;
             if col == 0 && !current.is_empty() {
                 rows.push(std::mem::take(&mut current));
             }
@@ -103,7 +121,7 @@ impl KeyLayout {
         if !current.is_empty() {
             rows.push(current);
         }
-        Self { rows }
+        Self { rows, cols }
     }
 
     /// Human-readable label for `key` within this layout, falling back to matrix coordinates.
@@ -113,12 +131,8 @@ impl KeyLayout {
                 return cap.label.clone();
             }
         }
-        format!(
-            "R{}C{}",
-            key.value() / MATRIX_COLS,
-            key.value() % MATRIX_COLS
-        )
-        .into()
+        let cols = self.cols.max(1);
+        format!("R{}C{}", key.value() / cols, key.value() % cols).into()
     }
 }
 
@@ -322,5 +336,36 @@ mod tests {
         assert_eq!(keys[0], KeyIndex::new(0));
         assert_eq!(keys[60], KeyIndex::new(60));
         assert_eq!(layout.label(KeyIndex::new(17)), "R1C1");
+    }
+
+    #[test]
+    fn wooting_board_wraps_at_its_matrix_width() {
+        let info = DeviceInfo::new(
+            DeviceId::new("wooting:31E3:1302"),
+            VendorKind::Wooting,
+            "Wooting 60HE",
+            ConnectionKind::WiredUsb,
+            0x31E3,
+            0x1302,
+        );
+        let caps = HallEffectCapabilities::new(
+            84,
+            TravelHundredthsMm::from_hundredths(10),
+            TravelHundredthsMm::from_hundredths(400),
+            TravelHundredthsMm::from_hundredths(5),
+        );
+        let layout = KeyLayout::for_device(&info, &caps);
+        assert_eq!(layout.rows.len(), 6);
+        assert!(layout.rows.iter().all(|row| row.len() == 14));
+        assert_eq!(layout.rows[1][0].index, KeyIndex::new(14));
+        assert_eq!(layout.label(KeyIndex::new(15)), "R1C1");
+    }
+
+    #[test]
+    fn grid_follows_keymap_columns() {
+        let layout = KeyLayout::grid(6 * 15, 15);
+        assert_eq!(layout.rows.len(), 6);
+        assert_eq!(layout.rows[2][0].index, KeyIndex::new(30));
+        assert_eq!(layout.label(KeyIndex::new(31)), "R2C1");
     }
 }

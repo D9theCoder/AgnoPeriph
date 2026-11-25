@@ -6,7 +6,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use agnoperiph_core::{
-    CoreResult, DeviceId, DpiStage, KeyIndex, ProfileSlot, RapidTriggerConfig, TravelHundredthsMm,
+    CoreError, CoreResult, DeviceId, DpiStage, KeyIndex, ProfileSlot, RapidTriggerConfig,
+    TravelHundredthsMm,
 };
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::component::{
@@ -951,7 +952,14 @@ impl AgnoPeriphApp {
         } else {
             String::new()
         };
-        let message = if failure.rejected_before_send {
+        let message = if failure.rejected_before_send
+            && matches!(failure.error, CoreError::UnsupportedCapability(_))
+        {
+            format!(
+                "{device_name} doesn’t accept this change from AgnoPeriph ({}). Nothing was written.{step_note}",
+                failure.error
+            )
+        } else if failure.rejected_before_send {
             format!(
                 "{}. Nothing was written for this step. Adjust the value, or refresh if the device was disconnected.{step_note}",
                 failure.error
@@ -1477,7 +1485,7 @@ impl AgnoPeriphApp {
                 .confirm()
                 .title("Enable live device writes?")
                 .description(
-                    "Changes will be sent directly to connected peripherals. Fully exit G Hub, ATK HUB, and Lamzu software (including system tray icons) before continuing.",
+                    "Changes will be sent directly to connected peripherals. Fully exit each vendor’s own software, including system tray icons, before continuing.",
                 )
                 .ok_text("Enable live writes")
                 .ok_variant(ButtonVariant::Warning)
@@ -1720,7 +1728,10 @@ impl AgnoPeriphApp {
                     ),
             )
             .when(
-                caps.has_hall_effect() && device.hall_effect.is_some(),
+                device
+                    .hall_effect
+                    .as_ref()
+                    .is_some_and(|he| he.capabilities.supports_calibration_status),
                 |this| {
                     this.child(
                         Button::new("open-calibration")
@@ -1828,7 +1839,7 @@ impl AgnoPeriphApp {
                     .text_center()
                     .text_color(theme.muted_foreground)
                     .child(
-                        "Connect a Logitech, Lamzu or ATK device. Fully exit G Hub, ATK HUB and Lamzu software, including tray icons, then refresh.",
+                        "Connect a supported mouse or keyboard. Fully exit each vendor’s own software, including tray icons, then refresh.",
                     ),
             )
             .child(

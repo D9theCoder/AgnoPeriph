@@ -104,7 +104,7 @@ pub(crate) fn render(
     let base = section(
         "pointer-panel",
         "Sensor",
-        "DPI stages, polling rate and lift-off distance stored on the mouse.",
+        "DPI stages, polling rate and sensor options stored on the mouse.",
         cx.theme(),
     );
     let busy = app.is_busy();
@@ -126,7 +126,42 @@ pub(crate) fn render(
                 .snapshot
                 .motion_sync
                 .filter(|_| pointer.capabilities.supports_motion_sync),
-            |this, enabled| this.child(render_motion_sync(enabled, busy, cx)),
+            |this, enabled| {
+                this.child(render_sensor_switch(
+                    SensorSwitch::MotionSync,
+                    enabled,
+                    busy,
+                    cx,
+                ))
+            },
+        )
+        .when_some(
+            pointer
+                .snapshot
+                .angle_snapping
+                .filter(|_| pointer.capabilities.supports_angle_snapping),
+            |this, enabled| {
+                this.child(render_sensor_switch(
+                    SensorSwitch::AngleSnapping,
+                    enabled,
+                    busy,
+                    cx,
+                ))
+            },
+        )
+        .when_some(
+            pointer
+                .snapshot
+                .ripple_control
+                .filter(|_| pointer.capabilities.supports_ripple_control),
+            |this, enabled| {
+                this.child(render_sensor_switch(
+                    SensorSwitch::RippleControl,
+                    enabled,
+                    busy,
+                    cx,
+                ))
+            },
         )
 }
 
@@ -319,6 +354,7 @@ fn render_lod(
     let buttons = pointer.capabilities.supported_lods.iter().map(|&lod| {
         let key = match lod {
             LiftOffDistance::Low => 1,
+            LiftOffDistance::Medium => 3,
             LiftOffDistance::High => 2,
             LiftOffDistance::TenthsMm(tenths) => 100 + u64::from(tenths),
         };
@@ -386,21 +422,53 @@ fn render_debounce(
     )
 }
 
-fn render_motion_sync(
+/// On/off sensor features that share one switch row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SensorSwitch {
+    MotionSync,
+    AngleSnapping,
+    RippleControl,
+}
+
+impl SensorSwitch {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MotionSync => "Motion sync",
+            Self::AngleSnapping => "Angle snapping",
+            Self::RippleControl => "Ripple control",
+        }
+    }
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::MotionSync => "motion-sync",
+            Self::AngleSnapping => "angle-snapping",
+            Self::RippleControl => "ripple-control",
+        }
+    }
+
+    const fn change(self, enabled: bool) -> PointerChange {
+        match self {
+            Self::MotionSync => PointerChange::MotionSync(enabled),
+            Self::AngleSnapping => PointerChange::AngleSnapping(enabled),
+            Self::RippleControl => PointerChange::RippleControl(enabled),
+        }
+    }
+}
+
+fn render_sensor_switch(
+    kind: SensorSwitch,
     enabled: bool,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    field("Motion sync", cx.theme()).child(
-        Switch::new("motion-sync")
+    field(kind.label(), cx.theme()).child(
+        Switch::new(kind.id())
             .checked(enabled)
             .disabled(busy)
-            .accessibility_label("Motion sync")
-            .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                this.apply_change(
-                    SettingChange::Pointer(PointerChange::MotionSync(*checked)),
-                    cx,
-                );
+            .accessibility_label(kind.label())
+            .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                this.apply_change(SettingChange::Pointer(kind.change(*checked)), cx);
             })),
     )
 }

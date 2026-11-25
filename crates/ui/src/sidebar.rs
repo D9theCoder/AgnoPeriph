@@ -177,7 +177,8 @@ fn render_row(
     let theme = cx.theme();
     let info = &device.info;
     let muted = theme.muted_foreground;
-    let icon = if device.capabilities.has_hall_effect() {
+    let caps = device.capabilities;
+    let icon = if caps.has_hall_effect() || caps.has_keymap() || caps.has_keyboard_config() {
         IconName::Frame
     } else {
         IconName::Cpu

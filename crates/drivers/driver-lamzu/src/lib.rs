@@ -409,6 +409,14 @@ impl<T: HidTransport> PointerDevice for LamzuAtlantisDevice<T> {
     fn set_motion_sync(&mut self, enabled: bool) -> CoreResult<()> {
         self.write_flash_u8(flash::MOTION_SYNC, u8::from(enabled))
     }
+
+    fn set_angle_snapping(&mut self, enabled: bool) -> CoreResult<()> {
+        self.write_flash_u8(flash::ANGLE_SNAPPING, u8::from(enabled))
+    }
+
+    fn set_ripple_control(&mut self, enabled: bool) -> CoreResult<()> {
+        self.write_flash_u8(flash::RIPPLE_CONTROL, u8::from(enabled))
+    }
 }
 
 impl<T: HidTransport> ProfileManager for LamzuAtlantisDevice<T> {

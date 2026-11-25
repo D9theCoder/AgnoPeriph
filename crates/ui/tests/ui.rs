@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agnoperiph::backend::{
-    ApplyError, DeviceSnapshot, MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MockPeripheralService,
-    PeripheralService, SettingChange,
+    ApplyError, DeviceSnapshot, MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID,
+    MOCK_VIA_ID, MOCK_WOOTING_ID, MockPeripheralService, PeripheralService, SettingChange,
 };
 use agnoperiph::game_profiles::{DetectedGame, GameSource};
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, Route, device_element_id};
 use agnoperiph_core::{
-    CoreError, CoreResult, DeviceId, KeyCode, KeyIndex, MacroActionKind, ModTapBinding,
-    PollingRateHz, ProfileSlot, RapidSwitchPair, RgbColor, RgbEffect, ToggleKeyBinding,
-    TravelHundredthsMm,
+    CoreError, CoreResult, DeviceId, KeyCode, KeyIndex, LiftOffDistance, MacroActionKind,
+    ModTapBinding, PollingRateHz, ProfileSlot, RapidSwitchPair, RgbColor, RgbEffect,
+    ToggleKeyBinding, TravelHundredthsMm,
 };
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::test::TestWindowExt;
@@ -1396,4 +1396,147 @@ fn game_profile_switch_sends_batched_windows_notification(cx: &mut TestAppContex
     app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
     settle(cx, handle);
     assert_eq!(system.take(), Vec::<(String, String)>::new());
+}
+
+fn device_snapshot(
+    cx: &mut TestAppContext,
+    app: &Entity<AgnoPeriphApp>,
+    id: &DeviceId,
+) -> DeviceSnapshot {
+    cx.update(|cx| app.read(cx).device(id).unwrap().clone())
+}
+
+fn is_checked(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) -> Option<bool> {
+    cx.update_window(handle, |_, window, _| window.find(id).checked())
+        .unwrap()
+}
+
+#[gpui_kit::test]
+fn sensor_switches_follow_pointer_capabilities(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::multi_brand());
+    let pulsar = DeviceId::new(MOCK_PULSAR_ID);
+    click(cx, handle, device_element_id(&pulsar));
+
+    assert_eq!(is_checked(cx, handle, "motion-sync"), Some(true));
+    assert_eq!(is_checked(cx, handle, "angle-snapping"), Some(false));
+    assert_eq!(is_checked(cx, handle, "ripple-control"), Some(true));
+
+    click(cx, handle, "angle-snapping");
+    click(cx, handle, "ripple-control");
+    let pointer = device_snapshot(cx, &app, &pulsar).pointer.unwrap();
+    assert_eq!(pointer.snapshot.angle_snapping, Some(true));
+    assert_eq!(pointer.snapshot.ripple_control, Some(false));
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert_eq!(app.banner(), None);
+        assert_eq!(
+            app.packets().last().unwrap().outcome,
+            PacketOutcome::DryRunSuppressed
+        );
+    });
+
+    // Medium lift-off is offered between Low and High and applies like the others.
+    assert!(exists(cx, handle, ("lod", 1u64)));
+    assert!(exists(cx, handle, ("lod", 3u64)));
+    assert!(exists(cx, handle, ("lod", 2u64)));
+    click(cx, handle, ("lod", 2u64));
+    click(cx, handle, ("lod", 3u64));
+    let pointer = device_snapshot(cx, &app, &pulsar).pointer.unwrap();
+    assert_eq!(pointer.snapshot.lod, Some(LiftOffDistance::Medium));
+
+    // A mouse without these features shows none of their switches.
+    click(cx, handle, device_element_id(&DeviceId::new(MOCK_RAZER_ID)));
+    assert!(!exists(cx, handle, "motion-sync"));
+    assert!(!exists(cx, handle, "angle-snapping"));
+    assert!(!exists(cx, handle, "ripple-control"));
+}
+
+#[gpui_kit::test]
+fn mouse_with_rgb_shows_lighting_beside_pointer_settings(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::multi_brand());
+    let razer = DeviceId::new(MOCK_RAZER_ID);
+    click(cx, handle, device_element_id(&razer));
+
+    assert!(exists(cx, handle, ("polling-rate", 1000u64)));
+    assert!(!exists(cx, handle, ("keymap-key", 0u64)));
+    // Zone ids are the device's LED ids (0, 1, 4), not list positions.
+    for zone in [0u64, 1, 4] {
+        assert!(exists(cx, handle, ("rgb-zone", zone)), "zone {zone}");
+    }
+    click(cx, handle, ("rgb-zone", 4u64));
+    click(cx, handle, "rgb-4-effect-Static");
+    let rgb = device_snapshot(cx, &app, &razer).rgb.unwrap();
+    let logo = rgb
+        .snapshot
+        .zones
+        .iter()
+        .find(|z| z.zone.value() == 4)
+        .unwrap();
+    assert!(matches!(logo.effect, RgbEffect::Static { .. }));
+    cx.update(|cx| assert_eq!(app.read(cx).banner(), None));
+}
+
+#[gpui_kit::test]
+fn via_keyboard_without_hall_effect_lands_on_its_own_tabs(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::multi_brand());
+    let via = DeviceId::new(MOCK_VIA_ID);
+    click(cx, handle, device_element_id(&via));
+
+    // No Triggers tab, so the first available tab (Keybinds) is shown.
+    assert!(exists(cx, handle, ("keymap-key", 17u64)));
+    assert!(!exists(cx, handle, "open-calibration"));
+    assert!(!exists(cx, handle, ("polling-rate", 1000u64)));
+
+    // Key 17 is row 1, column 1 on the 16-column VIA matrix.
+    click(cx, handle, ("keymap-key", 17u64));
+    click(cx, handle, ("hid-key", 0x04u64));
+    let keymap = device_snapshot(cx, &app, &via).keymap.unwrap();
+    assert_eq!(keymap.snapshot.layers[0][17], KeyCode::standard(0x04));
+    cx.update(|cx| assert_eq!(app.read(cx).banner(), None));
+
+    // The tab bar lists only Keybinds, Lighting and Macros, in that order.
+    let click_tab = |cx: &mut TestAppContext, index: usize| {
+        cx.update_window(handle, |_, window, cx| {
+            window.within("keyboard-tabs").click(index, cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+    };
+    click_tab(cx, 2);
+    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tab(), KeyboardTab::Macros));
+    assert!(exists(cx, handle, "save-macros"));
+    click_tab(cx, 1);
+    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tab(), KeyboardTab::Lighting));
+    assert!(exists(cx, handle, "rgb-0-preset-13"));
+    click(cx, handle, "rgb-0-preset-1");
+    let rgb = device_snapshot(cx, &app, &via).rgb.unwrap();
+    assert!(matches!(
+        rgb.snapshot.zones[0].effect,
+        RgbEffect::Preset { id: 1, .. }
+    ));
+}
+
+#[gpui_kit::test]
+fn readonly_hall_effect_keyboard_reports_unsupported_writes(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::multi_brand());
+    let wooting = DeviceId::new(MOCK_WOOTING_ID);
+    click(cx, handle, device_element_id(&wooting));
+
+    // 6 x 14 matrix: index 14 starts the second row, and every key is drawn.
+    assert!(exists(cx, handle, key_id(14)));
+    assert!(exists(cx, handle, key_id(83)));
+    assert!(!exists(cx, handle, key_id(84)));
+    assert!(!exists(cx, handle, "open-calibration"));
+
+    click(cx, handle, key_id(14));
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, "apply-actuation-key");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        let banner = app.banner().expect("unsupported write shows a banner");
+        assert!(banner.message().contains("Nothing was written"));
+        assert!(banner.message().contains("unsupported capability"));
+        let he = app.device(&wooting).unwrap().hall_effect.as_ref().unwrap();
+        assert_eq!(he.key(KeyIndex::new(14)).unwrap().actuation, travel(200));
+    });
 }

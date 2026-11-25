@@ -135,6 +135,7 @@ impl fmt::Display for PollingRateHz {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LiftOffDistance {
     Low,
+    Medium,
     High,
     /// Lift-off height in tenths of a millimeter (e.g., `10` = `1.0 mm`, `20` = `2.0 mm`).
     TenthsMm(u8),
@@ -144,6 +145,7 @@ impl fmt::Display for LiftOffDistance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Low => f.write_str("Low"),
+            Self::Medium => f.write_str("Medium"),
             Self::High => f.write_str("High"),
             Self::TenthsMm(tenths) => write!(f, "{}.{} mm", tenths / 10, tenths % 10),
         }
@@ -424,5 +426,17 @@ pub trait PointerDevice: Send + Sync {
     fn set_motion_sync(&mut self, enabled: bool) -> CoreResult<()> {
         let _ = enabled;
         Err(CoreError::UnsupportedCapability("motion_sync"))
+    }
+
+    /// Toggles sensor angle snapping.
+    fn set_angle_snapping(&mut self, enabled: bool) -> CoreResult<()> {
+        let _ = enabled;
+        Err(CoreError::UnsupportedCapability("angle_snapping"))
+    }
+
+    /// Toggles sensor ripple control.
+    fn set_ripple_control(&mut self, enabled: bool) -> CoreResult<()> {
+        let _ = enabled;
+        Err(CoreError::UnsupportedCapability("ripple_control"))
     }
 }

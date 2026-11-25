@@ -42,6 +42,14 @@ pub enum VendorKind {
     Logitech,
     Lamzu,
     Atk,
+    Razer,
+    Pulsar,
+    Finalmouse,
+    WLmouse,
+    EndgameGear,
+    Wooting,
+    Keychron,
+    QmkVia,
     Unknown(u16),
 }
 
@@ -53,6 +61,13 @@ impl VendorKind {
     pub fn from_vid(vid: u16) -> Self {
         match vid {
             0x046D => Self::Logitech,
+            0x1532 => Self::Razer,
+            0x3710 => Self::Pulsar,
+            0x361D => Self::Finalmouse,
+            0x36A7 => Self::WLmouse,
+            0x3367 => Self::EndgameGear,
+            0x31E3 => Self::Wooting,
+            0x3434 | 0x362D => Self::Keychron,
             other => Self::Unknown(other),
         }
     }
@@ -64,6 +79,14 @@ impl fmt::Display for VendorKind {
             Self::Logitech => f.write_str("Logitech"),
             Self::Lamzu => f.write_str("Lamzu"),
             Self::Atk => f.write_str("ATK"),
+            Self::Razer => f.write_str("Razer"),
+            Self::Pulsar => f.write_str("Pulsar"),
+            Self::Finalmouse => f.write_str("Finalmouse"),
+            Self::WLmouse => f.write_str("WLmouse"),
+            Self::EndgameGear => f.write_str("Endgame Gear"),
+            Self::Wooting => f.write_str("Wooting"),
+            Self::Keychron => f.write_str("Keychron"),
+            Self::QmkVia => f.write_str("QMK / VIA"),
             Self::Unknown(vid) => write!(f, "Unknown (0x{vid:04X})"),
         }
     }

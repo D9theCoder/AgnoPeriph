@@ -2,6 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
+mod brands;
+
+pub use brands::{MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID};
+
 use agnoperiph_core::{
     BatteryStatus, Brightness, CalibrationStatus, Capabilities, ChargingState, ConnectionKind,
     CoreError, CoreResult, DebounceMs, DeviceId, DeviceInfo, DksBinding, DksStageAction,
@@ -17,7 +21,7 @@ use agnoperiph_driver_atk::protocol as atk;
 use agnoperiph_driver_lamzu::atlantis::{self, AtlantisRateFamily, Command as LamzuCommand};
 use agnoperiph_transport::{
     FixedReportValidator, GuardedTransport, HidDeviceDescriptor, HidTransport, MockHidTransport,
-    PacketSink, PacketTraceEntry,
+    PacketSink, PacketTraceEntry, ReportKind,
 };
 
 use super::{
@@ -35,6 +39,10 @@ pub const MOCK_KEYBOARD_ID: &str = "atk:373B:1044:ATK RS HE";
 enum MockCodec {
     LamzuAtlantis(AtlantisRateFamily),
     AtkRs7,
+    Razer(brands::RazerProductProfile),
+    Pulsar,
+    Via { cols: u8 },
+    Wooting(brands::WootingProductProfile),
 }
 
 impl MockCodec {
@@ -42,20 +50,42 @@ impl MockCodec {
         match self {
             Self::LamzuAtlantis(_) => atlantis::atlantis_validator(),
             Self::AtkRs7 => atk::atk_rs7_validator(),
+            Self::Razer(_) => brands::razer_validator(),
+            Self::Pulsar => brands::pulsar_validator(),
+            Self::Via { .. } => brands::via_validator(),
+            Self::Wooting(_) => brands::wooting_validator(),
+        }
+    }
+
+    /// HID report type the matching driver writes with.
+    const fn report_kind(self) -> ReportKind {
+        match self {
+            Self::Razer(_) | Self::Wooting(_) => ReportKind::Feature,
+            Self::LamzuAtlantis(_) | Self::AtkRs7 | Self::Pulsar | Self::Via { .. } => {
+                ReportKind::Output
+            }
         }
     }
 
     /// Encodes the exact frame sequence the matching driver sends for `change`.
-    fn encode(
-        self,
-        change: &SettingChange,
-        key_count: u16,
-        previous_socd_len: usize,
-        previous_rs_len: usize,
-    ) -> CoreResult<Vec<Vec<u8>>> {
+    fn encode(self, change: &SettingChange, current: &DeviceSnapshot) -> CoreResult<Vec<Vec<u8>>> {
         match self {
             Self::LamzuAtlantis(family) => encode_lamzu(family, change),
-            Self::AtkRs7 => encode_atk(change, key_count, previous_socd_len, previous_rs_len),
+            Self::AtkRs7 => {
+                let (key_count, previous_socd_len, previous_rs_len) =
+                    current.hall_effect.as_ref().map_or((0, 0, 0), |he| {
+                        (
+                            he.capabilities.key_count,
+                            he.snapshot.socd_pairs.len(),
+                            he.snapshot.rapid_switch_pairs.len(),
+                        )
+                    });
+                encode_atk(change, key_count, previous_socd_len, previous_rs_len)
+            }
+            Self::Razer(profile) => brands::encode_razer(profile, change, current),
+            Self::Pulsar => brands::encode_pulsar(change),
+            Self::Via { cols } => brands::encode_via(cols, change, current),
+            Self::Wooting(profile) => brands::encode_wooting(profile, change),
         }
     }
 }
@@ -102,6 +132,12 @@ fn encode_lamzu(family: AtlantisRateFamily, change: &SettingChange) -> CoreResul
         }
         SettingChange::Pointer(PointerChange::MotionSync(enabled)) => {
             vec![lamzu_flash_u8(flash::MOTION_SYNC, u8::from(*enabled))?]
+        }
+        SettingChange::Pointer(PointerChange::AngleSnapping(enabled)) => {
+            vec![lamzu_flash_u8(flash::ANGLE_SNAPPING, u8::from(*enabled))?]
+        }
+        SettingChange::Pointer(PointerChange::RippleControl(enabled)) => {
+            vec![lamzu_flash_u8(flash::RIPPLE_CONTROL, u8::from(*enabled))?]
         }
         SettingChange::Profile(slot) => {
             let frame =
@@ -306,6 +342,8 @@ fn open_mock_transport(
 struct MockDevice {
     descriptor: HidDeviceDescriptor,
     codec: MockCodec,
+    /// Factory state restored by a keymap reset.
+    factory: DeviceSnapshot,
     /// The emulated device's stored state; only writes outside dry-run change it.
     stored: DeviceSnapshot,
     presented: DeviceSnapshot,
@@ -323,6 +361,7 @@ impl MockDevice {
         Self {
             descriptor,
             codec,
+            factory: snapshot.clone(),
             presented: snapshot.clone(),
             stored: snapshot,
             transport,
@@ -353,17 +392,32 @@ impl MockDevice {
                 reply[6] = 0x07;
                 (atk::wrap_tx(request).to_vec(), reply.to_vec())
             }
+            MockCodec::Razer(profile) => brands::razer_status_query(profile)?,
+            MockCodec::Pulsar => brands::pulsar_status_query(self.stored.battery)?,
+            MockCodec::Via { .. } => brands::via_status_query(),
+            MockCodec::Wooting(_) => brands::wooting_status_query(),
         };
-        self.transport.send_query_output_report(&request)?;
+        let kind = self.codec.report_kind();
+        if kind == ReportKind::Feature {
+            self.transport.send_query_feature_report(&request)?;
+        } else {
+            self.transport.send_query_output_report(&request)?;
+        }
 
         // The guarded transport exposes its inner mock only immutably, so the scripted
         // reply is read through a second guarded reader that shares the same sink.
         let mut responder = MockHidTransport::new(self.descriptor.clone());
-        responder.push_input_response(reply);
         let sink: Arc<dyn PacketSink> = sink.clone();
-        let mut reader = GuardedTransport::new(responder).with_sink(sink);
-        let mut buf = [0u8; 64];
-        reader.read_input_report(&mut buf, std::time::Duration::from_millis(1))?;
+        let mut buf = vec![0u8; reply.len().max(64)];
+        if kind == ReportKind::Feature {
+            responder.push_feature_response(reply);
+            let mut reader = GuardedTransport::new(responder).with_sink(sink);
+            reader.get_feature_report(&mut buf)?;
+        } else {
+            responder.push_input_response(reply);
+            let mut reader = GuardedTransport::new(responder).with_sink(sink);
+            reader.read_input_report(&mut buf, std::time::Duration::from_millis(1))?;
+        }
         Ok(())
     }
 }
@@ -409,6 +463,22 @@ impl MockPeripheralService {
                 atk_rs7_snapshot(),
                 &service.sink,
             ));
+        }
+        service
+    }
+
+    /// Creates the representative pair plus one emulated device per newer capability mix:
+    /// a Razer mouse with RGB, a Pulsar mouse with Medium lift-off, a QMK/VIA Keychron
+    /// keyboard without Hall Effect, and a Wooting 60HE with a readonly actuation table.
+    pub fn multi_brand() -> Self {
+        let service = Self::new();
+        {
+            let mut state = lock(&service.state);
+            for (descriptor, codec, snapshot) in brands::fixtures() {
+                state
+                    .devices
+                    .push(MockDevice::new(descriptor, codec, snapshot, &service.sink));
+            }
         }
         service
     }
@@ -463,38 +533,31 @@ impl PeripheralService for MockPeripheralService {
             .ok_or_else(|| ApplyError::rejected(CoreError::DeviceNotFound(device.to_string())))?;
 
         validate_change(&target.presented, &change).map_err(ApplyError::rejected)?;
-        let (key_count, previous_socd_len, previous_rs_len) = target
-            .presented
-            .hall_effect
-            .as_ref()
-            .map_or((0, 0, 0), |he| {
-                (
-                    he.capabilities.key_count,
-                    he.snapshot.socd_pairs.len(),
-                    he.snapshot.rapid_switch_pairs.len(),
-                )
-            });
         let frames = target
             .codec
-            .encode(&change, key_count, previous_socd_len, previous_rs_len)
+            .encode(&change, &target.presented)
             .map_err(ApplyError::rejected)?;
+        let is_feature = target.codec.report_kind() == ReportKind::Feature;
         for frame in frames {
-            target
-                .transport
-                .send_output_report(&frame)
-                .map_err(|err| ApplyError::failed_after_send(err.into(), None))?;
+            let sent = if is_feature {
+                target.transport.send_feature_report(&frame)
+            } else {
+                target.transport.send_output_report(&frame).map(|_| ())
+            };
+            sent.map_err(|err| ApplyError::failed_after_send(err.into(), None))?;
         }
 
+        let is_reset = matches!(change, SettingChange::ResetKeymap);
         if dry_run {
             apply_change_to_snapshot(&mut target.presented, &change);
-            if matches!(change, SettingChange::ResetKeymap) {
-                target.presented.keymap = atk_rs7_snapshot().keymap;
+            if is_reset {
+                target.presented.keymap = target.factory.keymap.clone();
             }
             target.presented.is_preview = true;
         } else {
             apply_change_to_snapshot(&mut target.stored, &change);
-            if matches!(change, SettingChange::ResetKeymap) {
-                target.stored.keymap = atk_rs7_snapshot().keymap;
+            if is_reset {
+                target.stored.keymap = target.factory.keymap.clone();
             }
             target.presented = target.stored.clone();
         }
@@ -952,9 +1015,7 @@ mod tests {
                     target: ActuationTarget::AllKeys,
                     point: travel(150),
                 },
-                atk::RS7_KEY_COUNT,
-                0,
-                0,
+                &atk_rs7_snapshot(),
             )
             .unwrap();
         assert_eq!(frames.len(), 9);
@@ -969,13 +1030,13 @@ mod tests {
     #[test]
     fn lamzu_dpi_stage_frames_pass_the_checksum_validator() {
         let snapshot = lamzu_atlantis_snapshot();
-        let pointer = snapshot.pointer.unwrap();
+        let pointer = snapshot.pointer.clone().unwrap();
         let change = SettingChange::Pointer(PointerChange::DpiStages {
             stages: pointer.snapshot.dpi_stages,
             active: 2,
         });
         let frames = MockCodec::LamzuAtlantis(AtlantisRateFamily::Wired)
-            .encode(&change, 0, 0, 0)
+            .encode(&change, &snapshot)
             .unwrap();
         assert_eq!(frames.len(), 1 + 4 * 2 + 1);
         let validator = atlantis::atlantis_validator();
@@ -984,5 +1045,130 @@ mod tests {
                 .validate_outgoing(ReportKind::Output, frame)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn multi_brand_lists_every_capability_mix_and_refreshes() {
+        let service = MockPeripheralService::multi_brand();
+        let devices = service.refresh().unwrap();
+        let ids: Vec<&str> = devices.iter().map(|d| d.id().as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                MOCK_MOUSE_ID,
+                MOCK_KEYBOARD_ID,
+                MOCK_RAZER_ID,
+                MOCK_PULSAR_ID,
+                MOCK_VIA_ID,
+                MOCK_WOOTING_ID
+            ]
+        );
+        let razer = &devices[2];
+        assert!(razer.capabilities.has_pointer() && razer.capabilities.has_rgb());
+        let via = &devices[4];
+        assert!(via.capabilities.has_keymap() && !via.capabilities.has_hall_effect());
+    }
+
+    #[test]
+    fn new_codec_writes_pass_their_driver_validators() {
+        let service = MockPeripheralService::multi_brand();
+        service.refresh().unwrap();
+        service.set_dry_run(false);
+        service.clear_packet_log();
+
+        let razer = DeviceId::new(MOCK_RAZER_ID);
+        let after = service
+            .apply_rgb(
+                &razer,
+                RgbZoneId::new(4),
+                RgbEffect::Static {
+                    color: RgbColor::new(0, 0, 255),
+                },
+                Brightness::new(50).unwrap(),
+            )
+            .unwrap();
+        let logo = after.rgb.unwrap().snapshot.zones;
+        assert!(logo.iter().any(|z| z.zone == RgbZoneId::new(4)
+            && z.effect
+                == RgbEffect::Static {
+                    color: RgbColor::new(0, 0, 255)
+                }));
+
+        let pulsar = DeviceId::new(MOCK_PULSAR_ID);
+        let after = service
+            .apply_pointer_settings(
+                &pulsar,
+                PointerChange::LiftOffDistance(LiftOffDistance::High),
+            )
+            .unwrap();
+        assert_eq!(
+            after.pointer.unwrap().snapshot.lod,
+            Some(LiftOffDistance::High)
+        );
+        let after = service
+            .apply_pointer_settings(&pulsar, PointerChange::AngleSnapping(true))
+            .unwrap();
+        assert_eq!(after.pointer.unwrap().snapshot.angle_snapping, Some(true));
+
+        let via = DeviceId::new(MOCK_VIA_ID);
+        let after = service
+            .apply(
+                &via,
+                SettingChange::KeyBinding {
+                    layer: 1,
+                    key: KeyIndex::new(17),
+                    code: KeyCode::standard(0x04),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            after.keymap.unwrap().snapshot.layers[1][17],
+            KeyCode::standard(0x04)
+        );
+
+        let log = service.packet_log();
+        assert_ne!(log.len(), 0);
+        assert!(
+            log.iter()
+                .all(|entry| entry.outcome == PacketOutcome::Transmitted)
+        );
+    }
+
+    #[test]
+    fn readonly_wooting_actuation_is_rejected_before_send() {
+        let service = MockPeripheralService::multi_brand();
+        service.refresh().unwrap();
+        service.set_dry_run(false);
+        service.clear_packet_log();
+        let err = service
+            .apply_actuation(
+                &DeviceId::new(MOCK_WOOTING_ID),
+                ActuationTarget::AllKeys,
+                travel(150),
+            )
+            .unwrap_err();
+        assert!(err.rejected_before_send);
+        assert!(matches!(err.error, CoreError::UnsupportedCapability(_)));
+        assert_eq!(service.packet_log(), Vec::new());
+    }
+
+    #[test]
+    fn keymap_reset_restores_the_devices_own_factory_layers() {
+        let service = MockPeripheralService::multi_brand();
+        service.refresh().unwrap();
+        let via = DeviceId::new(MOCK_VIA_ID);
+        let factory = service.refresh().unwrap()[4].keymap.clone();
+        service
+            .apply(
+                &via,
+                SettingChange::KeyBinding {
+                    layer: 0,
+                    key: KeyIndex::new(0),
+                    code: KeyCode::standard(0x04),
+                },
+            )
+            .unwrap();
+        let reset = service.apply(&via, SettingChange::ResetKeymap).unwrap();
+        assert_eq!(reset.keymap, factory);
     }
 }

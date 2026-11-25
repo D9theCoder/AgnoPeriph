@@ -20,8 +20,15 @@ use agnoperiph_core::{
     TravelHundredthsMm,
 };
 use agnoperiph_driver_atk::AtkRs7Device;
+use agnoperiph_driver_endgame_gear::EndgameGearDevice;
+use agnoperiph_driver_finalmouse::FinalmouseDevice;
 use agnoperiph_driver_lamzu::LamzuAtlantisDevice;
 use agnoperiph_driver_logitech::LogitechHidppDevice;
+use agnoperiph_driver_pulsar::PulsarDevice;
+use agnoperiph_driver_razer::RazerDevice;
+use agnoperiph_driver_via::ViaKeyboardDevice;
+use agnoperiph_driver_wlmouse::WLmouseDevice;
+use agnoperiph_driver_wooting::WootingDevice;
 use agnoperiph_transport::{
     HidDeviceDescriptor, HidEnumerator, HidTransport, HidapiEnumerator, MemoryPacketSink,
     PacketSink, PacketTraceEntry, TransportResult,
@@ -29,7 +36,10 @@ use agnoperiph_transport::{
 
 mod mock;
 
-pub use mock::{MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MockPeripheralService};
+pub use mock::{
+    MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID,
+    MockPeripheralService,
+};
 
 /// Packet frames retained by the live HID packet inspector.
 pub const PACKET_LOG_CAPACITY: usize = 500;
@@ -180,6 +190,8 @@ pub enum PointerChange {
     LiftOffDistance(LiftOffDistance),
     Debounce(DebounceMs),
     MotionSync(bool),
+    AngleSnapping(bool),
+    RippleControl(bool),
 }
 
 /// Scope of an actuation point change.
@@ -705,6 +717,20 @@ fn validate_pointer_change(pointer: &PointerState, change: &PointerChange) -> Co
                 Err(CoreError::UnsupportedCapability("motion_sync"))
             }
         }
+        PointerChange::AngleSnapping(_) => {
+            if caps.supports_angle_snapping {
+                Ok(())
+            } else {
+                Err(CoreError::UnsupportedCapability("angle_snapping"))
+            }
+        }
+        PointerChange::RippleControl(_) => {
+            if caps.supports_ripple_control {
+                Ok(())
+            } else {
+                Err(CoreError::UnsupportedCapability("ripple_control"))
+            }
+        }
     }
 }
 
@@ -869,6 +895,8 @@ fn apply_pointer_change(snapshot: &mut PointerSnapshot, change: &PointerChange) 
         PointerChange::LiftOffDistance(lod) => snapshot.lod = Some(*lod),
         PointerChange::Debounce(debounce) => snapshot.debounce_ms = Some(*debounce),
         PointerChange::MotionSync(enabled) => snapshot.motion_sync = Some(*enabled),
+        PointerChange::AngleSnapping(enabled) => snapshot.angle_snapping = Some(*enabled),
+        PointerChange::RippleControl(enabled) => snapshot.ripple_control = Some(*enabled),
     }
 }
 
@@ -982,6 +1010,8 @@ fn apply_to_peripheral(peripheral: &mut dyn Peripheral, change: &SettingChange) 
                 PointerChange::LiftOffDistance(lod) => pointer.set_lod(*lod),
                 PointerChange::Debounce(debounce) => pointer.set_debounce_ms(*debounce),
                 PointerChange::MotionSync(enabled) => pointer.set_motion_sync(*enabled),
+                PointerChange::AngleSnapping(enabled) => pointer.set_angle_snapping(*enabled),
+                PointerChange::RippleControl(enabled) => pointer.set_ripple_control(*enabled),
             }
         }
         SettingChange::Actuation { target, point } => {
@@ -1098,6 +1128,13 @@ fn build_registry() -> DeviceRegistry {
     registry.register_driver(agnoperiph_driver_logitech::driver_descriptor());
     registry.register_driver(agnoperiph_driver_lamzu::driver_descriptor());
     registry.register_driver(agnoperiph_driver_atk::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_razer::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_pulsar::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_finalmouse::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_wlmouse::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_endgame_gear::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_wooting::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_via::driver_descriptor());
     registry
 }
 
@@ -1121,6 +1158,25 @@ fn open_driver(
             Some(sink),
         )?)),
         "atk-rs7" => Ok(Box::new(AtkRs7Device::open(wrapped, dry_run, Some(sink))?)),
+        "razer-hid" => Ok(Box::new(RazerDevice::open(wrapped, dry_run, Some(sink))?)),
+        "pulsar-hid" => Ok(Box::new(PulsarDevice::open(wrapped, dry_run, Some(sink))?)),
+        "finalmouse-hid" => Ok(Box::new(FinalmouseDevice::open(
+            wrapped,
+            dry_run,
+            Some(sink),
+        )?)),
+        "wlmouse-hid" => Ok(Box::new(WLmouseDevice::open(wrapped, dry_run, Some(sink))?)),
+        "endgame-gear-hid" => Ok(Box::new(EndgameGearDevice::open(
+            wrapped,
+            dry_run,
+            Some(sink),
+        )?)),
+        "wooting-he" => Ok(Box::new(WootingDevice::open(wrapped, dry_run, Some(sink))?)),
+        "qmk-via" => Ok(Box::new(ViaKeyboardDevice::open(
+            wrapped,
+            dry_run,
+            Some(sink),
+        )?)),
         other => Err(CoreError::DeviceNotFound(format!(
             "no driver registered as '{other}'"
         ))),
@@ -1137,7 +1193,7 @@ struct LiveState {
     devices: Vec<LiveDevice>,
 }
 
-/// Real Windows HID backend driving Logitech, Lamzu and ATK peripherals through `hidapi`.
+/// Real Windows HID backend driving every registered peripheral driver through `hidapi`.
 ///
 /// Starts in dry-run mode. Because each driver fixes dry-run at `open()`, changing the
 /// mode closes every handle under the same lock, so a write can never reach a handle
@@ -1333,9 +1389,13 @@ impl PeripheralService for LiveHidService {
             return Ok(target.snapshot.clone());
         }
 
+        let sequence_before = self.sink.next.load(Ordering::Relaxed);
         if let Err(err) = apply_to_peripheral(state.devices[target_ix].peripheral.as_mut(), &change)
         {
-            if dry_run {
+            // A driver that refuses a write it cannot express (e.g. Wooting's readonly actuation
+            // table) fails before tracing any frame; only then is it safe to skip the re-read.
+            let nothing_sent = self.sink.next.load(Ordering::Relaxed) == sequence_before;
+            if dry_run || nothing_sent {
                 return Err(ApplyError::rejected(err));
             }
             // Changing USB polling rate resets the keyboard's USB interface immediately; drop the

@@ -14,7 +14,10 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agnoperiph::backend::{MOCK_KEYBOARD_ID, MockPeripheralService, PeripheralService};
+use agnoperiph::backend::{
+    MOCK_KEYBOARD_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID,
+    MockPeripheralService, PeripheralService,
+};
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, device_element_id};
 use agnoperiph_core::DeviceId;
 use gpui_kit::component::{Theme, ThemeMode};
@@ -27,6 +30,8 @@ use gpui_kit::{
 
 const WIDTH: f32 = 1240.;
 const HEIGHT: f32 = 820.;
+/// Taller window for mouse views, so every sensor row below the DPI table is on screen.
+const TALL_HEIGHT: f32 = 1100.;
 
 fn screenshot_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-screenshots");
@@ -104,10 +109,18 @@ fn headless() -> HeadlessAppContext {
 }
 
 fn open(cx: &mut HeadlessAppContext) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
+    open_with(cx, MockPeripheralService::new(), HEIGHT)
+}
+
+fn open_with(
+    cx: &mut HeadlessAppContext,
+    service: MockPeripheralService,
+    height: f32,
+) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
     cx.update(gpui_kit::init);
-    let service: Arc<dyn PeripheralService> = Arc::new(MockPeripheralService::new());
+    let service: Arc<dyn PeripheralService> = Arc::new(service);
     let window = cx
-        .open_window(size(px(WIDTH), px(HEIGHT)), |window, cx| {
+        .open_window(size(px(WIDTH), px(height)), |window, cx| {
             AgnoPeriphApp::build(
                 service,
                 AppOptions::default().with_dev_tools(false),
@@ -181,5 +194,62 @@ fn capture_keyboard_screens() {
         save(&mut cx, handle, &format!("lighting-{suffix}"));
         open_tab(&mut cx, handle, KeyboardTab::Keybinds);
         save(&mut cx, handle, &format!("keybinds-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_multi_brand_screens() {
+    let mut cx = headless();
+    let (handle, app) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
+    let (tall, _) = open_with(&mut cx, MockPeripheralService::multi_brand(), TALL_HEIGHT);
+
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, tall, mode);
+        click(
+            &mut cx,
+            tall,
+            device_element_id(&DeviceId::new(MOCK_PULSAR_ID)),
+        );
+        save(&mut cx, tall, &format!("mouse-sensor-{suffix}"));
+        click(
+            &mut cx,
+            tall,
+            device_element_id(&DeviceId::new(MOCK_RAZER_ID)),
+        );
+        save(&mut cx, tall, &format!("mouse-rgb-{suffix}"));
+
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_VIA_ID)),
+        );
+        save(&mut cx, handle, &format!("via-keybinds-{suffix}"));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.set_keyboard_tab(KeyboardTab::Lighting, cx);
+            });
+        });
+        save(&mut cx, handle, &format!("via-lighting-{suffix}"));
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.set_keyboard_tab(KeyboardTab::Keybinds, cx);
+            });
+        });
+
+        // Own window, so the expected error banner stays out of the other views.
+        let (wooting, _) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
+        set_theme(&mut cx, wooting, mode);
+        click(
+            &mut cx,
+            wooting,
+            device_element_id(&DeviceId::new(MOCK_WOOTING_ID)),
+        );
+        save(&mut cx, wooting, &format!("wooting-triggers-{suffix}"));
+        click(&mut cx, wooting, ("key", 14u64));
+        click(&mut cx, wooting, "actuation-inc");
+        click(&mut cx, wooting, "apply-actuation-key");
+        save(&mut cx, wooting, &format!("wooting-unsupported-{suffix}"));
     }
 }

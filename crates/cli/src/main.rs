@@ -6,12 +6,20 @@ use std::sync::Arc;
 
 use agnoperiph_core::{
     BatteryStatus, DebounceMs, DeviceInfo, DeviceRegistry, DpiStage, DpiValue, HallEffectSnapshot,
-    KeyIndex, LiftOffDistance, Peripheral, PointerSnapshot, PollingRateHz, ProfileSlot,
-    ProfileSnapshot, RapidTriggerConfig, RgbSnapshot, TravelHundredthsMm,
+    KeyIndex, KeymapSnapshot, LiftOffDistance, MacroSlot, Peripheral, PointerSnapshot,
+    PollingRateHz, ProfileSlot, ProfileSnapshot, RapidTriggerConfig, RgbSnapshot,
+    TravelHundredthsMm,
 };
 use agnoperiph_driver_atk::AtkRs7Device;
+use agnoperiph_driver_endgame_gear::EndgameGearDevice;
+use agnoperiph_driver_finalmouse::FinalmouseDevice;
 use agnoperiph_driver_lamzu::LamzuAtlantisDevice;
 use agnoperiph_driver_logitech::LogitechHidppDevice;
+use agnoperiph_driver_pulsar::PulsarDevice;
+use agnoperiph_driver_razer::RazerDevice;
+use agnoperiph_driver_via::ViaKeyboardDevice;
+use agnoperiph_driver_wlmouse::WLmouseDevice;
+use agnoperiph_driver_wooting::WootingDevice;
 use agnoperiph_transport::{
     HidDeviceDescriptor, HidEnumerator, HidTransport, HidapiEnumerator, NoOpPacketSink, PacketSink,
     TracingPacketSink,
@@ -106,6 +114,14 @@ enum Command {
         #[arg(long)]
         motion_sync: Option<bool>,
 
+        /// Enable or disable sensor angle snapping.
+        #[arg(long)]
+        angle_snapping: Option<bool>,
+
+        /// Enable or disable sensor ripple control.
+        #[arg(long)]
+        ripple_control: Option<bool>,
+
         /// Select onboard profile slot (zero-based index).
         #[arg(long)]
         profile_slot: Option<u8>,
@@ -139,6 +155,8 @@ struct ProbedDeviceReport {
     battery: Option<BatteryStatus>,
     pointer: Option<PointerSnapshot>,
     hall_effect: Option<HallEffectSnapshot>,
+    keymap: Option<KeymapSnapshot>,
+    macros: Option<Vec<MacroSlot>>,
     rgb: Option<RgbSnapshot>,
     profiles: Option<ProfileSnapshot>,
     warnings: Vec<String>,
@@ -170,6 +188,8 @@ fn main() -> Result<()> {
             lod_tenths_mm,
             debounce_ms,
             motion_sync,
+            angle_snapping,
+            ripple_control,
             profile_slot,
             actuation_hundredths_mm,
             key_index,
@@ -185,6 +205,8 @@ fn main() -> Result<()> {
                 lod_tenths_mm,
                 debounce_ms,
                 motion_sync,
+                angle_snapping,
+                ripple_control,
                 profile_slot,
                 actuation_hundredths_mm,
                 key_index,
@@ -205,6 +227,8 @@ struct SetParams {
     lod_tenths_mm: Option<u8>,
     debounce_ms: Option<u8>,
     motion_sync: Option<bool>,
+    angle_snapping: Option<bool>,
+    ripple_control: Option<bool>,
     profile_slot: Option<u8>,
     actuation_hundredths_mm: Option<u16>,
     key_index: Option<u16>,
@@ -218,6 +242,13 @@ fn build_registry() -> DeviceRegistry {
     registry.register_driver(agnoperiph_driver_logitech::driver_descriptor());
     registry.register_driver(agnoperiph_driver_lamzu::driver_descriptor());
     registry.register_driver(agnoperiph_driver_atk::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_razer::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_pulsar::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_finalmouse::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_wlmouse::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_endgame_gear::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_wooting::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_via::driver_descriptor());
     registry
 }
 
@@ -358,6 +389,41 @@ fn open_matched_driver(
                 .context("failed to probe ATK RS7 Hall Effect keyboard")?;
             Ok(Box::new(dev))
         }
+        "razer-hid" => {
+            let dev = RazerDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe Razer HID peripheral")?;
+            Ok(Box::new(dev))
+        }
+        "pulsar-hid" => {
+            let dev = PulsarDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe Pulsar mouse")?;
+            Ok(Box::new(dev))
+        }
+        "finalmouse-hid" => {
+            let dev = FinalmouseDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe Finalmouse peripheral")?;
+            Ok(Box::new(dev))
+        }
+        "wlmouse-hid" => {
+            let dev = WLmouseDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe WLmouse peripheral")?;
+            Ok(Box::new(dev))
+        }
+        "endgame-gear-hid" => {
+            let dev = EndgameGearDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe Endgame Gear mouse")?;
+            Ok(Box::new(dev))
+        }
+        "wooting-he" => {
+            let dev = WootingDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe Wooting Hall Effect keyboard")?;
+            Ok(Box::new(dev))
+        }
+        "qmk-via" => {
+            let dev = ViaKeyboardDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe QMK/VIA keyboard")?;
+            Ok(Box::new(dev))
+        }
         other => bail!("unsupported driver id '{other}'"),
     }
 }
@@ -371,7 +437,7 @@ fn run_probe(
 ) -> Result<()> {
     if !as_json {
         eprintln!(
-            "Reminder: Fully exit official vendor apps (G Hub, ATK HUB, Lamzu software, including tray icons) before live HID probing."
+            "Reminder: Fully exit official vendor apps (G Hub, Razer Synapse, ATK HUB, Lamzu, Pulsar, Wootility, etc., including tray icons) before live HID probing."
         );
     }
 
@@ -458,6 +524,24 @@ fn collect_probe_report(driver_id: String, peripheral: &mut dyn Peripheral) -> P
                     None
                 }
             });
+    let keymap = peripheral
+        .as_keymap_mut()
+        .and_then(|km| match km.read_keymap() {
+            Ok(snap) => Some(snap),
+            Err(err) => {
+                warnings.push(format!("keymap: {err}"));
+                None
+            }
+        });
+    let macros = peripheral
+        .as_macros_mut()
+        .and_then(|mc| match mc.read_macros() {
+            Ok(slots) => Some(slots),
+            Err(err) => {
+                warnings.push(format!("macros: {err}"));
+                None
+            }
+        });
     let rgb = peripheral
         .as_rgb_mut()
         .and_then(|r| match r.read_rgb_state() {
@@ -483,6 +567,8 @@ fn collect_probe_report(driver_id: String, peripheral: &mut dyn Peripheral) -> P
         battery,
         pointer,
         hall_effect,
+        keymap,
+        macros,
         rgb,
         profiles,
         warnings,
@@ -552,41 +638,20 @@ fn print_single_probe_report(report: &ProbedDeviceReport) {
         }
     }
     if let Some(he) = &report.hall_effect {
-        let min_act = he
-            .keys
-            .iter()
-            .map(|k| k.actuation)
-            .min()
-            .unwrap_or(TravelHundredthsMm::from_hundredths(0));
-        let max_act = he
-            .keys
-            .iter()
-            .map(|k| k.actuation)
-            .max()
-            .unwrap_or(TravelHundredthsMm::from_hundredths(0));
-        let rt_on = he
-            .keys
-            .iter()
-            .filter(|k| k.rapid_trigger.is_enabled())
-            .count();
-        let dz = he
-            .keys
-            .first()
-            .map_or((None, None), |k| (k.top_deadzone, k.bottom_deadzone));
+        print_hall_effect_summary(he);
+    }
+    if let Some(km) = &report.keymap {
+        let total_bindings: usize = km.layers.iter().map(Vec::len).sum();
         println!(
-            "  HallEff  : keys={}, actuation={}..{}, rt_enabled={}/{}, socd_pairs={}, dks={}, calibration={:?}",
-            he.keys.len(),
-            min_act,
-            max_act,
-            rt_on,
-            he.keys.len(),
-            he.socd_pairs.len(),
-            he.dks_bindings.len(),
-            he.calibration
+            "  Keymap   : layers={}, active={}, bindings={}",
+            km.layers.len(),
+            km.active_layer,
+            total_bindings
         );
-        if dz.0.is_some() || dz.1.is_some() {
-            println!("  Deadzone : top={:?}, bottom={:?}", dz.0, dz.1);
-        }
+    }
+    if let Some(macros) = &report.macros {
+        let used = macros.iter().filter(|m| !m.steps.is_empty()).count();
+        println!("  Macros   : {used}/{} slot(s) programmed", macros.len());
     }
     if let Some(rgb) = &report.rgb {
         for zone in &rgb.zones {
@@ -611,6 +676,44 @@ fn print_single_probe_report(report: &ProbedDeviceReport) {
     }
 }
 
+fn print_hall_effect_summary(he: &HallEffectSnapshot) {
+    let min_act = he
+        .keys
+        .iter()
+        .map(|k| k.actuation)
+        .min()
+        .unwrap_or(TravelHundredthsMm::from_hundredths(0));
+    let max_act = he
+        .keys
+        .iter()
+        .map(|k| k.actuation)
+        .max()
+        .unwrap_or(TravelHundredthsMm::from_hundredths(0));
+    let rt_on = he
+        .keys
+        .iter()
+        .filter(|k| k.rapid_trigger.is_enabled())
+        .count();
+    let dz = he
+        .keys
+        .first()
+        .map_or((None, None), |k| (k.top_deadzone, k.bottom_deadzone));
+    println!(
+        "  HallEff  : keys={}, actuation={}..{}, rt_enabled={}/{}, socd_pairs={}, dks={}, calibration={:?}",
+        he.keys.len(),
+        min_act,
+        max_act,
+        rt_on,
+        he.keys.len(),
+        he.socd_pairs.len(),
+        he.dks_bindings.len(),
+        he.calibration
+    );
+    if dz.0.is_some() || dz.1.is_some() {
+        println!("  Deadzone : top={:?}, bottom={:?}", dz.0, dz.1);
+    }
+}
+
 fn run_set(
     vid: u16,
     pid: u16,
@@ -619,7 +722,7 @@ fn run_set(
     sink: &Arc<dyn PacketSink>,
 ) -> Result<()> {
     eprintln!(
-        "Reminder: Fully exit official vendor apps (G Hub, ATK HUB, Lamzu software) before live HID writes (dry_run={dry_run})."
+        "Reminder: Fully exit official vendor apps (G Hub, Razer Synapse, ATK HUB, Lamzu, Pulsar, Wootility, etc.) before live HID writes (dry_run={dry_run})."
     );
 
     let enumerator = HidapiEnumerator::new();
@@ -693,6 +796,22 @@ fn run_set(
             .context("device does not expose PointerDevice capability")?;
         ptr.set_motion_sync(enabled)?;
         println!("Applied motion_sync={enabled} (dry_run={dry_run}).");
+    }
+
+    if let Some(enabled) = params.angle_snapping {
+        let ptr = peripheral
+            .as_pointer_mut()
+            .context("device does not expose PointerDevice capability")?;
+        ptr.set_angle_snapping(enabled)?;
+        println!("Applied angle_snapping={enabled} (dry_run={dry_run}).");
+    }
+
+    if let Some(enabled) = params.ripple_control {
+        let ptr = peripheral
+            .as_pointer_mut()
+            .context("device does not expose PointerDevice capability")?;
+        ptr.set_ripple_control(enabled)?;
+        println!("Applied ripple_control={enabled} (dry_run={dry_run}).");
     }
 
     if let Some(slot) = params.profile_slot {
@@ -789,8 +908,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_registers_all_three_vendor_drivers() {
+    fn registry_registers_all_vendor_drivers() {
         let registry = build_registry();
-        assert_eq!(registry.drivers().len(), 3);
+        assert_eq!(registry.drivers().len(), 10);
     }
 }

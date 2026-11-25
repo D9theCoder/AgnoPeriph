@@ -115,8 +115,15 @@ version = "0.1.0"
 dependencies = [
  "agnoperiph-core",
  "agnoperiph-driver-atk",
+ "agnoperiph-driver-endgame-gear",
+ "agnoperiph-driver-finalmouse",
  "agnoperiph-driver-lamzu",
  "agnoperiph-driver-logitech",
+ "agnoperiph-driver-pulsar",
+ "agnoperiph-driver-razer",
+ "agnoperiph-driver-via",
+ "agnoperiph-driver-wlmouse",
+ "agnoperiph-driver-wooting",
  "agnoperiph-transport",
  "anyhow",
  "gpui-fast-wgpu",
@@ -137,8 +144,15 @@ version = "0.1.0"
 dependencies = [
  "agnoperiph-core",
  "agnoperiph-driver-atk",
+ "agnoperiph-driver-endgame-gear",
+ "agnoperiph-driver-finalmouse",
  "agnoperiph-driver-lamzu",
  "agnoperiph-driver-logitech",
+ "agnoperiph-driver-pulsar",
+ "agnoperiph-driver-razer",
+ "agnoperiph-driver-via",
+ "agnoperiph-driver-wlmouse",
+ "agnoperiph-driver-wooting",
  "agnoperiph-transport",
  "anyhow",
  "clap",
@@ -169,6 +183,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "agnoperiph-driver-endgame-gear"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "agnoperiph-driver-finalmouse"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "agnoperiph-driver-lamzu"
 version = "0.1.0"
 dependencies = [
@@ -181,6 +217,61 @@ dependencies = [
 
 [[package]]
 name = "agnoperiph-driver-logitech"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "agnoperiph-driver-pulsar"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "agnoperiph-driver-razer"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "agnoperiph-driver-via"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "agnoperiph-driver-wlmouse"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "agnoperiph-driver-wooting"
 version = "0.1.0"
 dependencies = [
  "agnoperiph-core",

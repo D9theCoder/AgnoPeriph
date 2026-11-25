@@ -496,6 +496,8 @@ struct ZoneSupport {
     speed: bool,
     colorful: bool,
     is_colorful: bool,
+    /// Whether any preset on the device has a full color mode, so the switch is worth showing.
+    offers_colorful: bool,
 }
 
 pub(crate) fn render(
@@ -524,6 +526,12 @@ pub(crate) fn render(
         ),
         colorful: preset.as_ref().is_some_and(|p| p.supports_colorful),
         is_colorful: matches!(state.effect, RgbEffect::Preset { colorful: true, .. }),
+        offers_colorful: rgb
+            .capabilities
+            .zones
+            .iter()
+            .flat_map(|zone| &zone.presets)
+            .any(|p| p.supports_colorful),
     };
 
     let effects = render_effects(app, &info, state, rgb, busy, cx);
@@ -1005,20 +1013,22 @@ fn render_color(
         .min_w_72()
         .gap_3()
         .child(
-            column_title("Color settings", theme).child(
-                Switch::new("rgb-colorful")
-                    .label("Full color mode")
-                    .checked(support.is_colorful)
-                    .disabled(busy || !support.colorful)
-                    .tooltip(if support.colorful {
-                        "Cycle through every color instead of one"
-                    } else {
-                        "This effect has no full color mode"
-                    })
-                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                        this.set_colorful(*checked, cx);
-                    })),
-            ),
+            column_title("Color settings", theme).when(support.offers_colorful, |this| {
+                this.child(
+                    Switch::new("rgb-colorful")
+                        .label("Full color mode")
+                        .checked(support.is_colorful)
+                        .disabled(busy || !support.colorful)
+                        .tooltip(if support.colorful {
+                            "Cycle through every color instead of one"
+                        } else {
+                            "This effect has no full color mode"
+                        })
+                        .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                            this.set_colorful(*checked, cx);
+                        })),
+                )
+            }),
         )
         .child(
             h_flex()

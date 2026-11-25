@@ -12,8 +12,15 @@ path = "src/main.rs"
 [dependencies]
 agnoperiph-core = { workspace = true }
 agnoperiph-driver-atk = { workspace = true }
+agnoperiph-driver-endgame-gear = { workspace = true }
+agnoperiph-driver-finalmouse = { workspace = true }
 agnoperiph-driver-lamzu = { workspace = true }
 agnoperiph-driver-logitech = { workspace = true }
+agnoperiph-driver-pulsar = { workspace = true }
+agnoperiph-driver-razer = { workspace = true }
+agnoperiph-driver-via = { workspace = true }
+agnoperiph-driver-wlmouse = { workspace = true }
+agnoperiph-driver-wooting = { workspace = true }
 agnoperiph-transport = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

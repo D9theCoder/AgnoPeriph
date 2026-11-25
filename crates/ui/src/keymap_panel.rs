@@ -182,6 +182,29 @@ fn keymap_select(
     app.select_key(key, false, cx);
 }
 
+/// Grid for a keyboard without a physical layout table, with each key named after what it
+/// sends on the base layer (as VIA does). Only standard HID usages (`class 0x00`) are named;
+/// unused positions and vendor-specific codes keep their `R#C#` name.
+fn base_keycode_grid(keymap: &KeymapState) -> KeyLayout {
+    let caps = &keymap.capabilities;
+    let mut layout = KeyLayout::grid(
+        u16::from(caps.rows) * u16::from(caps.cols),
+        u16::from(caps.cols),
+    );
+    let Some(base) = keymap.snapshot.layers.first() else {
+        return layout;
+    };
+    for cap in layout.rows.iter_mut().flatten() {
+        if let Some(&code) = base.get(usize::from(cap.index.value()))
+            && code.class == 0x00
+            && code.id > 0x01
+        {
+            cap.label = keycode_name(code).into();
+        }
+    }
+    layout
+}
+
 pub(crate) fn render(
     app: &AgnoPeriphApp,
     device: &DeviceSnapshot,
@@ -196,11 +219,9 @@ pub(crate) fn render(
     let Some(keymap) = device.keymap.as_ref() else {
         return base.child(muted_note("The keymap couldn’t be read.", cx.theme()));
     };
-    let layout = match device.hall_effect.as_ref() {
-        Some(he) => KeyLayout::for_device(&device.info, &he.capabilities),
-        None => std::sync::Arc::new(KeyLayout::generic(
-            u16::from(keymap.capabilities.rows) * u16::from(keymap.capabilities.cols),
-        )),
+    let (layout, is_named_by_keycode) = match device.hall_effect.as_ref() {
+        Some(he) => (KeyLayout::for_device(&device.info, &he.capabilities), false),
+        None => (std::sync::Arc::new(base_keycode_grid(keymap)), true),
     };
     let busy = app.is_busy() || app.is_loading();
     let ui = &app.keymap_ui;
@@ -275,7 +296,10 @@ pub(crate) fn render(
             let code = codes.get(usize::from(cap.index.value())).copied();
             let is_default = code.is_none_or(|c| c == KeyCode::TRANSPARENT);
             KeyFace {
-                detail: code.filter(|_| !is_default).map(|c| keycode_name(c).into()),
+                detail: code
+                    .filter(|_| !is_default)
+                    .map(|c| SharedString::from(keycode_name(c)))
+                    .filter(|name| !is_named_by_keycode || *name != cap.label),
                 fill: None,
                 marker: false,
                 badge: None,
@@ -386,7 +410,11 @@ fn render_picker(
             }
         }
         PickerTab::Extra => {
-            let macros: Vec<AnyElement> = (0..16u8)
+            let macro_slots = app
+                .selected_device()
+                .and_then(|d| d.macros.as_ref())
+                .map_or(16, |m| m.capabilities.max_slots);
+            let macros: Vec<AnyElement> = (0..macro_slots)
                 .filter(|ix| matches_search(&format!("M{} macro", ix + 1), &query))
                 .map(|ix| {
                     key_button(

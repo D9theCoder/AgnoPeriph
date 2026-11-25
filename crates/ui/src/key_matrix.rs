@@ -198,6 +198,13 @@ fn keycap(
         theme.foreground
     };
 
+    // Matrix names such as `R1C10` shrink a step instead of truncating.
+    let cap_label_rem = if is_matrix_name(&cap.label) && cap.label.len() > 4 {
+        (label_rem * 0.82).max(0.52)
+    } else {
+        label_rem
+    };
+
     let top = h_flex()
         .w_full()
         .justify_between()
@@ -205,8 +212,8 @@ fn keycap(
         .gap_0p5()
         .child(
             div()
-                .text_size(rems(label_rem))
-                .line_height(rems(label_rem * 1.22))
+                .text_size(rems(cap_label_rem))
+                .line_height(rems(cap_label_rem * 1.22))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(label_color)
                 .truncate()
@@ -272,4 +279,17 @@ fn keycap(
         })
         .test_support()
         .into_any_element()
+}
+
+/// Whether `label` is a generic matrix position (`R<row>C<col>`) rather than a keycap legend.
+fn is_matrix_name(label: &str) -> bool {
+    label
+        .strip_prefix('R')
+        .and_then(|rest| rest.split_once('C'))
+        .is_some_and(|(row, col)| {
+            !row.is_empty()
+                && !col.is_empty()
+                && row.bytes().all(|b| b.is_ascii_digit())
+                && col.bytes().all(|b| b.is_ascii_digit())
+        })
 }

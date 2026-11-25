@@ -333,11 +333,13 @@ pub fn encode_lod(lod: LiftOffDistance) -> CoreResult<u8> {
     match lod {
         LiftOffDistance::Low | LiftOffDistance::TenthsMm(10) => Ok(1),
         LiftOffDistance::High | LiftOffDistance::TenthsMm(20) => Ok(2),
-        other @ LiftOffDistance::TenthsMm(_) => Err(CoreError::OutOfRange {
-            field: "lod",
-            actual: other.to_string(),
-            expected: "1.0 mm (Low) or 2.0 mm (High)".to_owned(),
-        }),
+        other @ (LiftOffDistance::Medium | LiftOffDistance::TenthsMm(_)) => {
+            Err(CoreError::OutOfRange {
+                field: "lod",
+                actual: other.to_string(),
+                expected: "1.0 mm (Low) or 2.0 mm (High)".to_owned(),
+            })
+        }
     }
 }
 
