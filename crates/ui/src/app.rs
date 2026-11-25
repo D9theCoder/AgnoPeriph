@@ -1409,6 +1409,7 @@ impl AgnoPeriphApp {
     ) {
         match role {
             SliderRole::Travel
+            | SliderRole::PairTravel
             | SliderRole::RtPress
             | SliderRole::RtRelease
             | SliderRole::DeadzoneTop
@@ -1624,13 +1625,21 @@ impl AgnoPeriphApp {
             })
     }
 
-    fn render_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_workspace(
+        &self,
+        workspace_width: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let background = cx.theme().background;
         let notices = self.render_notices(cx);
         let body = match self.route {
-            Route::GameProfiles => game_profiles_view::render(self, cx).into_any_element(),
+            Route::GameProfiles => {
+                game_profiles_view::render(self, workspace_width, cx).into_any_element()
+            }
             Route::Device => match self.selected_device() {
-                Some(device) => self.render_device(device, cx).into_any_element(),
+                Some(device) => self
+                    .render_device(device, workspace_width, cx)
+                    .into_any_element(),
                 None if !self.has_loaded => loading_state(cx.theme()).into_any_element(),
                 None => self.render_empty_state(cx).into_any_element(),
             },
@@ -1657,6 +1666,7 @@ impl AgnoPeriphApp {
     fn render_device(
         &self,
         device: &DeviceSnapshot,
+        workspace_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme();
@@ -1742,7 +1752,7 @@ impl AgnoPeriphApp {
             body = body.child(pointer_panel::render(self, device, cx));
         }
         if is_keyboard {
-            body = body.child(self.render_keyboard(device, cx));
+            body = body.child(self.render_keyboard(device, workspace_width, cx));
         } else if caps.has_rgb() {
             body = body.child(rgb_panel::render(self, device, cx));
         }
@@ -1752,6 +1762,7 @@ impl AgnoPeriphApp {
     fn render_keyboard(
         &self,
         device: &DeviceSnapshot,
+        workspace_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let caps = device.capabilities;
@@ -1782,7 +1793,9 @@ impl AgnoPeriphApp {
                 }
             }));
         let panel = match current {
-            KeyboardTab::Triggers => hall_effect_panel::render(self, device, cx).into_any_element(),
+            KeyboardTab::Triggers => {
+                hall_effect_panel::render(self, device, workspace_width, cx).into_any_element()
+            }
             KeyboardTab::Keybinds => keymap_panel::render(self, device, cx).into_any_element(),
             KeyboardTab::Lighting => rgb_panel::render(self, device, cx).into_any_element(),
             KeyboardTab::Macros => macro_panel::render(self, device, cx).into_any_element(),
@@ -1867,16 +1880,19 @@ fn loading_state(theme: &Theme) -> impl IntoElement + use<> {
 }
 
 impl Render for AgnoPeriphApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
         if self.controls.is_none() {
             return v_flex().size_full().bg(background).text_color(foreground);
         }
+        // Available inner width of the workspace pane (viewport minus 240px sidebar and 40px padding).
+        let viewport_w: f32 = window.viewport_size().width.into();
+        let workspace_width = (viewport_w - 240.0 - 40.0).max(320.0);
         let header = self.render_header(cx);
         let sidebar = sidebar::render(self, cx);
-        let workspace = self.render_workspace(cx);
+        let workspace = self.render_workspace(workspace_width, cx);
         v_flex()
             .size_full()
             .bg(background)

@@ -14,14 +14,10 @@ use crate::app::AgnoPeriphApp;
 use crate::icons::{AdvancedIcon, advanced_svg};
 use crate::keymap::{KeyLayout, LayoutKey};
 
-/// Width of one key unit in rem; sized so the board sits cleanly beside Paired & Advanced Keys
-/// at the default 1240×820 window width without clipping either column.
-const KEY_UNIT_REM: f32 = 2.42;
+/// Default width of one key unit in rem for fixed-size views (Keybinds, Calibration).
+pub(crate) const KEY_UNIT_REM: f32 = 2.42;
 /// Space between neighbouring keycaps in rem (matches `gap_1`).
 const KEY_GAP_REM: f32 = 0.25;
-/// Height of a 1u keycap in rem, kept proportional to `KEY_UNIT_REM - KEY_GAP_REM` (~0.94:1)
-/// so keycaps retain crisp square proportions rather than stretching vertically.
-const KEY_HEIGHT_REM: f32 = 2.30;
 
 /// How a keycap is emphasised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,13 +62,24 @@ impl KeyFace {
 
 type OnSelect = fn(&mut AgnoPeriphApp, KeyIndex, bool, &mut Window, &mut Context<AgnoPeriphApp>);
 
-/// Renders `layout` as clickable keycaps with ids `(id_prefix, key)`.
-///
-/// `on_select` receives the key and whether Ctrl or Shift was held.
+/// Renders `layout` as clickable keycaps with ids `(id_prefix, key)` at the default key unit size.
 pub(crate) fn render(
     id: &'static str,
     id_prefix: &'static str,
     layout: &KeyLayout,
+    face: impl Fn(&LayoutKey) -> KeyFace,
+    on_select: OnSelect,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> Stateful<Div> {
+    render_sized(id, id_prefix, layout, KEY_UNIT_REM, face, on_select, cx)
+}
+
+/// Renders `layout` as clickable keycaps scaled proportionally to `unit_rem`.
+pub(crate) fn render_sized(
+    id: &'static str,
+    id_prefix: &'static str,
+    layout: &KeyLayout,
+    unit_rem: f32,
     face: impl Fn(&LayoutKey) -> KeyFace,
     on_select: OnSelect,
     cx: &mut Context<AgnoPeriphApp>,
@@ -89,6 +96,7 @@ pub(crate) fn render(
             line = line.child(keycap(
                 id_prefix,
                 cap,
+                unit_rem,
                 &face(cap),
                 Some(Box::new(listener)),
                 cx.theme(),
@@ -112,7 +120,7 @@ pub(crate) fn render_static(
         board = board.child(
             h_flex().gap_1().children(
                 row.iter()
-                    .map(|cap| keycap(id_prefix, cap, &face(cap), None, theme)),
+                    .map(|cap| keycap(id_prefix, cap, KEY_UNIT_REM, &face(cap), None, theme)),
             ),
         );
     }
@@ -136,12 +144,17 @@ type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 fn keycap(
     id_prefix: &'static str,
     cap: &LayoutKey,
+    unit_rem: f32,
     face: &KeyFace,
     on_click: Option<ClickHandler>,
     theme: &Theme,
 ) -> AnyElement {
-    let width = f32::from(cap.width) / 100.0 * KEY_UNIT_REM - KEY_GAP_REM;
-    let gap = f32::from(cap.gap) / 100.0 * KEY_UNIT_REM;
+    let width = f32::from(cap.width) / 100.0 * unit_rem - KEY_GAP_REM;
+    let height = (unit_rem - 0.12).max(1.75);
+    let gap = f32::from(cap.gap) / 100.0 * unit_rem;
+    let label_rem = (unit_rem * 0.285).clamp(0.64, 0.85);
+    let detail_rem = (unit_rem * 0.245).clamp(0.54, 0.72);
+    let icon_rem = (unit_rem * 0.29).clamp(0.64, 0.90);
     let (accent, border, background, hover) = match face.tone {
         KeyTone::Normal => (
             theme.primary,
@@ -192,8 +205,8 @@ fn keycap(
         .gap_0p5()
         .child(
             div()
-                .text_size(rems(0.6875))
-                .line_height(rems(0.85))
+                .text_size(rems(label_rem))
+                .line_height(rems(label_rem * 1.22))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(label_color)
                 .truncate()
@@ -205,7 +218,7 @@ fn keycap(
             } else {
                 theme.muted_foreground
             };
-            this.child(advanced_svg(icon, rems(0.70), icon_color))
+            this.child(advanced_svg(icon, rems(icon_rem), icon_color))
         })
         .when(face.marker && face.badge.is_none(), |this| {
             this.child(div().flex_shrink_0().size_1p5().rounded_full().bg(accent))
@@ -217,8 +230,8 @@ fn keycap(
         .aria_selected(face.tone == KeyTone::Selected)
         .ml(rems(gap))
         .w(rems(width))
-        .h(rems(KEY_HEIGHT_REM))
-        .px_0p5()
+        .h(rems(height))
+        .px_1()
         .py_0p5()
         .flex()
         .flex_col()
@@ -238,8 +251,8 @@ fn keycap(
         .when_some(face.detail.clone(), |this, detail| {
             this.child(
                 div()
-                    .text_size(rems(0.60))
-                    .line_height(rems(0.75))
+                    .text_size(rems(detail_rem))
+                    .line_height(rems(detail_rem * 1.22))
                     .truncate()
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)

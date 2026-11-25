@@ -4,7 +4,7 @@
 use agnoperiph_core::{DeviceId, ProfileSlot};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable, WindowExt,
-    button::{Button, ButtonGroup, ButtonVariant, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     input::Input,
@@ -424,6 +424,7 @@ fn is_exe(value: &str) -> bool {
 
 pub(crate) fn render(
     app: &AgnoPeriphApp,
+    workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
@@ -441,25 +442,37 @@ pub(crate) fn render(
                 .text_color(theme.muted_foreground)
                 .child("Switch every connected device to the right preset when a game starts, and back when it closes."),
         );
+    let stacked = workspace_width < 760.0;
     let status = render_status(app, cx);
-    let list = render_list(app, cx);
+    let list = render_list(app, stacked, cx);
     let editor = render_editor(app, cx);
     let discovery = render_discovery(app, cx);
+    let detail = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap_5()
+        .child(editor)
+        .child(discovery);
+    let body = if stacked {
+        v_flex()
+            .gap_4()
+            .child(list)
+            .child(detail)
+            .into_any_element()
+    } else {
+        h_flex()
+            .items_start()
+            .gap_5()
+            .child(list)
+            .child(detail)
+            .into_any_element()
+    };
     v_flex()
         .id("game-profiles")
         .gap_5()
         .child(header)
         .child(status)
-        .child(
-            h_flex().items_start().gap_5().child(list).child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_5()
-                    .child(editor)
-                    .child(discovery),
-            ),
-        )
+        .child(body)
 }
 
 fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl IntoElement + use<> {
@@ -481,6 +494,7 @@ fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl I
     };
     h_flex()
         .id("auto-switch-status")
+        .flex_wrap()
         .gap_4()
         .p_4()
         .rounded(theme.radius_lg)
@@ -490,6 +504,7 @@ fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl I
         .child(
             v_flex()
                 .flex_1()
+                .min_w_48()
                 .gap_1()
                 .child(
                     h_flex()
@@ -514,6 +529,7 @@ fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl I
         )
         .child(
             h_flex()
+                .flex_wrap()
                 .gap_4()
                 .child(
                     h_flex()
@@ -544,7 +560,11 @@ fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl I
         )
 }
 
-fn render_list(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl IntoElement + use<> {
+fn render_list(
+    app: &AgnoPeriphApp,
+    full_width: bool,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> impl IntoElement + use<> {
     let selected = app.games_ui.selected.clone();
     let active = app.active_game().map(str::to_owned);
     let mut items: Vec<AnyElement> = Vec::new();
@@ -595,8 +615,8 @@ fn render_list(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl Int
     let theme = cx.theme();
     v_flex()
         .id("game-profile-list")
-        .w_56()
-        .flex_none()
+        .when(full_width, Styled::w_full)
+        .when(!full_width, |this| this.w_56().flex_none())
         .gap_0p5()
         .child(
             div()
@@ -742,13 +762,17 @@ fn render_matrix(
         let current = targets.get(id.as_str()).copied();
         let row_id = SharedString::from(format!("target-{id}"));
         let theme = cx.theme();
-        let name = v_flex()
-            .w_48()
-            .flex_none()
-            .gap_0p5()
+        let name = h_flex()
+            .flex_1()
+            .min_w_0()
+            .flex_wrap()
+            .items_baseline()
+            .gap_x_2()
+            .gap_y_0p5()
             .child(
                 div()
                     .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
                     .truncate()
                     .child(device.info.model_name.clone()),
             )
@@ -763,55 +787,70 @@ fn render_matrix(
             ));
         if slots.is_empty() {
             rows.push(
-                h_flex()
+                v_flex()
                     .id(row_id)
-                    .gap_4()
+                    .gap_1()
                     .child(name)
                     .child(muted_note("This device has no presets to switch.", theme))
                     .into_any_element(),
             );
             continue;
         }
-        let mut buttons: Vec<Button> = Vec::new();
+        let mut buttons: Vec<AnyElement> = Vec::new();
         {
             let game = game.clone();
             let id = id.clone();
+            let selected = current.is_none();
+            let btn = Button::new(SharedString::from(format!("target-{id}-none")))
+                .small()
+                .label("Don’t change")
+                .selected(selected)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_game_target(game.as_deref(), &id, None, cx);
+                }));
             buttons.push(
-                Button::new(SharedString::from(format!("target-{id}-none")))
-                    .label("Don’t change")
-                    .selected(current.is_none())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_game_target(game.as_deref(), &id, None, cx);
-                    })),
+                if selected {
+                    btn.primary()
+                } else {
+                    btn.outline()
+                }
+                .into_any_element(),
             );
         }
         for (slot, slot_name) in &slots {
             let slot = *slot;
             let game = game.clone();
             let id = id.clone();
+            let selected = current == Some(slot);
+            let btn = Button::new(SharedString::from(format!("target-{id}-{slot}")))
+                .small()
+                .label(slot_name.clone())
+                .selected(selected)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_game_target(game.as_deref(), &id, Some(slot), cx);
+                }));
             buttons.push(
-                Button::new(SharedString::from(format!("target-{id}-{slot}")))
-                    .label(slot_name.clone())
-                    .selected(current == Some(slot))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_game_target(game.as_deref(), &id, Some(slot), cx);
-                    })),
+                if selected {
+                    btn.primary()
+                } else {
+                    btn.outline()
+                }
+                .into_any_element(),
             );
         }
         let rename = rename_menu(&id, &slots, cx);
         rows.push(
-            h_flex()
+            v_flex()
                 .id(row_id)
-                .gap_4()
-                .child(name)
+                .gap_1p5()
+                .child(h_flex().justify_between().gap_2().child(name).child(rename))
                 .child(
-                    ButtonGroup::new(SharedString::from(format!("targets-{id}")))
-                        .outline()
-                        .small()
+                    h_flex()
+                        .id(SharedString::from(format!("targets-{id}")))
+                        .flex_wrap()
+                        .gap_1()
                         .children(buttons),
                 )
-                .child(div().flex_1())
-                .child(rename)
                 .into_any_element(),
         );
     }
@@ -985,18 +1024,21 @@ fn render_discovery(
 
     let manual = controls.map(|c| (c.manual_name.clone(), c.manual_exe.clone()));
     let form = h_flex()
+        .flex_wrap()
         .gap_2()
         .when_some(manual, |this, (name, exe)| {
             this.child(
                 div()
                     .id("manual-game-name")
-                    .w_56()
+                    .flex_1()
+                    .min_w_32()
                     .child(Input::new(&name).small()),
             )
             .child(
                 div()
                     .id("manual-game-exe")
                     .flex_1()
+                    .min_w_40()
                     .child(Input::new(&exe).small()),
             )
         })

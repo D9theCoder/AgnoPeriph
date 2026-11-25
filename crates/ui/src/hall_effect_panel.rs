@@ -23,7 +23,7 @@ use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, DraftScope, JobOrigin, field, mm, muted_note, readout, section};
 use crate::backend::{ActuationTarget, DeviceSnapshot, HallEffectState, SettingChange};
-use crate::controls::{SliderRole, sync_slider, to_units};
+use crate::controls::{ConfiguredPairKey, SliderRole, sync_slider, to_units};
 use crate::icons::{AdvancedIcon, advanced_svg};
 use crate::key_matrix::{self, KeyFace, KeyTone};
 use crate::keycodes::{HID_KEYS, KeyGroup, hid_name};
@@ -170,6 +170,8 @@ pub(crate) struct PairedKeysUi {
     pub(crate) pair_trigger_point: TravelHundredthsMm,
     /// Per-pair Rapid Trigger toggle for new RS / SOCD pairs.
     pub(crate) pair_rapid_trigger: bool,
+    /// In-flight slider drag previews for configured RS / SOCD pairs (committed on release).
+    pub(crate) pair_travel_drafts: BTreeMap<ConfiguredPairKey, TravelHundredthsMm>,
     pub(crate) dks_stages: [DksStageDraft; 4],
     pub(crate) primary_usage: u8,
     pub(crate) secondary_usage: u8,
@@ -188,6 +190,7 @@ impl Default for PairedKeysUi {
             socd_mode: SocdMode::LastInputPriority,
             pair_trigger_point: DEFAULT_PAIR_TRIGGER_POINT,
             pair_rapid_trigger: false,
+            pair_travel_drafts: BTreeMap::new(),
             dks_stages: [
                 DksStageDraft {
                     enabled: true,
@@ -877,6 +880,62 @@ impl AgnoPeriphApp {
         }
     }
 
+    pub(crate) fn on_configured_pair_slider(
+        &mut self,
+        key: ConfiguredPairKey,
+        value: f32,
+        released: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((min, max, step)) = self.hall_effect_state().map(|he| {
+            (
+                he.capabilities.actuation_min,
+                he.capabilities.actuation_max,
+                he.capabilities.actuation_step,
+            )
+        }) else {
+            return;
+        };
+        let snapped = snap_travel(i32::from(to_units(value)), min, max, step);
+        if !released {
+            self.paired.pair_travel_drafts.insert(key, snapped);
+            cx.notify();
+            return;
+        }
+        self.paired.pair_travel_drafts.remove(&key);
+        if key.is_socd {
+            let target = self.hall_effect_state().and_then(|he| {
+                he.snapshot
+                    .socd_pairs
+                    .iter()
+                    .copied()
+                    .find(|p| p.key_a.value() == key.key_a && p.key_b.value() == key.key_b)
+            });
+            if let Some(pair) = target
+                && pair.trigger_point != snapped
+            {
+                self.update_socd_pair(pair, |p| p.with_trigger_point(snapped), cx);
+            } else {
+                cx.notify();
+            }
+        } else {
+            let target = self.hall_effect_state().and_then(|he| {
+                he.snapshot
+                    .rapid_switch_pairs
+                    .iter()
+                    .copied()
+                    .find(|p| p.key_a.value() == key.key_a && p.key_b.value() == key.key_b)
+            });
+            if let Some(pair) = target
+                && pair.trigger_point != snapped
+            {
+                self.update_rs_pair(pair, |p| p.with_trigger_point(snapped), cx);
+            } else {
+                cx.notify();
+            }
+        }
+    }
+
     pub(crate) fn set_paired_usage(&mut self, is_primary: bool, usage: u8, cx: &mut Context<Self>) {
         if is_primary {
             self.paired.primary_usage = usage;
@@ -908,17 +967,53 @@ pub(crate) fn sync_controls(
     window: &mut Window,
     cx: &mut Context<AgnoPeriphApp>,
 ) {
-    let Some(controls) = app.controls.as_ref() else {
+    let pair_entries: Vec<(ConfiguredPairKey, TravelHundredthsMm)> =
+        app.hall_effect_state().map_or_default(|he| {
+            let socd = he.snapshot.socd_pairs.iter().map(|p| {
+                (
+                    ConfiguredPairKey {
+                        is_socd: true,
+                        key_a: p.key_a.value(),
+                        key_b: p.key_b.value(),
+                    },
+                    p.trigger_point,
+                )
+            });
+            let rs = he.snapshot.rapid_switch_pairs.iter().map(|p| {
+                (
+                    ConfiguredPairKey {
+                        is_socd: false,
+                        key_a: p.key_a.value(),
+                        key_b: p.key_b.value(),
+                    },
+                    p.trigger_point,
+                )
+            });
+            socd.chain(rs).collect()
+        });
+    let pair_drafts = app.paired.pair_travel_drafts.clone();
+    let pair_trigger_point = app.paired.pair_trigger_point;
+    let key_values = app.key_values();
+    let deadzone_values = app.deadzone_values();
+    let Some(controls) = app.controls.as_mut() else {
         return;
     };
-    let (travel, rt_press, rt_release, dz_top, dz_bottom) = (
+    controls.sync_configured_pair_sliders(&pair_entries, &pair_drafts, window, cx);
+    let (travel, pair_travel, rt_press, rt_release, dz_top, dz_bottom) = (
         controls.travel.clone(),
+        controls.pair_travel.clone(),
         controls.rt_press.clone(),
         controls.rt_release.clone(),
         controls.deadzone_top.clone(),
         controls.deadzone_bottom.clone(),
     );
-    if let Some((actuation, rt)) = app.key_values() {
+    sync_slider(
+        &pair_travel,
+        f32::from(pair_trigger_point.as_hundredths()),
+        window,
+        cx,
+    );
+    if let Some((actuation, rt)) = key_values {
         sync_slider(&travel, f32::from(actuation.as_hundredths()), window, cx);
         sync_slider(
             &rt_press,
@@ -933,7 +1028,7 @@ pub(crate) fn sync_controls(
             cx,
         );
     }
-    if let Some((top, bottom)) = app.deadzone_values() {
+    if let Some((top, bottom)) = deadzone_values {
         sync_slider(&dz_top, f32::from(top.as_hundredths()), window, cx);
         sync_slider(&dz_bottom, f32::from(bottom.as_hundredths()), window, cx);
     }
@@ -948,6 +1043,7 @@ pub(crate) fn on_slider(
     let units = i32::from(to_units(value));
     match role {
         SliderRole::Travel => app.set_actuation_draft(units, cx),
+        SliderRole::PairTravel => app.set_pair_trigger_point(units, cx),
         SliderRole::RtPress => app.set_sensitivity(true, units, cx),
         SliderRole::RtRelease => app.set_sensitivity(false, units, cx),
         SliderRole::DeadzoneTop => app.set_deadzone(true, units, cx),
@@ -956,9 +1052,14 @@ pub(crate) fn on_slider(
     }
 }
 
+/// Minimum workspace width (px) to place Paired & Advanced Keys beside the keyboard matrix
+/// in a 65% / 35% split; narrower windows stack Paired & Advanced Keys at the bottom of the page.
+const SIDE_BY_SIDE_MIN_WIDTH: f32 = 940.0;
+
 pub(crate) fn render(
     app: &AgnoPeriphApp,
     device: &DeviceSnapshot,
+    workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let Some(he) = device.hall_effect.as_ref() else {
@@ -972,26 +1073,63 @@ pub(crate) fn render(
     let layout = KeyLayout::for_device(&device.info, &he.capabilities);
     let occupied = crate::backend::occupied_advanced_keys(device);
     let has_paired = he.capabilities.has_socd() || he.capabilities.has_dks();
+    let side_by_side = has_paired && workspace_width >= SIDE_BY_SIDE_MIN_WIDTH;
 
-    v_flex()
-        .id("hall-effect-panel")
-        .gap_3()
-        .child(
-            h_flex()
-                .items_start()
-                .gap_3()
-                .child(
-                    v_flex()
-                        .flex_shrink_0()
-                        .gap_2()
-                        .child(render_matrix(app, he, &layout, &occupied, cx))
-                        .child(render_selection_bar(app, &layout, cx)),
-                )
-                .when(has_paired, |this| {
-                    this.child(render_paired(app, he, &layout, &occupied, cx))
-                }),
-        )
-        .child(render_deck(app, he, &layout, cx))
+    // 65% keyboard / 35% paired-keys split on wide viewports; full-width keyboard when stacked.
+    let gap = 12.0_f32;
+    let unit_rem = if side_by_side {
+        let board_target = (workspace_width - gap) * 0.65;
+        ((board_target - 14.0) / 272.0).clamp(2.35, 3.85)
+    } else {
+        ((workspace_width - 14.0) / 272.0).clamp(1.80, 2.85)
+    };
+    let paired_height_px = if side_by_side {
+        let key_h_px = (unit_rem - 0.12).max(1.75) * 16.0;
+        let board_col_h = 6.0 * key_h_px + 20.0 + 18.0 + 22.0 + 30.0;
+        Some(board_col_h.max(368.0))
+    } else {
+        None
+    };
+    let paired_max_w = side_by_side.then(|| ((workspace_width - gap) * 0.35).max(280.0));
+
+    let board_column = v_flex()
+        .flex_shrink_0()
+        .gap_2()
+        .child(render_matrix(app, he, &layout, &occupied, unit_rem, cx))
+        .child(render_selection_bar(app, &layout, cx));
+
+    let deck = render_deck(app, he, &layout, workspace_width, cx);
+
+    if side_by_side {
+        v_flex()
+            .id("hall-effect-panel")
+            .gap_3()
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(board_column)
+                    .child(render_paired(
+                        app,
+                        he,
+                        &layout,
+                        &occupied,
+                        paired_height_px,
+                        paired_max_w,
+                        cx,
+                    )),
+            )
+            .child(deck)
+    } else {
+        v_flex()
+            .id("hall-effect-panel")
+            .gap_3()
+            .child(board_column)
+            .child(deck)
+            .when(has_paired, |this| {
+                this.child(render_paired(app, he, &layout, &occupied, None, None, cx))
+            })
+    }
 }
 
 /// Compact single-row selection bar tucked directly under the keyboard matrix, freeing
@@ -1088,6 +1226,7 @@ fn render_matrix(
     he: &HallEffectState,
     layout: &KeyLayout,
     occupied: &BTreeMap<KeyIndex, &'static str>,
+    unit_rem: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let max = f32::from(he.capabilities.actuation_max.as_hundredths().max(1));
@@ -1096,10 +1235,11 @@ fn render_matrix(
     let picking = paired.pick.is_some();
     let keys = &he.snapshot.keys;
     let rt_count = keys.iter().filter(|k| k.rapid_trigger.is_enabled()).count();
-    let matrix = key_matrix::render(
+    let matrix = key_matrix::render_sized(
         "key-matrix",
         "key",
         layout,
+        unit_rem,
         |cap| {
             let config = keys.iter().find(|k| k.key == cap.index);
             let owner = occupied.get(&cap.index).copied();
@@ -1404,10 +1544,11 @@ fn render_deck(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
     layout: &KeyLayout,
+    workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let gauge = render_gauge(app, he, cx);
-    let travel = render_travel_column(app, he, layout, cx);
+    let travel = render_travel_column(app, he, layout, workspace_width, cx);
     let rapid = he
         .capabilities
         .has_rapid_trigger()
@@ -1433,6 +1574,7 @@ fn render_travel_column(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
     layout: &KeyLayout,
+    workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let count = app.selected_keys().len();
@@ -1546,7 +1688,19 @@ fn render_travel_column(
                     .on_click(cx.listener(|this, _, _, cx| this.apply_deadzones(cx))),
             ),
         )
-        .child(
+        .child(if workspace_width < 900.0 {
+            v_flex()
+                .gap_2()
+                .child(slider_row("Top", top_slider, top_stepper, busy, theme))
+                .child(slider_row(
+                    "Bottom",
+                    bottom_slider,
+                    bottom_stepper,
+                    busy,
+                    theme,
+                ))
+                .into_any_element()
+        } else {
             h_flex()
                 .items_start()
                 .gap_2()
@@ -1563,8 +1717,9 @@ fn render_travel_column(
                     bottom_stepper,
                     busy,
                     theme,
-                ))),
-        )
+                )))
+                .into_any_element()
+        })
 }
 
 fn render_rapid_trigger_column(
@@ -1704,6 +1859,8 @@ fn render_paired(
     he: &HallEffectState,
     layout: &KeyLayout,
     occupied: &BTreeMap<KeyIndex, &'static str>,
+    side_height_px: Option<f32>,
+    side_max_w_px: Option<f32>,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let mode = app.paired.mode;
@@ -1770,16 +1927,17 @@ fn render_paired(
         .collect();
 
     let flow = render_flow(app, layout, occupied, cx);
-    let list = render_configured(app, he, layout, cx);
+    let list = render_configured(app, he, layout, side_height_px.is_some(), cx);
     let theme = cx.theme();
     v_flex()
         .id("paired-keys")
         .flex_1()
-        .min_w_64()
-        .h(rems(21.25))
-        .gap_1p5()
+        .min_w_0()
+        .when_some(side_max_w_px, |this, max_w| this.max_w(px(max_w)))
+        .when_some(side_height_px, |this, h_px| this.h(px(h_px)))
+        .gap_1()
         .px_3()
-        .py_2p5()
+        .py_2()
         .rounded(theme.radius_lg)
         .border_1()
         .border_color(theme.border)
@@ -1929,6 +2087,7 @@ fn render_flow(
                         ),
                 );
             }
+            let pair_slider = app.controls.as_ref().map(|c| c.pair_travel.clone());
             let pair_stepper = stepper(
                 "paired-travel",
                 ui.pair_trigger_point,
@@ -1937,32 +2096,13 @@ fn render_flow(
                 cx,
             );
             let theme = cx.theme();
-            body = body.child(
-                h_flex()
-                    .justify_between()
-                    .gap_2()
-                    .child(pair_stepper)
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child("RT"),
-                            )
-                            .child(
-                                Switch::new("paired-rt")
-                                    .small()
-                                    .checked(ui.pair_rapid_trigger)
-                                    .disabled(busy)
-                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                        this.paired.pair_rapid_trigger = *checked;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            );
+            body = body.child(slider_row(
+                "Actuation point",
+                pair_slider,
+                pair_stepper,
+                busy,
+                theme,
+            ));
         }
         PairedMode::Dks => {
             body = body.child(field("Sends", cx.theme()).child(key_chooser(
@@ -2111,24 +2251,55 @@ fn render_flow(
         })
         .child(
             h_flex()
+                .justify_between()
                 .gap_2()
                 .child(
-                    Button::new("paired-add")
-                        .primary()
-                        .xsmall()
-                        .label(format!("Add {}", mode.badge()))
-                        .loading(busy)
-                        .disabled(!ready)
-                        .on_click(cx.listener(|this, _, _, cx| this.add_paired(cx))),
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            Button::new("paired-add")
+                                .primary()
+                                .xsmall()
+                                .label(format!("Add {}", mode.badge()))
+                                .loading(busy)
+                                .disabled(!ready)
+                                .on_click(cx.listener(|this, _, _, cx| this.add_paired(cx))),
+                        )
+                        .child(
+                            Button::new("paired-cancel")
+                                .ghost()
+                                .xsmall()
+                                .label("Reset")
+                                .disabled(
+                                    ui.first.is_none() && ui.second.is_none() && ui.pick.is_none(),
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cancel_paired_flow(cx)),
+                                ),
+                        ),
                 )
-                .child(
-                    Button::new("paired-cancel")
-                        .ghost()
-                        .xsmall()
-                        .label("Reset")
-                        .disabled(ui.first.is_none() && ui.second.is_none() && ui.pick.is_none())
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_paired_flow(cx))),
-                ),
+                .when(needs_two, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("RT"),
+                            )
+                            .child(
+                                Switch::new("paired-rt")
+                                    .small()
+                                    .checked(ui.pair_rapid_trigger)
+                                    .disabled(busy)
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.paired.pair_rapid_trigger = *checked;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                }),
         )
 }
 
@@ -2180,6 +2351,7 @@ fn render_configured(
     app: &AgnoPeriphApp,
     he: &HallEffectState,
     layout: &KeyLayout,
+    scrollable: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let busy = app.is_busy();
@@ -2237,52 +2409,26 @@ fn render_configured(
     match active_mode {
         PairedMode::RapidSwitch => {
             for &pair in &snapshot.rapid_switch_pairs {
+                let pair_key = ConfiguredPairKey {
+                    is_socd: false,
+                    key_a: pair.key_a.value(),
+                    key_b: pair.key_b.value(),
+                };
+                let display_point = app
+                    .paired
+                    .pair_travel_drafts
+                    .get(&pair_key)
+                    .copied()
+                    .unwrap_or(pair.trigger_point);
+                let pair_slider = app
+                    .controls
+                    .as_ref()
+                    .and_then(|c| c.configured_pair_slider(pair_key));
                 let id = ElementId::Name(
                     format!("rs-remove-{}-{}", pair.key_a.value(), pair.key_b.value()).into(),
                 );
-                let action = remove(id, PairedEntry::RapidSwitch(pair), cx).into_any_element();
-                let head = row(
-                    icon,
-                    format!(
-                        "{} + {}",
-                        layout.label(pair.key_a),
-                        layout.label(pair.key_b)
-                    ),
-                    None,
-                    action,
-                    cx.theme(),
-                );
-                let tuning = h_flex()
-                    .justify_between()
+                let trailing = h_flex()
                     .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new(rs_element_id("rs-travel-dec", pair, "m"))
-                                    .outline()
-                                    .xsmall()
-                                    .label("−")
-                                    .disabled(busy)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.step_rs_travel(pair, -1, cx);
-                                    })),
-                            )
-                            .child(readout(
-                                format!("{} mm", mm(pair.trigger_point)),
-                                cx.theme(),
-                            ))
-                            .child(
-                                Button::new(rs_element_id("rs-travel-inc", pair, "p"))
-                                    .outline()
-                                    .xsmall()
-                                    .label("+")
-                                    .disabled(busy)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.step_rs_travel(pair, 1, cx);
-                                    })),
-                            ),
-                    )
                     .child(
                         h_flex().gap_1().child(muted_note("RT", cx.theme())).child(
                             Switch::new(rs_element_id("rs-rt", pair, "sw"))
@@ -2293,18 +2439,76 @@ fn render_configured(
                                     this.set_rs_rt(pair, *checked, cx);
                                 })),
                         ),
+                    )
+                    .child(remove(id, PairedEntry::RapidSwitch(pair), cx))
+                    .into_any_element();
+                let head = row(
+                    icon,
+                    format!(
+                        "{} + {}",
+                        layout.label(pair.key_a),
+                        layout.label(pair.key_b)
+                    ),
+                    None,
+                    trailing,
+                    cx.theme(),
+                );
+                let pair_stepper = h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(
+                        Button::new(rs_element_id("rs-travel-dec", pair, "m"))
+                            .outline()
+                            .xsmall()
+                            .label("−")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.step_rs_travel(pair, -1, cx);
+                            })),
+                    )
+                    .child(readout(format!("{} mm", mm(display_point)), cx.theme()))
+                    .child(
+                        Button::new(rs_element_id("rs-travel-inc", pair, "p"))
+                            .outline()
+                            .xsmall()
+                            .label("+")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.step_rs_travel(pair, 1, cx);
+                            })),
                     );
                 rows.push(
                     v_flex()
                         .gap_1()
                         .child(head)
-                        .child(tuning)
+                        .child(slider_row(
+                            "Actuation point",
+                            pair_slider,
+                            pair_stepper,
+                            busy,
+                            cx.theme(),
+                        ))
                         .into_any_element(),
                 );
             }
         }
         PairedMode::Socd => {
             for &pair in &snapshot.socd_pairs {
+                let pair_key = ConfiguredPairKey {
+                    is_socd: true,
+                    key_a: pair.key_a.value(),
+                    key_b: pair.key_b.value(),
+                };
+                let display_point = app
+                    .paired
+                    .pair_travel_drafts
+                    .get(&pair_key)
+                    .copied()
+                    .unwrap_or(pair.trigger_point);
+                let pair_slider = app
+                    .controls
+                    .as_ref()
+                    .and_then(|c| c.configured_pair_slider(pair_key));
                 let make_mode_btn =
                     |(socd, label): (SocdMode, &'static str), cx: &mut Context<AgnoPeriphApp>| {
                         let selected = pair.mode == socd;
@@ -2341,54 +2545,8 @@ fn render_configured(
                             .child(make_mode_btn(SOCD_MODES[2], cx))
                             .child(make_mode_btn(SOCD_MODES[3], cx)),
                     );
-                let action = remove(
-                    socd_element_id("socd-remove", pair, "x"),
-                    PairedEntry::Socd(pair),
-                    cx,
-                )
-                .into_any_element();
-                let head = row(
-                    icon,
-                    format!(
-                        "{} + {}",
-                        layout.label(pair.key_a),
-                        layout.label(pair.key_b)
-                    ),
-                    None,
-                    action,
-                    cx.theme(),
-                );
-                let tuning = h_flex()
-                    .justify_between()
+                let trailing = h_flex()
                     .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new(socd_element_id("socd-travel-dec", pair, "m"))
-                                    .outline()
-                                    .xsmall()
-                                    .label("−")
-                                    .disabled(busy)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.step_socd_travel(pair, -1, cx);
-                                    })),
-                            )
-                            .child(readout(
-                                format!("{} mm", mm(pair.trigger_point)),
-                                cx.theme(),
-                            ))
-                            .child(
-                                Button::new(socd_element_id("socd-travel-inc", pair, "p"))
-                                    .outline()
-                                    .xsmall()
-                                    .label("+")
-                                    .disabled(busy)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.step_socd_travel(pair, 1, cx);
-                                    })),
-                            ),
-                    )
                     .child(
                         h_flex().gap_1().child(muted_note("RT", cx.theme())).child(
                             Switch::new(socd_element_id("socd-rt", pair, "sw"))
@@ -2399,13 +2557,60 @@ fn render_configured(
                                     this.set_socd_rt(pair, *checked, cx);
                                 })),
                         ),
+                    )
+                    .child(remove(
+                        socd_element_id("socd-remove", pair, "x"),
+                        PairedEntry::Socd(pair),
+                        cx,
+                    ))
+                    .into_any_element();
+                let head = row(
+                    icon,
+                    format!(
+                        "{} + {}",
+                        layout.label(pair.key_a),
+                        layout.label(pair.key_b)
+                    ),
+                    None,
+                    trailing,
+                    cx.theme(),
+                );
+                let pair_stepper = h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(
+                        Button::new(socd_element_id("socd-travel-dec", pair, "m"))
+                            .outline()
+                            .xsmall()
+                            .label("−")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.step_socd_travel(pair, -1, cx);
+                            })),
+                    )
+                    .child(readout(format!("{} mm", mm(display_point)), cx.theme()))
+                    .child(
+                        Button::new(socd_element_id("socd-travel-inc", pair, "p"))
+                            .outline()
+                            .xsmall()
+                            .label("+")
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.step_socd_travel(pair, 1, cx);
+                            })),
                     );
                 rows.push(
                     v_flex()
                         .gap_1()
                         .child(head)
                         .child(mode_grid)
-                        .child(tuning)
+                        .child(slider_row(
+                            "Actuation point",
+                            pair_slider,
+                            pair_stepper,
+                            busy,
+                            cx.theme(),
+                        ))
                         .into_any_element(),
                 );
             }
@@ -2497,9 +2702,9 @@ fn render_configured(
     let theme = cx.theme();
     v_flex()
         .id("paired-configured")
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
+        .when(scrollable, |this| {
+            this.flex_1().min_h_0().overflow_y_scroll()
+        })
         .gap_1()
         .child(
             div()
