@@ -12,18 +12,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use agnoperiph_core::{
     BatteryStatus, Brightness, Capabilities, CoreError, CoreResult, DebounceMs, DeviceId,
     DeviceInfo, DeviceRegistry, DksBinding, DpiStage, HallEffectCapabilities, HallEffectSnapshot,
-    KeyCode, KeyHallEffectConfig, KeyIndex, KeyboardConfigCapabilities, KeyboardConfigSnapshot,
-    KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroCapabilities, MacroSlot,
-    ModTapBinding, Peripheral, PointerCapabilities, PointerSnapshot, PollingRateHz,
+    KeyCode, KeyHallEffectConfig, KeyIndex, KeyTravelSample, KeyboardConfigCapabilities,
+    KeyboardConfigSnapshot, KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroCapabilities,
+    MacroSlot, ModTapBinding, Peripheral, PointerCapabilities, PointerSnapshot, PollingRateHz,
     ProfileCapabilities, ProfileSlot, ProfileSnapshot, RapidSwitchPair, RapidTriggerConfig,
     RgbCapabilities, RgbEffect, RgbSnapshot, RgbZoneId, SocdPair, ToggleKeyBinding,
     TravelHundredthsMm,
 };
-use agnoperiph_driver_atk::AtkRs7Device;
+use agnoperiph_driver_atk::AtkDevice;
 use agnoperiph_driver_endgame_gear::EndgameGearDevice;
 use agnoperiph_driver_finalmouse::FinalmouseDevice;
 use agnoperiph_driver_lamzu::LamzuAtlantisDevice;
 use agnoperiph_driver_logitech::LogitechHidppDevice;
+use agnoperiph_driver_mchose::MchoseDevice;
 use agnoperiph_driver_pulsar::PulsarDevice;
 use agnoperiph_driver_razer::RazerDevice;
 use agnoperiph_driver_via::ViaKeyboardDevice;
@@ -283,6 +284,13 @@ pub trait PeripheralService: Send + Sync {
     fn packet_log(&self) -> Vec<PacketTraceEntry>;
 
     fn clear_packet_log(&self);
+
+    /// Reads currently depressed keys and their live travel depth for Hall Effect boards
+    /// advertising [`HallEffectCapabilities::supports_live_travel`].
+    fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
+        let _ = device;
+        Err(CoreError::UnsupportedCapability("live_key_travel"))
+    }
 
     fn apply_pointer_settings(
         &self,
@@ -1128,6 +1136,7 @@ fn build_registry() -> DeviceRegistry {
     registry.register_driver(agnoperiph_driver_logitech::driver_descriptor());
     registry.register_driver(agnoperiph_driver_lamzu::driver_descriptor());
     registry.register_driver(agnoperiph_driver_atk::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_mchose::driver_descriptor());
     registry.register_driver(agnoperiph_driver_razer::driver_descriptor());
     registry.register_driver(agnoperiph_driver_pulsar::driver_descriptor());
     registry.register_driver(agnoperiph_driver_finalmouse::driver_descriptor());
@@ -1157,7 +1166,8 @@ fn open_driver(
             dry_run,
             Some(sink),
         )?)),
-        "atk-rs7" => Ok(Box::new(AtkRs7Device::open(wrapped, dry_run, Some(sink))?)),
+        "atk-rs7" => Ok(Box::new(AtkDevice::open(wrapped, dry_run, Some(sink))?)),
+        "mchose-hid" => Ok(Box::new(MchoseDevice::open(wrapped, dry_run, Some(sink))?)),
         "razer-hid" => Ok(Box::new(RazerDevice::open(wrapped, dry_run, Some(sink))?)),
         "pulsar-hid" => Ok(Box::new(PulsarDevice::open(wrapped, dry_run, Some(sink))?)),
         "finalmouse-hid" => Ok(Box::new(FinalmouseDevice::open(
@@ -1451,6 +1461,16 @@ impl PeripheralService for LiveHidService {
 
     fn clear_packet_log(&self) {
         self.sink.log.clear();
+    }
+
+    fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
+        let mut state = lock(&self.state);
+        let target = state
+            .devices
+            .iter_mut()
+            .find(|d| d.snapshot.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+        require(target.peripheral.as_hall_effect_mut(), "hall_effect")?.read_live_key_travel()
     }
 }
 

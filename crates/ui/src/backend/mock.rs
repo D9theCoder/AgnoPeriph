@@ -10,12 +10,12 @@ use agnoperiph_core::{
     BatteryStatus, Brightness, CalibrationStatus, Capabilities, ChargingState, ConnectionKind,
     CoreError, CoreResult, DebounceMs, DeviceId, DeviceInfo, DksBinding, DksStageAction,
     DksTriggerDirection, DpiStage, DpiValue, HallEffectCapabilities, HallEffectSnapshot, KeyCode,
-    KeyHallEffectConfig, KeyIndex, KeyboardConfigCapabilities, KeyboardConfigSnapshot,
-    KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroActionKind, MacroCapabilities,
-    MacroSlot, MacroStep, PointerCapabilities, PointerSnapshot, PollingRateHz, ProfileCapabilities,
-    ProfileInfo, ProfileMode, ProfileSlot, ProfileSnapshot, RapidSwitchPair, RapidTriggerConfig,
-    RgbCapabilities, RgbColor, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId, RgbZoneInfo,
-    RgbZoneState, SocdMode, SocdPair, TravelHundredthsMm, VendorKind,
+    KeyHallEffectConfig, KeyIndex, KeyTravelSample, KeyboardConfigCapabilities,
+    KeyboardConfigSnapshot, KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroActionKind,
+    MacroCapabilities, MacroSlot, MacroStep, PointerCapabilities, PointerSnapshot, PollingRateHz,
+    ProfileCapabilities, ProfileInfo, ProfileMode, ProfileSlot, ProfileSnapshot, RapidSwitchPair,
+    RapidTriggerConfig, RgbCapabilities, RgbColor, RgbEffect, RgbEffectKind, RgbSnapshot,
+    RgbZoneId, RgbZoneInfo, RgbZoneState, SocdMode, SocdPair, TravelHundredthsMm, VendorKind,
 };
 use agnoperiph_driver_atk::protocol as atk;
 use agnoperiph_driver_lamzu::atlantis::{self, AtlantisRateFamily, Command as LamzuCommand};
@@ -347,6 +347,8 @@ struct MockDevice {
     /// The emulated device's stored state; only writes outside dry-run change it.
     stored: DeviceSnapshot,
     presented: DeviceSnapshot,
+    /// Simulated live Hall Effect key-travel samples for offline testing.
+    live_travel: Vec<KeyTravelSample>,
     transport: GuardedTransport<MockHidTransport>,
 }
 
@@ -364,6 +366,7 @@ impl MockDevice {
             factory: snapshot.clone(),
             presented: snapshot.clone(),
             stored: snapshot,
+            live_travel: Vec::new(),
             transport,
         }
     }
@@ -493,6 +496,18 @@ impl MockPeripheralService {
             sink: Arc::new(SequencedSink::new()),
         }
     }
+
+    /// Injects simulated live Hall Effect travel samples for a mock keyboard (for tests & `--mock`).
+    pub fn set_live_key_travel(&self, device: &DeviceId, samples: Vec<KeyTravelSample>) {
+        let mut state = lock(&self.state);
+        if let Some(target) = state
+            .devices
+            .iter_mut()
+            .find(|d| d.presented.info.id == *device)
+        {
+            target.live_travel = samples;
+        }
+    }
 }
 
 impl PeripheralService for MockPeripheralService {
@@ -570,6 +585,22 @@ impl PeripheralService for MockPeripheralService {
 
     fn clear_packet_log(&self) {
         self.sink.log.clear();
+    }
+
+    fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
+        let state = lock(&self.state);
+        let target = state
+            .devices
+            .iter()
+            .find(|d| d.presented.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+        let Some(he) = target.presented.hall_effect.as_ref() else {
+            return Err(CoreError::UnsupportedCapability("hall_effect"));
+        };
+        if !he.capabilities.has_live_travel() {
+            return Err(CoreError::UnsupportedCapability("live_key_travel"));
+        }
+        Ok(target.live_travel.clone())
     }
 }
 
@@ -714,7 +745,8 @@ fn atk_rs7_snapshot() -> DeviceSnapshot {
     .with_rapid_trigger_range(atk::RS7_RT_MIN, atk::RS7_RT_MAX, true)
     .with_max_dks_bindings(atk::RS7_MAX_DKS_SLOTS)
     .with_max_socd_pairs(atk::RS7_MAX_SOCD_SLOTS)
-    .with_calibration_status(true);
+    .with_calibration_status(true)
+    .with_live_travel(true);
 
     DeviceSnapshot {
         info,

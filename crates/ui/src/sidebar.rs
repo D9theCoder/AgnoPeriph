@@ -47,13 +47,17 @@ pub(crate) fn render(
                 app.config()
                     .preset_name(device.id(), agnoperiph_core::ProfileSlot::new(slot))
             });
-            render_row(device, is_selected, preset, cx).into_any_element()
+            let unsaved = (app.draft_device.as_ref() == Some(device.id()))
+                .then(|| app.pending_changes().len())
+                .filter(|n| *n > 0);
+            render_row(device, is_selected, preset, unsaved, cx).into_any_element()
         })
         .collect();
     let game_count = app.config().game_profiles.len();
     let active_game = app.active_game_name().map(str::to_owned);
     let close_to_tray = app.config().close_to_tray;
     let start_with_windows = app.config().start_with_windows;
+    let low_battery_alerts = app.config().low_battery_alerts;
     let theme = cx.theme();
     let muted = theme.muted_foreground;
 
@@ -126,15 +130,7 @@ pub(crate) fn render(
                                                     .truncate()
                                                     .child(games_status),
                                             ),
-                                    )
-                                    .when(active_game.is_some(), |this| {
-                                        this.child(
-                                            div()
-                                                .size_2()
-                                                .rounded_full()
-                                                .bg(cx.theme().success),
-                                        )
-                                    }),
+                                    ),
                             )
                             .on_click(cx.listener(|this, _, _, cx| this.open_game_profiles(cx))),
                     ),
@@ -163,6 +159,16 @@ pub(crate) fn render(
                                 .on_change(cx.listener(|this, checked: &bool, _, cx| {
                                     this.set_start_with_windows(*checked, cx);
                                 })),
+                        )
+                        .child(
+                            Switch::new("pref-low-battery")
+                                .small()
+                                .label("Low-battery alerts")
+                                .checked(low_battery_alerts)
+                                .tooltip("Notify once below 20% and again below 5% while a wireless device runs on battery")
+                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.set_low_battery_alerts(*checked, cx);
+                                })),
                         ),
                 ),
         )
@@ -172,6 +178,7 @@ fn render_row(
     device: &DeviceSnapshot,
     is_selected: bool,
     preset: Option<String>,
+    unsaved: Option<usize>,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let theme = cx.theme();
@@ -183,11 +190,14 @@ fn render_row(
     } else {
         IconName::Cpu
     };
-    let detail = preset.unwrap_or_else(|| {
+    let mut detail = preset.unwrap_or_else(|| {
         info.firmware_version
             .clone()
             .unwrap_or_else(|| "Firmware unknown".to_owned())
     });
+    if let Some(count) = unsaved {
+        detail = format!("{detail} · {count} unsaved");
+    }
     let battery = device
         .capabilities
         .has_battery()
@@ -237,7 +247,9 @@ fn render_row(
                         .child(div().text_xs().text_color(muted).truncate().child(detail)),
                 ),
         )
-        .on_click(cx.listener(move |this, _, _, cx| this.select_device(id.clone(), cx)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.request_select_device(id.clone(), window, cx);
+        }))
 }
 
 fn battery_tag(battery: BatteryStatus) -> Tag {

@@ -187,6 +187,10 @@ pub struct KeyboardConfigCapabilities {
     pub supports_six_key_rollover: bool,
     pub supports_anti_accidental_touch: bool,
     pub supports_extreme_mode: bool,
+    #[serde(default)]
+    pub supports_fn_inversion: bool,
+    #[serde(default)]
+    pub supports_game_mode: bool,
     pub supported_polling_rates: Vec<PollingRateHz>,
 }
 
@@ -208,8 +212,20 @@ impl KeyboardConfigCapabilities {
             supports_six_key_rollover,
             supports_anti_accidental_touch,
             supports_extreme_mode,
+            supports_fn_inversion: false,
+            supports_game_mode: false,
             supported_polling_rates,
         }
+    }
+
+    pub const fn with_fn_inversion(mut self, enabled: bool) -> Self {
+        self.supports_fn_inversion = enabled;
+        self
+    }
+
+    pub const fn with_game_mode(mut self, enabled: bool) -> Self {
+        self.supports_game_mode = enabled;
+        self
     }
 }
 
@@ -223,6 +239,10 @@ pub struct KeyboardConfigSnapshot {
     pub six_key_rollover: bool,
     pub anti_accidental_touch: bool,
     pub extreme_mode: bool,
+    #[serde(default)]
+    pub fn_inversion: bool,
+    #[serde(default)]
+    pub game_mode: bool,
     pub polling_rate: PollingRateHz,
 }
 
@@ -244,8 +264,20 @@ impl KeyboardConfigSnapshot {
             six_key_rollover,
             anti_accidental_touch,
             extreme_mode,
+            fn_inversion: false,
+            game_mode: false,
             polling_rate,
         }
+    }
+
+    pub const fn with_fn_inversion(mut self, enabled: bool) -> Self {
+        self.fn_inversion = enabled;
+        self
+    }
+
+    pub const fn with_game_mode(mut self, enabled: bool) -> Self {
+        self.game_mode = enabled;
+        self
     }
 }
 

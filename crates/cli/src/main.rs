@@ -10,11 +10,12 @@ use agnoperiph_core::{
     PollingRateHz, ProfileSlot, ProfileSnapshot, RapidTriggerConfig, RgbSnapshot,
     TravelHundredthsMm,
 };
-use agnoperiph_driver_atk::AtkRs7Device;
+use agnoperiph_driver_atk::AtkDevice;
 use agnoperiph_driver_endgame_gear::EndgameGearDevice;
 use agnoperiph_driver_finalmouse::FinalmouseDevice;
 use agnoperiph_driver_lamzu::LamzuAtlantisDevice;
 use agnoperiph_driver_logitech::LogitechHidppDevice;
+use agnoperiph_driver_mchose::MchoseDevice;
 use agnoperiph_driver_pulsar::PulsarDevice;
 use agnoperiph_driver_razer::RazerDevice;
 use agnoperiph_driver_via::ViaKeyboardDevice;
@@ -242,6 +243,7 @@ fn build_registry() -> DeviceRegistry {
     registry.register_driver(agnoperiph_driver_logitech::driver_descriptor());
     registry.register_driver(agnoperiph_driver_lamzu::driver_descriptor());
     registry.register_driver(agnoperiph_driver_atk::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_mchose::driver_descriptor());
     registry.register_driver(agnoperiph_driver_razer::driver_descriptor());
     registry.register_driver(agnoperiph_driver_pulsar::driver_descriptor());
     registry.register_driver(agnoperiph_driver_finalmouse::driver_descriptor());
@@ -385,8 +387,13 @@ fn open_matched_driver(
             Ok(Box::new(dev))
         }
         "atk-rs7" => {
-            let dev = AtkRs7Device::open(wrapped, dry_run, Some(sink))
-                .context("failed to probe ATK RS7 Hall Effect keyboard")?;
+            let dev = AtkDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe ATK / VGN / VXE peripheral")?;
+            Ok(Box::new(dev))
+        }
+        "mchose-hid" => {
+            let dev = MchoseDevice::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe MCHOSE mouse")?;
             Ok(Box::new(dev))
         }
         "razer-hid" => {
@@ -910,6 +917,12 @@ mod tests {
     #[test]
     fn registry_registers_all_vendor_drivers() {
         let registry = build_registry();
-        assert_eq!(registry.drivers().len(), 10);
+        assert_eq!(registry.drivers().len(), 11);
+        assert!(
+            registry
+                .drivers()
+                .iter()
+                .any(|d| d.driver_id == "mchose-hid")
+        );
     }
 }

@@ -213,6 +213,13 @@ pub struct AppConfig {
     pub close_to_tray: bool,
     /// Launch AgnoPeriph when the user signs in to Windows.
     pub start_with_windows: bool,
+    /// Show a Windows notification when a wireless device's battery runs low.
+    #[serde(default = "default_true")]
+    pub low_battery_alerts: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -226,6 +233,7 @@ impl Default for AppConfig {
             default_targets: BTreeMap::new(),
             close_to_tray: true,
             start_with_windows: false,
+            low_battery_alerts: true,
         }
     }
 }

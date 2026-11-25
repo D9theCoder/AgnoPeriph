@@ -118,10 +118,14 @@ Before designing or writing any UI code, **read both normative guides in full**:
 ### 6.1 Visual Verification (Headless Screenshots)
 Behavior tests (`tests/ui.rs`) cannot show what the UI looks like. Any change with a visible surface (layout, spacing, color, theme, copy) must also be checked by rendering screenshots and **actually viewing them** before the work is reported done. Never launch the real binary for this: it enumerates live HID devices.
 
-1. **Run:** `cargo test -p agnoperiph --test visual -- --ignored --nocapture`. It renders the production `AgnoPeriphApp` against `MockPeripheralService` at 1240×820 with dev tools off, in light and dark themes, and writes PNGs to `target/ui-screenshots/` (`<view>-<theme>.png`, 2× scale).
-2. **View:** open each PNG that your change affects with the image Read tool and review it against the design guides and any reference screenshots. Check text, truncation, overlap, clipping at the window edge, alignment and both themes.
-3. **Extend:** add views or states in `crates/ui/tests/visual.rs` by driving the UI first, with the same helpers as `tests/ui.rs` (`click`, `open_tab`, `set_theme`), then calling `save(cx, handle, "name")`. Use the mock only.
-4. **Report:** say which screenshots you viewed and what you fixed. If the renderer is unavailable (no GPU adapter, CI), say the visual check was skipped. Do not claim it passed.
+1. **Run:** `cargo test -p agnoperiph --test visual -- --ignored --nocapture` (or `.\scripts\dev.ps1 visual [filter]`). It renders the production `AgnoPeriphApp` against `MockPeripheralService` at 1240×820 with dev tools off, in light and dark themes, and writes PNGs to `target/ui-screenshots/` (`<view>-<theme>.png`, 2× scale).
+   - **Filter views during iteration:** Set `AGNO_VISUAL=<comma-separated substrings>` (e.g., `.\scripts\dev.ps1 visual triggers,mouse-sensor`) to render only the affected views.
+   - **Baseline pixel diffing:** Run `.\scripts\dev.ps1 visual-baseline` (`AGNO_VISUAL_UPDATE_BASELINE=1`) to save baselines in `target/ui-screenshots-baseline/`; subsequent runs print `%` pixel diff vs. baseline (and fail if `AGNO_VISUAL_MAX_DIFF` is set and exceeded).
+   - **Human live preview:** Humans can run `.\scripts\dev.ps1 mock` (`cargo run -p agnoperiph -- --mock`) or `.\scripts\dev.ps1 watch-mock` to preview UI changes in a real window without touching live HID hardware.
+2. **HTML-first prototyping (medium-to-big frontend changes only):** For new screens, complex multi-panel layouts, or comparing design options, prototype the layout in an inline HTML/CSS preview first so the user can approve or tweak spacing and hierarchy in seconds before writing GPUI Rust code. Skip this for small tweaks (padding, labels, single controls) and go straight to Rust + filtered `tests/visual.rs`.
+3. **View:** open each PNG that your change affects with the image Read tool and review it against the design guides and any reference screenshots. Check text, truncation, overlap, clipping at the window edge, alignment and both themes.
+4. **Extend:** add views or states in `crates/ui/tests/visual.rs` by driving the UI first, with the same helpers as `tests/ui.rs` (`click`, `open_tab`, `set_theme`), then calling `save(cx, handle, "name")`. Use the mock only.
+5. **Report:** say which screenshots you viewed and what you fixed. If the renderer is unavailable (no GPU adapter, CI), say the visual check was skipped. Do not claim it passed.
 
 How it works, so nobody has to rediscover it:
 - **Renderer:** gpui supplies no headless renderer on Windows (`current_headless_renderer()` returns `None`). `tests/visual.rs` therefore builds a `HeadlessAppContext` with `gpui_wgpu::WgpuHeadlessRenderer` from the dev-dependency `gpui-fast-wgpu` (lib name `gpui_wgpu`), pinned to the exact `gpui-fast` version `gpui-kit` uses (`=0.1.19`). The context loads `agnoperiph::icons::AppAssets`, the same asset source as the app, so custom and extra icons render. This dev-dependency (plus `image` and `anyhow`) is the one allowed exception to "single UI dependency". It is test-only and must never move into `[dependencies]`. When upgrading `gpui-kit`, bump the pin to match, or the build fails with "multiple versions of crate `gpui`".
@@ -137,7 +141,9 @@ Work one phase at a time and wait for user confirmation between phases:
 3. **Phase 3:** ATK RS7 protocol implementation from documented references, `docs/protocols/atk-rs7.md`, `driver-atk` with fixture tests, live CLI validation.
 4. **Phase 4:** `crates/ui` with `gpui-kit` (device sidebar, capability-driven mouse & ATK RS7 Hall Effect editors, collapsible live HID packet inspector).
 
-Before completing any phase or milestone, run and verify:
+During active iteration, run targeted crate tests (`cargo test -p <crate>` or `.\scripts\dev.ps1 test <crate>`) rather than the entire workspace on every edit.
+
+Before completing any phase or milestone, run and verify (or `.\scripts\dev.ps1 check`):
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -147,3 +153,13 @@ For UI changes, also run and view the screenshots (§6.1):
 ```powershell
 cargo test -p agnoperiph --test visual -- --ignored --nocapture
 ```
+
+### 7.1 Target Directory & Build Cache Hygiene
+- `Cargo.toml` sets `[profile.dev.package."*"] debug = "line-tables-only"` to keep Windows `.pdb`/`.rlib` sizes manageable while preserving dependency backtraces and full debug info for workspace crates.
+- **Never touch or delete `target/release/`** (avoid bare `cargo clean`, which wipes release builds).
+- To reclaim disk space from dev/test caches, clean only the dev profile or prune stale artifacts with `cargo-sweep`:
+  ```powershell
+  cargo clean --profile dev
+  # or, with cargo-sweep installed:
+  cargo sweep --time 7
+  ```

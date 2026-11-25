@@ -5,6 +5,10 @@
 //!
 //! ```powershell
 //! cargo test -p agnoperiph --test visual -- --ignored --nocapture
+//! # Or filter to specific views (comma-separated substrings, case-insensitive):
+//! $env:AGNO_VISUAL = "triggers,mouse-sensor"; cargo test -p agnoperiph --test visual -- --ignored --nocapture
+//! # Save/update baselines in target/ui-screenshots-baseline/ for pixel-diff reporting:
+//! $env:AGNO_VISUAL_UPDATE_BASELINE = "1"; cargo test -p agnoperiph --test visual -- --ignored --nocapture
 //! ```
 //!
 //! Images land in `target/ui-screenshots/`. Never touches HID hardware: only
@@ -18,14 +22,15 @@ use agnoperiph::backend::{
     MOCK_KEYBOARD_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID,
     MockPeripheralService, PeripheralService,
 };
+use agnoperiph::key_tester::{LIVE_POLL_INTERVAL, TesterSource};
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, device_element_id};
-use agnoperiph_core::DeviceId;
+use agnoperiph_core::{DeviceId, KeyIndex, KeyTravelSample, TravelHundredthsMm};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, Bounds, DevicePixels, ElementId, Entity, Font, FontId, FontMetrics, FontRun,
-    GlyphId, HeadlessAppContext, Hsla, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams,
-    Size, TextRenderingMode, px, size,
+    AnyWindowHandle, AppContext, Bounds, DevicePixels, ElementId, Entity, Font, FontId,
+    FontMetrics, FontRun, GlyphId, HeadlessAppContext, Hsla, LineLayout, Pixels,
+    PlatformTextSystem, RenderGlyphParams, Size, TextRenderingMode, px, size,
 };
 
 const WIDTH: f32 = 1240.;
@@ -37,6 +42,82 @@ fn screenshot_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-screenshots");
     std::fs::create_dir_all(&dir).expect("create screenshot dir");
     dir.canonicalize().expect("resolve screenshot dir")
+}
+
+fn baseline_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-screenshots-baseline")
+}
+
+/// Returns `true` when `name` matches `AGNO_VISUAL` (comma-separated case-insensitive substrings),
+/// or when `AGNO_VISUAL` is unset/empty.
+fn matches_filter(name: &str) -> bool {
+    let Ok(raw) = std::env::var("AGNO_VISUAL") else {
+        return true;
+    };
+    let filters: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if filters.is_empty() {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    filters.iter().any(|f| lower.contains(f))
+}
+
+fn compare_with_baseline(name: &str, current: &image::RgbaImage) {
+    let update = std::env::var("AGNO_VISUAL_UPDATE_BASELINE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let base_dir = baseline_dir();
+    let base_path = base_dir.join(format!("{name}.png"));
+
+    if update {
+        std::fs::create_dir_all(&base_dir).expect("create baseline dir");
+        current.save(&base_path).expect("write baseline png");
+        println!("  baseline updated: {}", base_path.display());
+        return;
+    }
+
+    let Ok(baseline_img) = image::open(&base_path) else {
+        return;
+    };
+    let baseline = baseline_img.to_rgba8();
+    if baseline.dimensions() != current.dimensions() {
+        println!(
+            "  diff: DIMENSION MISMATCH (baseline {:?} vs current {:?})",
+            baseline.dimensions(),
+            current.dimensions()
+        );
+        return;
+    }
+
+    let total_pixels = current.width().saturating_mul(current.height());
+    let mut changed_pixels = 0u32;
+    for (a, b) in baseline.pixels().zip(current.pixels()) {
+        let differs =
+            a.0.iter()
+                .zip(b.0.iter())
+                .any(|(ca, cb)| ca.abs_diff(*cb) > 2);
+        if differs {
+            changed_pixels = changed_pixels.saturating_add(1);
+        }
+    }
+    let pct = if total_pixels == 0 {
+        0.0
+    } else {
+        (f64::from(changed_pixels) / f64::from(total_pixels)) * 100.0
+    };
+    println!("  diff vs baseline: {pct:.3}% ({changed_pixels}/{total_pixels} px)");
+
+    if let Ok(max_str) = std::env::var("AGNO_VISUAL_MAX_DIFF")
+        && let Ok(max_pct) = max_str.parse::<f64>()
+    {
+        assert!(
+            pct <= max_pct,
+            "visual regression on '{name}': {pct:.3}% changed pixels exceeds AGNO_VISUAL_MAX_DIFF={max_pct:.3}%"
+        );
+    }
 }
 
 /// The Windows DirectWrite text system, forced to grayscale glyphs so snapshots don't
@@ -119,20 +200,21 @@ fn open_with(
 ) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
     cx.update(gpui_kit::init);
     let service: Arc<dyn PeripheralService> = Arc::new(service);
+    // Mount `Root` as `gpui_kit::open_window` does, so dialogs and popovers have their layers.
+    let mut built = None;
     let window = cx
         .open_window(size(px(WIDTH), px(height)), |window, cx| {
-            AgnoPeriphApp::build(
+            let view = AgnoPeriphApp::build(
                 service,
                 AppOptions::default().with_dev_tools(false),
                 window,
                 cx,
-            )
+            );
+            built = Some(view.clone());
+            cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
         })
         .expect("open headless window");
-    let app = cx
-        .update_window(window.into(), |root, _, _| root.downcast::<AgnoPeriphApp>())
-        .expect("window")
-        .expect("app root");
+    let app = built.expect("app root");
     settle(cx, window.into());
     (window.into(), app)
 }
@@ -168,11 +250,17 @@ fn set_theme(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, mode: ThemeMo
 }
 
 fn save(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, name: &str) {
+    if !matches_filter(name) {
+        return;
+    }
+    // Let dialog and popover enter animations finish.
+    cx.advance_clock(std::time::Duration::from_millis(600));
     settle(cx, handle);
     let image = cx.capture_screenshot(handle).expect("capture screenshot");
     let path = screenshot_dir().join(format!("{name}.png"));
     image.save(&path).expect("write png");
     println!("screenshot: {}", path.display());
+    compare_with_baseline(name, &image);
 }
 
 #[test]
@@ -249,7 +337,162 @@ fn capture_multi_brand_screens() {
         save(&mut cx, wooting, &format!("wooting-triggers-{suffix}"));
         click(&mut cx, wooting, ("key", 14u64));
         click(&mut cx, wooting, "actuation-inc");
-        click(&mut cx, wooting, "apply-actuation-key");
+        click(&mut cx, wooting, "dirty-apply");
         save(&mut cx, wooting, &format!("wooting-unsupported-{suffix}"));
+    }
+}
+
+/// Opens the mock keyboard on its Triggers tab with E selected and two unsaved edits.
+fn dirty_triggers(
+    cx: &mut HeadlessAppContext,
+    mode: ThemeMode,
+) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
+    let (handle, app) = open(cx);
+    set_theme(cx, handle, mode);
+    click(
+        cx,
+        handle,
+        device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+    );
+    open_tab(cx, handle, KeyboardTab::Triggers);
+    click(cx, handle, ("key", 35u64));
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, "rapid-trigger");
+    open_tab(cx, handle, KeyboardTab::Advanced);
+    click(cx, handle, "config-win-lock");
+    open_tab(cx, handle, KeyboardTab::Triggers);
+    (handle, app)
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_unsaved_changes_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let (handle, _) = dirty_triggers(&mut cx, mode);
+        save(&mut cx, handle, &format!("dirty-triggers-{suffix}"));
+        click(&mut cx, handle, "dirty-changes");
+        save(&mut cx, handle, &format!("dirty-changes-{suffix}"));
+        click(&mut cx, handle, "dirty-changes");
+        open_tab(&mut cx, handle, KeyboardTab::Advanced);
+        save(&mut cx, handle, &format!("advanced-dirty-{suffix}"));
+        click(&mut cx, handle, "dirty-discard");
+        save(&mut cx, handle, &format!("discard-toast-{suffix}"));
+
+        // Leaving the device with unsaved edits asks first.
+        let (handle, _) = dirty_triggers(&mut cx, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(agnoperiph::backend::MOCK_MOUSE_ID)),
+        );
+        save(&mut cx, handle, &format!("unsaved-guard-{suffix}"));
+
+        let (tall, _) = open_with(&mut cx, MockPeripheralService::new(), TALL_HEIGHT);
+        set_theme(&mut cx, tall, mode);
+        click(&mut cx, tall, ("dpi-inc", 1u64));
+        click(&mut cx, tall, ("polling-rate", 500u64));
+        save(&mut cx, tall, &format!("mouse-dirty-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_profile_file_and_shortcut_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let (handle, app) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        let (_, json) = cx
+            .update(|cx| app.read(cx).export_profile_json())
+            .expect("keyboard exports");
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_import_preview("RS7 FPS.json", &json, window, cx);
+            });
+        })
+        .unwrap();
+        save(&mut cx, handle, &format!("import-preview-{suffix}"));
+
+        let (handle, app) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_import_preview("notes.json", "{ not json", window, cx);
+            });
+        })
+        .unwrap();
+        save(&mut cx, handle, &format!("import-error-{suffix}"));
+
+        let (handle, _) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(&mut cx, handle, "shortcuts-toggle");
+        save(&mut cx, handle, &format!("shortcuts-{suffix}"));
+
+        let (handle, _) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        click(&mut cx, handle, "quick-presets");
+        save(&mut cx, handle, &format!("quick-presets-menu-{suffix}"));
+        let (handle, _) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        click(&mut cx, handle, "profile-file-menu");
+        save(&mut cx, handle, &format!("profile-file-menu-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_live_tester_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let service = MockPeripheralService::new();
+        let keyboard = DeviceId::new(MOCK_KEYBOARD_ID);
+        service.set_live_key_travel(
+            &keyboard,
+            vec![KeyTravelSample::new(
+                KeyIndex::new(35),
+                TravelHundredthsMm::from_hundredths(180),
+            )],
+        );
+        let (handle, app) = open_with(&mut cx, service, HEIGHT);
+        set_theme(&mut cx, handle, mode);
+        click(&mut cx, handle, device_element_id(&keyboard));
+        open_tab(&mut cx, handle, KeyboardTab::Triggers);
+        // Rapid Trigger on E shows the release/press band on the meter.
+        click(&mut cx, handle, ("key", 35u64));
+        click(&mut cx, handle, "rapid-trigger");
+        for _ in 0..5 {
+            click(&mut cx, handle, "press-sensitivity-inc");
+            click(&mut cx, handle, "release-sensitivity-inc");
+        }
+        cx.update(|cx| {
+            app.update(cx, |app, cx| app.set_tester_source(TesterSource::Live, cx));
+        });
+        for _ in 0..6 {
+            cx.advance_clock(LIVE_POLL_INTERVAL);
+            settle(&mut cx, handle);
+        }
+        save(&mut cx, handle, &format!("live-tester-{suffix}"));
     }
 }

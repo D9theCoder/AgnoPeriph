@@ -1,7 +1,8 @@
 //! Logitech HID++ 1.0 / 2.0 wire protocol constants, framing, and decoding helpers.
 
 use agnoperiph_core::{
-    BatteryStatus, ChargingState, CoreError, CoreResult, PollingRateHz, ProfileMode,
+    BatteryStatus, Brightness, ChargingState, CoreError, CoreResult, PollingRateHz, ProfileMode,
+    RgbColor, RgbDirection, RgbEffect, RgbEffectKind,
 };
 use agnoperiph_transport::FixedReportValidator;
 
@@ -39,8 +40,263 @@ pub mod feature {
     pub const BATTERY_VOLTAGE: u16 = 0x1001;
     pub const UNIFIED_BATTERY: u16 = 0x1004;
     pub const ADJUSTABLE_DPI: u16 = 0x2201;
+    pub const REPROG_CONTROLS_V4: u16 = 0x1B04;
+    pub const FN_INVERSION: u16 = 0x40A0;
+    pub const NEW_FN_INVERSION: u16 = 0x40A2;
+    pub const K375S_FN_INVERSION: u16 = 0x40A3;
+    pub const DISABLE_KEYS_BY_USAGE: u16 = 0x4522;
     pub const REPORT_RATE: u16 = 0x8060;
+    pub const COLOR_LED_EFFECTS: u16 = 0x8070;
+    pub const RGB_EFFECTS: u16 = 0x8071;
     pub const ONBOARD_PROFILES: u16 = 0x8100;
+
+    /// Optional keyboard features probed (in this exact order) after the mouse features.
+    pub const KEYBOARD_PROBE_ORDER: [u16; 7] = [
+        RGB_EFFECTS,
+        COLOR_LED_EFFECTS,
+        K375S_FN_INVERSION,
+        NEW_FN_INVERSION,
+        FN_INVERSION,
+        DISABLE_KEYS_BY_USAGE,
+        REPROG_CONTROLS_V4,
+    ];
+}
+
+/// `ColorLEDEffects` (`0x8070`) / `RGBEffects` (`0x8071`) effect IDs.
+pub mod led_effect {
+    pub const OFF: u16 = 0x00;
+    pub const STATIC: u16 = 0x01;
+    pub const CYCLE: u16 = 0x03;
+    pub const WAVE: u16 = 0x04;
+    pub const BREATHING: u16 = 0x0A;
+    pub const CYCLE_SATURATION: u16 = 0x15;
+    pub const WAVE_SATURATION: u16 = 0x16;
+}
+
+/// HID usages disabled by `DisableKeysByUsage` (`0x4522`) for Game Mode / Win Lock:
+/// Left GUI, Right GUI, Application.
+pub const GAME_MODE_USAGES: [u8; 3] = [0xE3, 0xE7, 0x65];
+
+/// Maximum number of 8-bit usages that fit in one `DisableKeysByUsage` request.
+pub const MAX_DISABLE_KEY_USAGES: usize = 16;
+
+/// `ReprogControlsV4` (`0x1B04`) control flag: the control can be remapped.
+pub const KEY_FLAG_REPROGRAMMABLE: u16 = 0x0010;
+
+/// Validates a `DisableKeysByUsage` (`0x4522`) usage list before it reaches the wire.
+///
+/// `0x00` is rejected because zero padding terminates the list on the device.
+pub fn validate_key_usages(usages: &[u8], capacity: usize) -> CoreResult<()> {
+    let limit = capacity.min(MAX_DISABLE_KEY_USAGES);
+    if usages.is_empty() || usages.len() > limit {
+        return Err(CoreError::OutOfRange {
+            field: "key_usages",
+            actual: usages.len().to_string(),
+            expected: format!("1..={limit} usages"),
+        });
+    }
+    if usages.contains(&0x00) {
+        return Err(CoreError::Validation(
+            "HID usage 0x00 is not a valid key usage".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Maps a Logitech LED effect ID onto the brand-agnostic [`RgbEffectKind`].
+pub const fn led_effect_kind(effect_id: u16) -> Option<RgbEffectKind> {
+    match effect_id {
+        led_effect::OFF => Some(RgbEffectKind::Off),
+        led_effect::STATIC => Some(RgbEffectKind::Static),
+        led_effect::CYCLE | led_effect::CYCLE_SATURATION => Some(RgbEffectKind::SpectrumCycle),
+        led_effect::WAVE | led_effect::WAVE_SATURATION => Some(RgbEffectKind::Wave),
+        led_effect::BREATHING => Some(RgbEffectKind::Breathing),
+        _ => None,
+    }
+}
+
+/// Effect IDs to try for a requested kind, most preferred first.
+///
+/// `0x16` is preferred over `0x04` because the `0x04` Wave parameter layout is only
+/// assumed upstream (Solaar borrows it from `0x16`).
+pub const fn led_effect_candidates(kind: RgbEffectKind) -> &'static [u16] {
+    match kind {
+        RgbEffectKind::Off => &[led_effect::OFF],
+        RgbEffectKind::Static => &[led_effect::STATIC],
+        RgbEffectKind::Breathing => &[led_effect::BREATHING],
+        RgbEffectKind::SpectrumCycle => &[led_effect::CYCLE, led_effect::CYCLE_SATURATION],
+        RgbEffectKind::Wave => &[led_effect::WAVE_SATURATION, led_effect::WAVE],
+        RgbEffectKind::Reactive | RgbEffectKind::Preset => &[],
+    }
+}
+
+const PERIOD_FASTEST_MS: u16 = 1_000;
+const PERIOD_STEP_MS: u16 = 40;
+const PERIOD_SLOWEST_MS: u16 = PERIOD_FASTEST_MS + PERIOD_STEP_MS * 255;
+
+/// Host-side mapping of the brand-agnostic speed (`255` = fastest) to an effect period in ms.
+pub fn speed_to_period_ms(speed: u8) -> u16 {
+    PERIOD_SLOWEST_MS - PERIOD_STEP_MS * u16::from(speed)
+}
+
+/// Inverse of [`speed_to_period_ms`]; periods outside the mapped range are clamped.
+pub fn period_ms_to_speed(period_ms: u16) -> u8 {
+    let clamped = period_ms.clamp(PERIOD_FASTEST_MS, PERIOD_SLOWEST_MS);
+    u8::try_from((PERIOD_SLOWEST_MS - clamped) / PERIOD_STEP_MS).unwrap_or(u8::MAX)
+}
+
+const fn direction_to_wire(direction: RgbDirection) -> u8 {
+    match direction {
+        RgbDirection::LeftToRight => 1,
+        RgbDirection::TopToBottom => 2,
+        RgbDirection::RightToLeft => 6,
+        RgbDirection::BottomToTop => 7,
+    }
+}
+
+const fn direction_from_wire(raw: u8) -> RgbDirection {
+    match raw {
+        2 => RgbDirection::TopToBottom,
+        6 => RgbDirection::RightToLeft,
+        7 => RgbDirection::BottomToTop,
+        _ => RgbDirection::LeftToRight,
+    }
+}
+
+fn scale_color(color: RgbColor, brightness: Brightness) -> RgbColor {
+    let scale = |c: u8| {
+        u8::try_from(u16::from(c) * u16::from(brightness.percent()) / 100).unwrap_or(u8::MAX)
+    };
+    RgbColor::new(scale(color.r), scale(color.g), scale(color.b))
+}
+
+fn put_period(params: &mut [u8; 10], offset: usize, speed: u8) {
+    params[offset..offset + 2].copy_from_slice(&speed_to_period_ms(speed).to_be_bytes());
+}
+
+/// Encodes the 10-byte effect parameter block that follows the effect ordinal byte.
+///
+/// Offsets follow Solaar `hidpp20.py` `LEDEffects`. Static has no intensity field, so the
+/// brightness is applied to the color on the host.
+pub fn encode_led_effect_params(
+    effect_id: u16,
+    effect: &RgbEffect,
+    brightness: Brightness,
+) -> CoreResult<[u8; 10]> {
+    let mut params = [0u8; 10];
+    let intensity = brightness.percent();
+    match (effect_id, effect) {
+        (led_effect::OFF, RgbEffect::Off) => {}
+        (led_effect::STATIC, RgbEffect::Static { color }) => {
+            let scaled = scale_color(*color, brightness);
+            params[..3].copy_from_slice(&[scaled.r, scaled.g, scaled.b]);
+            params[3] = 0x02;
+        }
+        (led_effect::CYCLE, RgbEffect::SpectrumCycle { speed }) => {
+            put_period(&mut params, 5, *speed);
+            params[7] = intensity;
+        }
+        (led_effect::CYCLE_SATURATION, RgbEffect::SpectrumCycle { speed }) => {
+            params[1] = 0xFF;
+            put_period(&mut params, 6, *speed);
+            params[8] = intensity;
+        }
+        (led_effect::WAVE, RgbEffect::Wave { speed, direction }) => {
+            put_period(&mut params, 6, *speed);
+            params[9] = direction_to_wire(*direction);
+        }
+        (led_effect::WAVE_SATURATION, RgbEffect::Wave { speed, direction }) => {
+            params[1] = 0xFF;
+            put_period(&mut params, 6, *speed);
+            params[8] = intensity;
+            params[9] = direction_to_wire(*direction);
+        }
+        (led_effect::BREATHING, RgbEffect::Breathing { color, speed }) => {
+            params[..3].copy_from_slice(&[color.r, color.g, color.b]);
+            put_period(&mut params, 3, *speed);
+            params[6] = intensity;
+        }
+        _ => {
+            return Err(CoreError::Validation(format!(
+                "effect {:?} cannot be encoded as Logitech LED effect 0x{effect_id:02X}",
+                effect.kind()
+            )));
+        }
+    }
+    Ok(params)
+}
+
+fn read_speed(params: &[u8], offset: usize) -> u8 {
+    period_ms_to_speed(u16::from_be_bytes([params[offset], params[offset + 1]]))
+}
+
+fn read_brightness(raw: u8) -> Brightness {
+    Brightness::new(raw.min(100)).unwrap_or_else(|_| full_brightness())
+}
+
+/// Returns a 100% [`Brightness`].
+pub fn full_brightness() -> Brightness {
+    Brightness::new(100).expect("100 is a valid brightness")
+}
+
+/// Decodes a 10-byte effect parameter block (inverse of [`encode_led_effect_params`]).
+pub fn decode_led_effect_params(effect_id: u16, params: &[u8]) -> Option<(RgbEffect, Brightness)> {
+    if params.len() < 10 {
+        return None;
+    }
+    let color = RgbColor::new(params[0], params[1], params[2]);
+    let decoded = match effect_id {
+        led_effect::OFF => (RgbEffect::Off, full_brightness()),
+        led_effect::STATIC => (RgbEffect::Static { color }, full_brightness()),
+        led_effect::CYCLE => (
+            RgbEffect::SpectrumCycle {
+                speed: read_speed(params, 5),
+            },
+            read_brightness(params[7]),
+        ),
+        led_effect::CYCLE_SATURATION => (
+            RgbEffect::SpectrumCycle {
+                speed: read_speed(params, 6),
+            },
+            read_brightness(params[8]),
+        ),
+        led_effect::WAVE => (
+            RgbEffect::Wave {
+                speed: read_speed(params, 6),
+                direction: direction_from_wire(params[9]),
+            },
+            full_brightness(),
+        ),
+        led_effect::WAVE_SATURATION => (
+            RgbEffect::Wave {
+                speed: read_speed(params, 6),
+                direction: direction_from_wire(params[9]),
+            },
+            read_brightness(params[8]),
+        ),
+        led_effect::BREATHING => (
+            RgbEffect::Breathing {
+                color,
+                speed: read_speed(params, 3),
+            },
+            read_brightness(params[6]),
+        ),
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+/// Display name of an LED zone location (Solaar `LEDZoneLocations`).
+pub fn led_zone_name(location: u16, index: u8) -> String {
+    match location {
+        0x01 => "Primary".to_owned(),
+        0x02 => "Logo".to_owned(),
+        0x03 => "Left Side".to_owned(),
+        0x04 => "Right Side".to_owned(),
+        0x05 => "Combined".to_owned(),
+        0x06..=0x0B => format!("Primary {}", location - 0x05),
+        _ => format!("Zone {}", u16::from(index) + 1),
+    }
 }
 
 /// Returns `true` when `pid` belongs to a Logitech webcam range (`0x0800..=0x09FF`)

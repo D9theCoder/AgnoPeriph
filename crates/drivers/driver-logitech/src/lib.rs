@@ -1,9 +1,17 @@
 //! Logitech HID++ 2.0 peripheral driver implementing `Peripheral`, `PointerDevice`,
-//! `BatteryMonitor`, and `ProfileManager`.
+//! `BatteryMonitor`, `ProfileManager`, `RgbController`, `KeyboardConfigController`,
+//! and `KeymapController`.
 
 #![forbid(unsafe_code)]
 
+mod controls;
+mod keyboard;
+#[cfg(test)]
+mod keyboard_tests;
 pub mod protocol;
+mod rgb;
+
+pub use controls::LogitechControlInfo;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -12,10 +20,14 @@ use std::time::Duration;
 
 use agnoperiph_core::{
     BatteryMonitor, BatteryStatus, Capabilities, ConnectionKind, CoreError, CoreResult, DeviceId,
-    DeviceInfo, DeviceMatchRule, DpiStage, DpiValue, DriverDescriptor, Peripheral,
-    PointerCapabilities, PointerDevice, PointerSnapshot, PollingRateHz, ProfileCapabilities,
-    ProfileInfo, ProfileManager, ProfileMode, ProfileSlot, ProfileSnapshot, VendorKind,
+    DeviceInfo, DeviceMatchRule, DpiStage, DpiValue, DriverDescriptor, KeyboardConfigController,
+    KeymapController, Peripheral, PointerCapabilities, PointerDevice, PointerSnapshot,
+    PollingRateHz, ProfileCapabilities, ProfileInfo, ProfileManager, ProfileMode, ProfileSlot,
+    ProfileSnapshot, RgbController, RgbZoneState, VendorKind,
 };
+
+use crate::keyboard::FnInversionVariant;
+use crate::rgb::LedDescriptor;
 use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
 
 use crate::protocol::{
@@ -84,6 +96,14 @@ pub struct LogitechHidppDevice<T: HidTransport> {
     pointer_caps: Option<PointerCapabilities>,
     profile_caps: Option<ProfileCapabilities>,
     ping_marker: u8,
+    report_rates: Vec<PollingRateHz>,
+    led: Option<LedDescriptor>,
+    // The device cannot report these back, so they survive `refresh()`.
+    rgb_cache: HashMap<u8, RgbZoneState>,
+    is_game_mode_enabled: bool,
+    fn_inversion: Option<FnInversionVariant>,
+    disable_keys_capacity: Option<usize>,
+    controls: Vec<LogitechControlInfo>,
 }
 
 impl<T: HidTransport> fmt::Debug for LogitechHidppDevice<T> {
@@ -165,6 +185,13 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
             pointer_caps: None,
             profile_caps: None,
             ping_marker: 0x5A,
+            report_rates: Vec::new(),
+            led: None,
+            rgb_cache: HashMap::new(),
+            is_game_mode_enabled: false,
+            fn_inversion: None,
+            disable_keys_capacity: None,
+            controls: Vec::new(),
         };
 
         if let Some(serial) = desc.serial_number {
@@ -188,11 +215,32 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
         params: &[u8],
         mutating: bool,
     ) -> CoreResult<[u8; 16]> {
+        match self.exchange(feature_index, function, params, mutating)? {
+            HidppReply::Ok(data) => Ok(data),
+            HidppReply::Hidpp20Error(code) => Err(CoreError::Protocol(format!(
+                "HID++ 2.0 error 0x{code:02X} on feat_idx={feature_index} func={function}"
+            ))),
+            HidppReply::Hidpp10Error(code) => Err(CoreError::Protocol(format!(
+                "HID++ 1.0 error 0x{code:02X} on slot 0x{:02X}",
+                self.device_index
+            ))),
+        }
+    }
+
+    /// Sends a request and returns the matched reply, including HID++ error frames.
+    /// `Err` means no reply was matched (timeout, transport failure, or read window exhausted).
+    fn exchange(
+        &mut self,
+        feature_index: u8,
+        function: u8,
+        params: &[u8],
+        mutating: bool,
+    ) -> CoreResult<HidppReply> {
         let req = encode_long_request(self.device_index, feature_index, function, params);
         if mutating {
             self.transport.send_output_report(&req)?;
             if self.transport.is_dry_run() {
-                return Ok([0u8; 16]);
+                return Ok(HidppReply::Ok([0u8; 16]));
             }
         } else {
             self.transport.send_query_output_report(&req)?;
@@ -214,22 +262,85 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
             if let Some(reply) =
                 match_reply(&buf[..read_len], self.device_index, feature_index, function)
             {
-                return match reply {
-                    HidppReply::Ok(data) => Ok(data),
-                    HidppReply::Hidpp20Error(code) => Err(CoreError::Protocol(format!(
-                        "HID++ 2.0 error 0x{code:02X} on feat_idx={feature_index} func={function}"
-                    ))),
-                    HidppReply::Hidpp10Error(code) => Err(CoreError::Protocol(format!(
-                        "HID++ 1.0 error 0x{code:02X} on slot 0x{:02X}",
-                        self.device_index
-                    ))),
-                };
+                return Ok(reply);
             }
         }
 
         Err(CoreError::Protocol(
             "no matching HID++ reply received within read window".to_owned(),
         ))
+    }
+
+    /// Returns the cached feature index without querying the device.
+    pub(crate) fn cached_feature(&self, feature_id: u16) -> Option<u8> {
+        self.feature_indices
+            .get(&feature_id)
+            .copied()
+            .filter(|&idx| idx != 0)
+    }
+
+    /// Probes the optional keyboard features. A HID++ error frame marks only that feature as
+    /// absent. An unanswered probe stops the pass without caching anything, because
+    /// `Root.GetFeature` replies do not echo the feature ID: a late reply would otherwise be
+    /// matched to the next probe and cache a wrong index.
+    fn probe_keyboard_features(&mut self) -> CoreResult<()> {
+        for feature_id in feature::KEYBOARD_PROBE_ORDER {
+            if self.feature_indices.contains_key(&feature_id) {
+                continue;
+            }
+            match self.exchange(0x00, 0, &feature_id.to_be_bytes(), false) {
+                Ok(HidppReply::Ok(reply)) => {
+                    self.feature_indices.insert(feature_id, reply[0]);
+                }
+                Ok(HidppReply::Hidpp20Error(_) | HidppReply::Hidpp10Error(_)) => {
+                    self.feature_indices.insert(feature_id, 0);
+                }
+                Err(CoreError::NotConnected(msg) | CoreError::Protocol(msg)) => {
+                    tracing::warn!(
+                        feature = format_args!("0x{feature_id:04X}"),
+                        "stopping optional keyboard feature probes: {msg}"
+                    );
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn discover_keyboard_features(&mut self) -> CoreResult<()> {
+        self.probe_keyboard_features()?;
+
+        self.led = match self.discover_led_effects() {
+            Ok(led) => led.filter(|l| !l.zones.is_empty()),
+            Err(err) => {
+                tracing::warn!("disabling Logitech RGB: zone discovery failed: {err}");
+                None
+            }
+        };
+
+        self.fn_inversion = FnInversionVariant::detect(self);
+
+        self.disable_keys_capacity = match self.discover_disable_keys_capacity() {
+            Ok(capacity) => capacity,
+            Err(err) => {
+                tracing::warn!("disabling Logitech DisableKeysByUsage: {err}");
+                None
+            }
+        };
+
+        self.controls = match self.discover_controls() {
+            Ok(controls) => controls,
+            Err(err) => {
+                tracing::warn!("disabling Logitech ReprogControlsV4: {err}");
+                Vec::new()
+            }
+        };
+        Ok(())
+    }
+
+    fn has_keyboard_config(&self) -> bool {
+        self.fn_inversion.is_some() || self.has_game_mode()
     }
 
     fn resolve_feature(&mut self, feature_id: u16) -> CoreResult<Option<u8>> {
@@ -315,31 +426,41 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
         // 5. Pointer capability probe (AdjustableDPI + ReportRate)
         let has_dpi = self.resolve_feature(feature::ADJUSTABLE_DPI)?.is_some();
         let has_rate = self.resolve_feature(feature::REPORT_RATE)?.is_some();
-        if has_dpi {
+        let dpi_bounds = if has_dpi {
             let list_resp = self.call_feature(feature::ADJUSTABLE_DPI, 1, &[0], false)?;
-            let (dpi_min, dpi_max, dpi_step) = decode_dpi_list(&list_resp)?;
-            let rates = if has_rate {
-                let mask_resp = self.call_feature(feature::REPORT_RATE, 0, &[], false)?;
-                decode_report_rate_mask(mask_resp[0])
-            } else {
-                Vec::new()
-            };
-            self.pointer_caps = Some(
-                PointerCapabilities::new(dpi_min, dpi_max, dpi_step, 5).with_polling_rates(rates),
-            );
-        }
+            Some(decode_dpi_list(&list_resp)?)
+        } else {
+            None
+        };
+        self.report_rates = if has_rate {
+            let mask_resp = self.call_feature(feature::REPORT_RATE, 0, &[], false)?;
+            decode_report_rate_mask(mask_resp[0])
+        } else {
+            Vec::new()
+        };
+        self.pointer_caps = dpi_bounds.map(|(dpi_min, dpi_max, dpi_step)| {
+            PointerCapabilities::new(dpi_min, dpi_max, dpi_step, 5)
+                .with_polling_rates(self.report_rates.clone())
+        });
 
         // 6. Onboard profiles capability probe (0x8100)
+        self.profile_caps = None;
         if self.resolve_feature(feature::ONBOARD_PROFILES)?.is_some() {
             let info_resp = self.call_feature(feature::ONBOARD_PROFILES, 0, &[], false)?;
             let slot_count = info_resp[3].max(1);
             self.profile_caps = Some(ProfileCapabilities::new(slot_count, true, false));
         }
 
+        // 7. Optional keyboard features (RGB, Fn-inversion, Game Mode, control remapping)
+        self.discover_keyboard_features()?;
+
         self.capabilities = Capabilities::empty()
             .with_pointer(self.pointer_caps.is_some())
             .with_battery(has_battery)
-            .with_profiles(self.profile_caps.is_some());
+            .with_profiles(self.profile_caps.is_some())
+            .with_rgb(self.led.is_some())
+            .with_keyboard_config(self.has_keyboard_config())
+            .with_keymap(!self.controls.is_empty());
 
         Ok(())
     }
@@ -392,6 +513,42 @@ impl<T: HidTransport> Peripheral for LogitechHidppDevice<T> {
         self.profile_caps
             .is_some()
             .then_some(self as &mut dyn ProfileManager)
+    }
+
+    fn as_rgb(&self) -> Option<&dyn RgbController> {
+        self.capabilities
+            .has_rgb()
+            .then_some(self as &dyn RgbController)
+    }
+
+    fn as_rgb_mut(&mut self) -> Option<&mut dyn RgbController> {
+        self.capabilities
+            .has_rgb()
+            .then_some(self as &mut dyn RgbController)
+    }
+
+    fn as_keyboard_config(&self) -> Option<&dyn KeyboardConfigController> {
+        self.capabilities
+            .has_keyboard_config()
+            .then_some(self as &dyn KeyboardConfigController)
+    }
+
+    fn as_keyboard_config_mut(&mut self) -> Option<&mut dyn KeyboardConfigController> {
+        self.capabilities
+            .has_keyboard_config()
+            .then_some(self as &mut dyn KeyboardConfigController)
+    }
+
+    fn as_keymap(&self) -> Option<&dyn KeymapController> {
+        self.capabilities
+            .has_keymap()
+            .then_some(self as &dyn KeymapController)
+    }
+
+    fn as_keymap_mut(&mut self) -> Option<&mut dyn KeymapController> {
+        self.capabilities
+            .has_keymap()
+            .then_some(self as &mut dyn KeymapController)
     }
 }
 
@@ -512,7 +669,7 @@ mod tests {
         HidDeviceDescriptor, MemoryPacketSink, MockHidTransport, PacketOutcome,
     };
 
-    fn make_reply(dev_idx: u8, feat_idx: u8, func: u8, params: &[u8]) -> Vec<u8> {
+    pub(crate) fn make_reply(dev_idx: u8, feat_idx: u8, func: u8, params: &[u8]) -> Vec<u8> {
         let mut frame = vec![0u8; LONG_REPORT_LEN];
         frame[0] = crate::protocol::REPORT_ID_LONG;
         frame[1] = dev_idx;
@@ -569,6 +726,10 @@ mod tests {
         mock.push_input_response(make_reply(1, 0x00, 0, &[0x07]));
         //    OnboardProfiles.Info(): 5 profiles
         mock.push_input_response(make_reply(1, 0x07, 0, &[0x01, 0x04, 0x01, 0x05]));
+        // 8. Keyboard feature probes (feature::KEYBOARD_PROBE_ORDER) -> all absent
+        for _ in feature::KEYBOARD_PROBE_ORDER {
+            mock.push_input_response(make_reply(1, 0x00, 0, &[0x00]));
+        }
 
         mock
     }
@@ -595,6 +756,10 @@ mod tests {
         assert!(dev.capabilities().has_pointer());
         assert!(dev.capabilities().has_battery());
         assert!(dev.capabilities().has_profiles());
+        assert!(!dev.capabilities().has_rgb());
+        assert!(!dev.capabilities().has_keyboard_config());
+        assert!(!dev.capabilities().has_keymap());
+        assert!(dev.as_rgb().is_none());
 
         let battery = dev.as_battery_mut().unwrap().read_battery().unwrap();
         assert_eq!(battery.percentage, Some(84));

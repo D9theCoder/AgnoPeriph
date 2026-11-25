@@ -23,8 +23,8 @@ pub use error::{CoreError, CoreResult};
 pub use hall_effect::{
     CalibrationStatus, DEFAULT_PAIR_TRIGGER_POINT, DksBinding, DksStageAction, DksTriggerDirection,
     HallEffectCapabilities, HallEffectKeyboard, HallEffectSnapshot, KeyHallEffectConfig, KeyIndex,
-    ModTapBinding, RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair, ToggleKeyBinding,
-    TravelHundredthsMm,
+    KeyTravelSample, ModTapBinding, RapidSwitchPair, RapidTriggerConfig, SocdMode, SocdPair,
+    ToggleKeyBinding, TravelHundredthsMm,
 };
 pub use keyboard::{
     KeyCode, KeyboardConfigCapabilities, KeyboardConfigController, KeyboardConfigSnapshot,
@@ -36,6 +36,7 @@ pub use pointer::{
     PointerSnapshot, PollingRateHz,
 };
 pub use profile::{
+    EXPORTED_PROFILE_SCHEMA_VERSION, ExportedHallEffectProfile, ExportedProfile,
     ProfileCapabilities, ProfileInfo, ProfileManager, ProfileMode, ProfileSlot, ProfileSnapshot,
 };
 pub use registry::{

@@ -16,8 +16,8 @@ Replace half a dozen bloated, telemetry-heavy vendor suites with a single GPU-ac
 Modern desks mix brands — a Logitech or Pulsar mouse, an ATK or Wooting Hall Effect keyboard, a Keychron QMK board — and each vendor expects its own always-on background service. **AgnoPeriph** talks directly to your hardware over standard host-side Windows USB HID:
 
 - **Native & fast** — Written end-to-end in Rust with a GPU-accelerated [`gpui-kit`](https://crates.io/crates/gpui-kit) (`gpui-fast`) interface. Zero Electron, zero Chromium, minimal RAM.
-- **Capability-driven UI** — Controls appear automatically based on what each peripheral actually supports (DPI stages, 8K polling, lift-off distance, Hall Effect per-key actuation & Rapid Trigger, SOCD/DKS/Mod-Tap, QMK keymaps & macros, multi-zone RGB, onboard profiles, battery telemetry).
-- **Game Profiles & Tray integration** — Auto-switch peripheral settings when you launch a game, minimize cleanly to the Windows system tray, and optionally start with Windows.
+- **Capability-driven UI & staged editing** — Controls appear automatically based on what each peripheral actually supports (DPI stages, 8K polling, lift-off distance, Hall Effect per-key actuation, Rapid Trigger & live travel tester, SOCD/DKS/Mod-Tap, QMK keymaps & macros, multi-zone RGB, Fn-inversion, Game Mode, onboard profiles, battery telemetry). Unsaved edits stage behind a unified Apply / Undo (`Ctrl+Z`) / Discard bar with switch guards, validated JSON profile import/export, quick presets, and keyboard-first shortcuts (`Ctrl+1..9`, `Ctrl+Tab`, `Ctrl+S`, `Ctrl+/`).
+- **Game Profiles, Tray Quick-Menu & Battery Alerts** — Auto-switch peripheral settings when you launch a game, check live battery % and switch profiles from the Windows system tray, receive non-spammy low-battery Windows toast notifications, and optionally start with Windows.
 - **Safety-first USB HID** — Every outgoing write passes through `GuardedTransport` + a per-protocol `PacketValidator` enforcing exact packet length, Report IDs, checksums, and hard blocks on bootloader/DFU/EEPROM-reset commands. Includes a global `--dry-run` mode and live hex packet tracing.
 - **Headless CLI included** — Script and inspect devices with `agnoperiph-cli` (`list`, `probe`, `set`, `--dry-run`, `--trace-hex`, `--json`).
 
@@ -38,12 +38,15 @@ AgnoPeriph targets documented host-side runtime USB HID protocols only — **no 
 | **Finalmouse** | 64-byte Telemetry HID ([spec](docs/protocols/finalmouse-hid.md)) | UltralightX (ULX), Starlight X | Wired USB, 2.4 GHz dongle | DPI, polling rate (up to 8K), PAW LOD (0.7–2.0 mm), Motion Sync, battery curve, profiles |
 | **WLmouse** | CompX 64-byte Feature ([spec](docs/protocols/wlmouse-hid.md)) | Beast X / Max / Pro, Beast Mini, Sword X, Strider | Wired USB, 2.4 GHz dongle | X/Y DPI stages, polling rate (up to 8K), LOD (0.7/1.0/2.0 mm), debounce, Motion Sync, Angle Snapping, Ripple Control, battery, profiles |
 | **Endgame Gear** | `0xA0`/`0xA1` Config Blob ([spec](docs/protocols/endgame-gear-hid.md)) | OP1 8K, OP1w 4K, XM2 8K, XM2w 4K | Wired USB, 4K dongle | CPI stages, polling rate (up to 8K), LOD (0.7–2.0 mm), Motion Sync, Angle Snapping, Ripple Control |
+| **MCHOSE** | M-HUB V2 (`0x11`/`0x12`), V3 (`0x4D`), A5 Gen1 (`0x2023`) ([spec](docs/protocols/mchose.md)) | A7 / A7 V2 / A7 V3, L7, A5 / A5 V3, K7, K5, R7, V7, G3 V3 | Wired USB, 1K / 2.4 GHz / 4K / 8K receivers | DPI stages, polling rate (up to 8K), LOD, debounce, Motion Sync, Angle Snapping, Ripple Control, battery, onboard profiles |
+| **ATK / VGN / VXE** | `0xFF02` Report-`0x08` EEPROM ([spec](docs/protocols/atk-mice.md)) | ATK F1 / X1 / Z1 / A9, VXE R1 / Mad R, VGN Dragonfly F2 Master+ | Wired USB, 1K / 8K dongles | X/Y DPI stages, polling rate (up to 8K), LOD, debounce, Motion Sync, Angle Snapping, Ripple Control, battery, profiles |
 
 ### Keyboards
 
 | Brand / Ecosystem | Firmware / Protocol | Supported Models & Families | Connection | Supported Features |
 | --- | --- | --- | --- | --- |
-| **ATK** | ATK HUB `0xFF01` ([spec](docs/protocols/atk-rs7.md)) | ATK RS7 Hall Effect (and compatible `0xFF01` HE boards) | Wired USB | Per-key actuation (0.10–4.00 mm), Rapid Trigger, top/bottom deadzones, DKS, SOCD, Rapid Switch, Mod-Tap, Toggle Key, calibration, keymap, macros, RGB + logo light, onboard profiles |
+| **ATK / VXE** | DuckBread `0xFF60` ([RS7 spec](docs/protocols/atk-rs7.md)) & GTech `0xFF01` ([FF01 spec](docs/protocols/atk-ff01.md)) | ATK RS7 RGB (`0xFF60`); ATK68 / ATK75 / VXE / Mad60 / Mad68 family (`0xFF01`) | Wired USB | Per-key actuation, Rapid Trigger, live key-travel tester, top/bottom deadzones, DKS, SOCD, Rapid Switch, Mod-Tap, Toggle Key, calibration, keymap, macros, RGB + logo light, polling rate, onboard profiles |
+| **Logitech** | HID++ 2.0 ([spec](docs/protocols/logitech-hidpp.md)) | HID++ 2.0 keyboards (G-series, MX / K-series) | Wired USB, Lightspeed, Bolt, Unifying | Multi-zone RGB (`0x8070`/`0x8071`), Fn-inversion (`0x40A0`/`0x40A2`/`0x40A3`), Game Mode / Win Lock (`0x4522`), key remapping (`0x1B04`), polling rate, battery |
 | **Wooting** | Wooting ARM / HE `0xFF55` & `0x1337` ([spec](docs/protocols/wooting-hid.md)) | 60HE, 60HE+, 80HE, Two HE, UwU | Wired USB | Firmware/layout detection, onboard profile readout, per-key actuation readout *(read-only writes for safety)*, RGB control (`wooting-rgb-sdk` commands) |
 | **QMK / VIA** | VIA Raw HID `0xFF60:0x0061` ([spec](docs/protocols/qmk-via.md)) | Keychron, Lemokey, NuPhy, MonsGeek / Akko, Glorious GMMK QMK, Drop, standard QMK boards | Wired USB | Dynamic multi-layer keymap read/write/reset, VIA v3 macros, QMK RGB Matrix & RGBLight effects/brightness/color |
 
@@ -53,7 +56,7 @@ AgnoPeriph targets documented host-side runtime USB HID protocols only — **no 
 
 ## Quick Start
 
-> **Important before connecting live hardware:** Fully exit all official vendor apps (**G Hub**, **Razer Synapse**, **ATK HUB**, **Lamzu**, **Pulsar**, **Wootility**, **Endgame Gear**, etc. — including background tray icons) so they do not contend for exclusive HID interfaces.
+> **Important before connecting live hardware:** Fully exit all official vendor apps (**G Hub**, **Razer Synapse**, **ATK HUB**, **M-HUB**, **Lamzu**, **Pulsar**, **Wootility**, **Endgame Gear**, etc. — including background tray icons) so they do not contend for exclusive HID interfaces.
 
 ### Download Installer (Recommended)
 Grab the latest Windows x64 installer (`.exe`) directly from **[GitHub Releases](https://github.com/D9theCoder/AgnoPeriph/releases/latest)**:
@@ -84,6 +87,8 @@ cargo run -p agnoperiph-cli -- --dry-run --trace-hex set --vid 0x046D --pid 0xC5
 
 ### Run Verification & Tests
 ```powershell
+.\scripts\dev.ps1 check
+# or manually:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -101,9 +106,9 @@ crates/cli (agnoperiph-cli)  ──┼──▶ crates/drivers/* ──▶ crate
                                └────────────────────────▶ crates/transport & crates/core
 ```
 
-- **`crates/core`** — Pure Rust (`#![forbid(unsafe_code)]`, zero OS/HID/UI deps). Brand-agnostic hardware traits (`Peripheral`, `PointerDevice`, `HallEffectKeyboard`, `KeymapController`, `MacroController`, `RgbController`, `BatteryMonitor`, `ProfileManager`), fixed-point validated domain types (`TravelHundredthsMm`, `DpiValue`, `PollingRateHz`), and `DeviceRegistry`.
+- **`crates/core`** — Pure Rust (`#![forbid(unsafe_code)]`, zero OS/HID/UI deps). Brand-agnostic hardware traits (`Peripheral`, `PointerDevice`, `HallEffectKeyboard`, `KeymapController`, `MacroController`, `RgbController`, `BatteryMonitor`, `ProfileManager`, `KeyboardConfigController`), fixed-point validated domain types (`TravelHundredthsMm`, `DpiValue`, `PollingRateHz`, `ExportedProfile`), and `DeviceRegistry`.
 - **`crates/transport`** — `HidTransport`, `HidEnumerator`, `HidapiTransport`, deterministic `MockHidTransport`, and `GuardedTransport` (`PacketValidator`, `--dry-run`, `PacketSink`).
-- **`crates/drivers/*`** — Self-contained protocol crates (`driver-logitech`, `driver-lamzu`, `driver-atk`, `driver-razer`, `driver-pulsar`, `driver-finalmouse`, `driver-wlmouse`, `driver-endgame-gear`, `driver-wooting`, `driver-via`), each unit-tested against `MockHidTransport`.
+- **`crates/drivers/*`** — Self-contained protocol crates (`driver-logitech`, `driver-lamzu`, `driver-atk`, `driver-mchose`, `driver-razer`, `driver-pulsar`, `driver-finalmouse`, `driver-wlmouse`, `driver-endgame-gear`, `driver-wooting`, `driver-via`), each unit-tested against `MockHidTransport`.
 - **`crates/cli`** — Headless diagnostics and configuration CLI.
 - **`crates/ui`** — Native Windows GPU-accelerated desktop app built on `gpui-kit` (`gpui-fast`).
 
@@ -111,7 +116,7 @@ crates/cli (agnoperiph-cli)  ──┼──▶ crates/drivers/* ──▶ crate
 
 ## Acknowledgments
 
-Protocol documentation and wire compatibility build on open-source community work from [`OpenMouse-Project/mouse-protocol`](https://github.com/OpenMouse-Project/mouse-protocol), [`libratbag`](https://github.com/libratbag/libratbag), [`Solaar`](https://github.com/pwr-Solaar/Solaar), [`qmk/qmk_firmware`](https://github.com/qmk/qmk_firmware), [`WootingKb/wooting-rgb-sdk`](https://github.com/WootingKb/wooting-rgb-sdk), [`LeadSun/lamzu-cfg`](https://github.com/LeadSun/lamzu-cfg), [`qu1ncky/BatteryTray`](https://github.com/qu1ncky/BatteryTray), and [`bsdrop/atk68`](https://github.com/bsdrop/atk68).
+Protocol documentation and wire compatibility build on open-source community work from [`OpenMouse-Project/mouse-protocol`](https://github.com/OpenMouse-Project/mouse-protocol), [`OpenMouse-Project/keyboard-protocol`](https://github.com/OpenMouse-Project/keyboard-protocol), [`libratbag`](https://github.com/libratbag/libratbag), [`Solaar`](https://github.com/pwr-Solaar/Solaar), [`OpenLogi`](https://openlogi.org/), [`alexfrih/mchose-linux`](https://github.com/alexfrih/mchose-linux), [`qmk/qmk_firmware`](https://github.com/qmk/qmk_firmware), [`WootingKb/wooting-rgb-sdk`](https://github.com/WootingKb/wooting-rgb-sdk), [`LeadSun/lamzu-cfg`](https://github.com/LeadSun/lamzu-cfg), [`qu1ncky/BatteryTray`](https://github.com/qu1ncky/BatteryTray), and [`bsdrop/atk68`](https://github.com/bsdrop/atk68).
 
 ## License
 

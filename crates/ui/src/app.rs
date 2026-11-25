@@ -5,10 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use agnoperiph_core::{
-    CoreError, CoreResult, DeviceId, DpiStage, KeyIndex, ProfileSlot, RapidTriggerConfig,
-    TravelHundredthsMm,
-};
+use agnoperiph_core::{CoreError, CoreResult, DeviceId, KeyIndex, ProfileSlot, TravelHundredthsMm};
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode, WindowExt,
@@ -20,14 +17,18 @@ use gpui_kit::component::{
     switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::backend::{ApplyError, DeviceSnapshot, PeripheralService, PointerChange, SettingChange};
+use crate::backend::{ApplyError, DeviceSnapshot, PeripheralService, SettingChange};
+use crate::battery_alerts::BatteryAlertTracker;
 use crate::controls::{Controls, InputRole, SliderRange, SliderRole};
+use crate::draft::{ChangeId, DeviceDraft, DraftHistory};
 use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
+use crate::key_tester::TesterUi;
 use crate::smooth_scroll::{ScrollIds, SmoothScroll};
 use crate::system::{DetachedSystem, SystemIntegration};
 use crate::{
@@ -55,27 +56,9 @@ impl Banner {
     }
 }
 
-/// Unsaved edits for the selected keys; `None` fields fall back to the device snapshot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct KeyDraft {
-    pub(crate) actuation: Option<TravelHundredthsMm>,
-    pub(crate) rapid_trigger: Option<RapidTriggerConfig>,
-}
-
-/// Keyboard-wide dead zone edits, separate from per-key drafts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DeadzoneDraft {
-    pub(crate) top: Option<TravelHundredthsMm>,
-    pub(crate) bottom: Option<TravelHundredthsMm>,
-}
-
-/// Which unsaved edits a write commits, so a successful write clears only those.
+/// Which panel-local edits a write commits, so a successful write clears only those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DraftScope {
-    DpiStages,
-    Actuation,
-    RapidTrigger,
-    Deadzones,
     Macros,
     None,
 }
@@ -83,18 +66,17 @@ pub(crate) enum DraftScope {
 impl DraftScope {
     fn of(change: &SettingChange) -> Self {
         match change {
-            SettingChange::Pointer(PointerChange::DpiStages { .. }) => Self::DpiStages,
-            SettingChange::Actuation { .. } | SettingChange::ActuationMany { .. } => {
-                Self::Actuation
-            }
-            SettingChange::RapidTrigger { .. } | SettingChange::RapidTriggerMany { .. } => {
-                Self::RapidTrigger
-            }
-            SettingChange::Deadzones { .. } => Self::Deadzones,
             SettingChange::Macros(_) => Self::Macros,
             _ => Self::None,
         }
     }
+}
+
+/// What runs once the pending edits have been applied, from the unsaved-changes guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AfterApply {
+    SelectDevice(DeviceId),
+    SwitchProfile { device: DeviceId, slot: u8 },
 }
 
 /// Why a queued write exists, which decides what happens after it lands.
@@ -102,6 +84,8 @@ impl DraftScope {
 pub(crate) enum JobOrigin {
     /// A user edit; clears the matching draft on success.
     User(DraftScope),
+    /// Commits the unsaved edits. `steps[i]` names the change written by step `i`.
+    ApplyDraft { steps: Vec<ChangeId> },
     /// Activates a profile slot, from the profile bar or the Game Profile switcher.
     ProfileSwitch {
         slot: u8,
@@ -254,11 +238,11 @@ impl AppOptions {
 /// background executor; replies to superseded refreshes are dropped by revision, and
 /// writes run one job at a time from a queue so automatic switches never drop.
 pub struct AgnoPeriphApp {
-    service: Arc<dyn PeripheralService>,
+    pub(crate) service: Arc<dyn PeripheralService>,
     pub(crate) system: Arc<dyn SystemIntegration>,
     pub(crate) discover_games: GameDiscovery,
     devices: Vec<DeviceSnapshot>,
-    selected: Option<DeviceId>,
+    pub(crate) selected: Option<DeviceId>,
     route: Route,
     /// Incremented by every refresh; a reply carrying an older revision is stale.
     revision: u64,
@@ -281,9 +265,22 @@ pub struct AgnoPeriphApp {
     cleared_through_sequence: u64,
     pub(crate) selected_key: KeyIndex,
     pub(crate) selected_keys: BTreeSet<KeyIndex>,
-    pub(crate) key_draft: KeyDraft,
-    pub(crate) deadzone_draft: DeadzoneDraft,
-    pub(crate) dpi_draft: Option<Vec<DpiStage>>,
+    /// Unsaved edits for `draft_device`, shown in the dirty bar until applied or discarded.
+    pub(crate) draft: DeviceDraft,
+    pub(crate) draft_device: Option<DeviceId>,
+    pub(crate) history: DraftHistory,
+    /// Selected device with the draft applied; `None` when nothing is staged.
+    pub(crate) effective: Option<DeviceSnapshot>,
+    /// Last discarded draft, restorable from the Discard notification.
+    pub(crate) discarded: Option<(DeviceId, DeviceDraft)>,
+    /// Why the last Apply stopped early; the dirty bar offers Retry.
+    pub(crate) apply_failure: Option<SharedString>,
+    pub(crate) after_apply: Option<AfterApply>,
+    pub(crate) is_changes_open: bool,
+    pub(crate) is_shortcuts_open: bool,
+    pub(crate) tester: TesterUi,
+    pub(crate) battery_alerts: BatteryAlertTracker,
+    pub(crate) focus_handle: FocusHandle,
     pub(crate) keyboard_tab: KeyboardTab,
     pub(crate) paired: hall_effect_panel::PairedKeysUi,
     pub(crate) keymap_ui: keymap_panel::KeymapUi,
@@ -301,7 +298,7 @@ pub struct AgnoPeriphApp {
     pub(crate) auto_switch_note: Option<SharedString>,
     pub(crate) calibration: calibration::CalibrationUi,
     pub(crate) controls: Option<Controls>,
-    window_handle: Option<AnyWindowHandle>,
+    pub(crate) window_handle: Option<AnyWindowHandle>,
     pub(crate) smooth_scroll: SmoothScroll,
     pending_save: Arc<Mutex<Option<AppConfig>>>,
     save_lock: Arc<Mutex<()>>,
@@ -334,6 +331,7 @@ impl AgnoPeriphApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let dry_run = service.is_dry_run();
+        crate::shortcuts::bind_keys(cx);
         let theme_subscription = cx.observe_global::<Theme>(|_, cx| cx.notify());
         let mut app = Self {
             service,
@@ -358,9 +356,18 @@ impl AgnoPeriphApp {
             cleared_through_sequence: 0,
             selected_key: KeyIndex::new(0),
             selected_keys: BTreeSet::new(),
-            key_draft: KeyDraft::default(),
-            deadzone_draft: DeadzoneDraft::default(),
-            dpi_draft: None,
+            draft: DeviceDraft::default(),
+            draft_device: None,
+            history: DraftHistory::default(),
+            effective: None,
+            discarded: None,
+            apply_failure: None,
+            after_apply: None,
+            is_changes_open: false,
+            is_shortcuts_open: false,
+            tester: TesterUi::default(),
+            battery_alerts: BatteryAlertTracker::default(),
+            focus_handle: cx.focus_handle(),
             keyboard_tab: KeyboardTab::Triggers,
             paired: hall_effect_panel::PairedKeysUi::default(),
             keymap_ui: keymap_panel::KeymapUi::default(),
@@ -410,7 +417,21 @@ impl AgnoPeriphApp {
         self.window_handle = Some(window.window_handle());
         self.rebuild_controls(window, cx);
         self.sync_controls(window, cx);
+        self.focus_handle.focus(window, cx);
+        self.update_live_polling(cx);
         cx.notify();
+    }
+
+    /// Called when the window closes but the app keeps running in the notification area.
+    pub fn detach_window(&mut self, cx: &mut Context<Self>) {
+        self.window_handle = None;
+        self.is_changes_open = false;
+        self.is_shortcuts_open = false;
+        self.update_live_polling(cx);
+    }
+
+    pub(crate) fn has_window(&self) -> bool {
+        self.window_handle.is_some()
     }
 
     fn device_ranges(&self) -> (SliderRange, SliderRange, f32) {
@@ -500,7 +521,17 @@ impl AgnoPeriphApp {
         self.selected.as_ref()
     }
 
+    /// The selected device as the editors show it: device values with unsaved edits applied.
     pub fn selected_device(&self) -> Option<&DeviceSnapshot> {
+        let id = self.selected.as_ref()?;
+        match &self.effective {
+            Some(effective) if effective.id() == id => Some(effective),
+            _ => self.device(id),
+        }
+    }
+
+    /// The selected device's values as last read from (or written to) the device.
+    pub(crate) fn selected_raw(&self) -> Option<&DeviceSnapshot> {
         self.device(self.selected.as_ref()?)
     }
 
@@ -640,10 +671,9 @@ impl AgnoPeriphApp {
         self.formatted_packets = Arc::new(inspector_drawer::format_packets(&self.packets));
     }
 
+    /// Clears panel-local edits (paired-key flow, lighting drag, macros). The unsaved
+    /// device draft is separate: see [`Self::reset_draft`].
     fn clear_drafts(&mut self) {
-        self.dpi_draft = None;
-        self.key_draft = KeyDraft::default();
-        self.deadzone_draft = DeadzoneDraft::default();
         self.paired = hall_effect_panel::PairedKeysUi::default();
         self.lighting.clear_draft();
         self.macros_ui.clear_draft();
@@ -664,6 +694,8 @@ impl AgnoPeriphApp {
         self.set_packets(packets);
         self.clear_drafts();
         self.keymap_ui.clear_history();
+        self.apply_failure = None;
+        self.after_apply = None;
         // Fresh handles hold whatever the device stores; the switcher re-checks every target.
         self.applied_targets.clear();
         match devices {
@@ -692,6 +724,12 @@ impl AgnoPeriphApp {
                         self.config.ensure_software_profiles(device.id());
                     }
                 }
+                // Unsaved edits survive a refresh while their device is still connected.
+                if self.draft_device.as_ref() != self.selected.as_ref() {
+                    self.reset_draft();
+                }
+                self.renormalize_draft();
+                self.observe_batteries(cx);
                 if needs_reconnect {
                     self.schedule_auto_reconnect(cx);
                 } else {
@@ -701,6 +739,7 @@ impl AgnoPeriphApp {
             Err(err) => {
                 self.devices.clear();
                 self.selected = None;
+                self.reset_draft();
                 self.reset_key_selection();
                 self.banner = Some(Banner {
                     title: "Couldn’t scan for devices".into(),
@@ -711,6 +750,7 @@ impl AgnoPeriphApp {
                 });
             }
         }
+        self.update_live_polling(cx);
         self.request_sync(cx);
         self.pump_queue(cx);
         cx.notify();
@@ -822,6 +862,7 @@ impl AgnoPeriphApp {
                 .iter()
                 .any(|w| crate::backend::is_disconnect_message(&w.message));
             self.store_snapshot(snapshot);
+            self.observe_batteries(cx);
             if needs_reconnect {
                 self.schedule_auto_reconnect(cx);
             } else {
@@ -833,12 +874,16 @@ impl AgnoPeriphApp {
                 if !origin.is_background() {
                     self.banner = None;
                 }
-                self.finish_origin(device, origin);
+                self.finish_origin(device, origin, cx);
             }
             Some((step, total, failure)) => {
+                if let JobOrigin::ApplyDraft { steps } = origin {
+                    self.finish_partial_apply(device, steps, step, &failure.error);
+                }
                 self.report_failure(device, origin, step, total, failure, cx);
             }
         }
+        self.renormalize_draft();
         if let JobOrigin::ProfileSwitch {
             is_automatic: true, ..
         } = origin
@@ -874,21 +919,31 @@ impl AgnoPeriphApp {
         if let Some(slot) = self.devices.iter_mut().find(|d| d.id() == snapshot.id()) {
             *slot = snapshot;
         }
+        self.sync_effective();
     }
 
-    fn finish_origin(&mut self, device: &DeviceId, origin: &JobOrigin) {
+    fn finish_origin(&mut self, device: &DeviceId, origin: &JobOrigin, cx: &mut Context<Self>) {
         match origin {
             JobOrigin::User(scope) => {
                 match scope {
-                    DraftScope::DpiStages => self.dpi_draft = None,
-                    DraftScope::Actuation => self.key_draft.actuation = None,
-                    DraftScope::RapidTrigger => self.key_draft.rapid_trigger = None,
-                    DraftScope::Deadzones => self.deadzone_draft = DeadzoneDraft::default(),
                     DraftScope::Macros => self.macros_ui.clear_draft(),
                     DraftScope::None => {}
                 }
                 // Keep the active software preset synchronized with every confirmed user edit.
                 self.snapshot_active_software_preset(device);
+            }
+            JobOrigin::ApplyDraft { .. } => {
+                if self.draft_device.as_ref() == Some(device) {
+                    self.draft = DeviceDraft::default();
+                    self.history.clear();
+                    self.sync_effective();
+                }
+                self.apply_failure = None;
+                self.is_changes_open = false;
+                self.snapshot_active_software_preset(device);
+                if let Some(next) = self.after_apply.take() {
+                    self.run_after_apply(next, cx);
+                }
             }
             JobOrigin::ProfileSwitch {
                 slot,
@@ -1003,6 +1058,8 @@ impl AgnoPeriphApp {
         });
     }
 
+    /// Shows `device`. Unsaved edits on the previous device are dropped; use
+    /// [`Self::request_select_device`] to ask first.
     pub fn select_device(&mut self, device: DeviceId, cx: &mut Context<Self>) {
         if self.route == Route::Device && self.selected.as_ref() == Some(&device) {
             return;
@@ -1013,19 +1070,41 @@ impl AgnoPeriphApp {
             self.selected = Some(device);
             self.reset_key_selection();
             self.clear_drafts();
+            self.reset_draft();
             self.keymap_ui = keymap_panel::KeymapUi::default();
             self.lighting = rgb_panel::LightingUi::default();
             self.macros_ui = macro_panel::MacroUi::default();
+            self.tester.reset();
         }
         self.smooth_scroll.reset();
+        self.update_live_polling(cx);
         self.request_sync(cx);
         cx.notify();
+    }
+
+    /// Shows `device`, asking first when the current device has unsaved edits.
+    pub fn request_select_device(
+        &mut self,
+        device: DeviceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected.as_ref() != Some(&device) && self.is_dirty() {
+            let name = self
+                .device(&device)
+                .map_or_else(|| device.to_string(), |d| d.info.model_name.clone());
+            crate::dirty_bar::open_guard(self, AfterApply::SelectDevice(device), &name, window, cx);
+            return;
+        }
+        self.select_device(device, cx);
     }
 
     pub fn open_game_profiles(&mut self, cx: &mut Context<Self>) {
         if self.route != Route::GameProfiles {
             self.route = Route::GameProfiles;
+            self.is_changes_open = false;
             self.smooth_scroll.reset();
+            self.update_live_polling(cx);
             cx.notify();
         }
     }
@@ -1035,9 +1114,53 @@ impl AgnoPeriphApp {
             self.keyboard_tab = tab;
             self.paired.cancel_pick();
             self.smooth_scroll.reset();
+            self.update_live_polling(cx);
             self.request_sync(cx);
             cx.notify();
         }
+    }
+
+    /// Keyboard tabs the selected device offers, in order.
+    pub fn keyboard_tabs(&self) -> Vec<KeyboardTab> {
+        let Some(device) = self.selected_device() else {
+            return Vec::new();
+        };
+        let caps = device.capabilities;
+        let is_keyboard = caps.has_hall_effect()
+            || caps.has_keymap()
+            || caps.has_macros()
+            || caps.has_keyboard_config();
+        if !is_keyboard {
+            return Vec::new();
+        }
+        KeyboardTab::ALL
+            .into_iter()
+            .filter(|tab| match tab {
+                KeyboardTab::Triggers => caps.has_hall_effect(),
+                KeyboardTab::Keybinds => caps.has_keymap(),
+                KeyboardTab::Lighting => caps.has_rgb(),
+                KeyboardTab::Macros => caps.has_macros(),
+                KeyboardTab::Advanced => caps.has_keyboard_config(),
+            })
+            .collect()
+    }
+
+    /// Moves to the next (`forward`) or previous keyboard tab, wrapping around.
+    pub fn cycle_keyboard_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let tabs = self.keyboard_tabs();
+        if tabs.is_empty() || self.route != Route::Device {
+            return;
+        }
+        let current = tabs
+            .iter()
+            .position(|t| *t == self.keyboard_tab)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % tabs.len()
+        } else {
+            (current + tabs.len() - 1) % tabs.len()
+        };
+        self.set_keyboard_tab(tabs[next], cx);
     }
 
     /// Feeds `key` to a pending paired-key pick. Returns `false` when no pick is armed.
@@ -1097,7 +1220,7 @@ impl AgnoPeriphApp {
             self.selected_keys.insert(key);
             self.selected_key = key;
         }
-        self.key_draft = KeyDraft::default();
+        self.history.end_group();
         self.request_sync(cx);
         cx.notify();
     }
@@ -1146,7 +1269,7 @@ impl AgnoPeriphApp {
             self.selected_key = key;
             self.selected_keys = BTreeSet::from([key]);
         }
-        self.key_draft = KeyDraft::default();
+        self.history.end_group();
         self.request_sync(cx);
         cx.notify();
     }
@@ -1280,7 +1403,13 @@ impl AgnoPeriphApp {
                 .map_or_default(|p| p.device_targets.clone()),
             None => self.config.default_targets.clone(),
         };
-        let device_ids: Vec<DeviceId> = self.devices.iter().map(|d| d.id().clone()).collect();
+        let device_ids: Vec<DeviceId> = self
+            .devices
+            .iter()
+            .map(|d| d.id().clone())
+            // A device with unsaved edits switches once they are applied or discarded.
+            .filter(|id| !(self.is_dirty() && self.draft_device.as_ref() == Some(id)))
+            .collect();
         for device in device_ids {
             let key = device.as_str().to_owned();
             let Some(&slot) = targets.get(&key) else {
@@ -1422,7 +1551,7 @@ impl AgnoPeriphApp {
             | SliderRole::RtRelease
             | SliderRole::DeadzoneTop
             | SliderRole::DeadzoneBottom => {
-                hall_effect_panel::on_slider(self, role, value, cx);
+                hall_effect_panel::on_slider(self, role, value, released, cx);
             }
             SliderRole::Brightness | SliderRole::Speed => {
                 rgb_panel::on_slider(self, role, value, released, window, cx);
@@ -1512,6 +1641,7 @@ impl AgnoPeriphApp {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let shortcuts = crate::dirty_bar::shortcuts_button(self, cx);
         let theme = cx.theme();
         let is_dark = theme.mode.is_dark();
         let write_state = if self.dry_run {
@@ -1577,6 +1707,7 @@ impl AgnoPeriphApp {
                             .disabled(self.has_pending_writes())
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     )
+                    .child(shortcuts)
                     .child(
                         Button::new("theme-toggle")
                             .ghost()
@@ -1686,7 +1817,10 @@ impl AgnoPeriphApp {
         if let Some(firmware) = &info.firmware_version {
             facts.push(format!("Firmware {firmware}").into());
         }
-        facts.push(format!("{:04X}:{:04X}", info.vid, info.pid).into());
+        // USB ids help when debugging a driver; release builds leave them out.
+        let vid_pid = self
+            .show_dev_tools
+            .then(|| format!("{:04X}:{:04X}", info.vid, info.pid));
         let caps = device.capabilities;
         let is_keyboard = caps.has_hall_effect()
             || caps.has_keymap()
@@ -1724,7 +1858,20 @@ impl AgnoPeriphApp {
                             .gap_3()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .children(facts),
+                            .children(facts)
+                            .when_some(vid_pid, |this, vid_pid| {
+                                this.child(
+                                    div()
+                                        .id("device-vid-pid")
+                                        .font_family(theme.mono_font_family.clone())
+                                        .child(vid_pid)
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new("USB vendor and product ID")
+                                                .build(window, cx)
+                                        })
+                                        .test_support(),
+                                )
+                            }),
                     ),
             )
             .when(
@@ -1776,17 +1923,7 @@ impl AgnoPeriphApp {
         workspace_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let caps = device.capabilities;
-        let tabs: Vec<KeyboardTab> = KeyboardTab::ALL
-            .into_iter()
-            .filter(|tab| match tab {
-                KeyboardTab::Triggers => caps.has_hall_effect(),
-                KeyboardTab::Keybinds => caps.has_keymap(),
-                KeyboardTab::Lighting => caps.has_rgb(),
-                KeyboardTab::Macros => caps.has_macros(),
-                KeyboardTab::Advanced => caps.has_keyboard_config(),
-            })
-            .collect();
+        let tabs = self.keyboard_tabs();
         let current = if tabs.contains(&self.keyboard_tab) {
             self.keyboard_tab
         } else {
@@ -1896,7 +2033,11 @@ impl Render for AgnoPeriphApp {
         let background = theme.background;
         let foreground = theme.foreground;
         if self.controls.is_none() {
-            return v_flex().size_full().bg(background).text_color(foreground);
+            return v_flex()
+                .id("app-root")
+                .size_full()
+                .bg(background)
+                .text_color(foreground);
         }
         // Available inner width of the workspace pane (viewport minus 240px sidebar and 40px padding).
         let viewport_w: f32 = window.viewport_size().width.into();
@@ -1904,7 +2045,13 @@ impl Render for AgnoPeriphApp {
         let header = self.render_header(cx);
         let sidebar = sidebar::render(self, cx);
         let workspace = self.render_workspace(workspace_width, cx);
-        v_flex()
+        let dirty_bar = (self.route == Route::Device && self.has_dirty_bar())
+            .then(|| crate::dirty_bar::render(self, cx));
+        let root = v_flex()
+            .id("app-root")
+            .key_context(crate::shortcuts::CONTEXT)
+            .track_focus(&self.focus_handle);
+        crate::dirty_bar::bind_actions(root, cx)
             .size_full()
             .bg(background)
             .text_color(foreground)
@@ -1915,7 +2062,14 @@ impl Render for AgnoPeriphApp {
                     .flex_1()
                     .min_h_0()
                     .child(sidebar)
-                    .child(workspace),
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(workspace)
+                            .children(dirty_bar),
+                    ),
             )
             .when(self.show_dev_tools && self.is_inspector_open, |this| {
                 this.child(inspector_drawer::render(self, cx))
@@ -2003,4 +2157,13 @@ pub(crate) fn muted_note(text: impl Into<SharedString>, theme: &Theme) -> Div {
 pub(crate) fn mm(value: TravelHundredthsMm) -> String {
     let raw = value.as_hundredths();
     format!("{}.{:02}", raw / 100, raw % 100)
+}
+
+/// Inline note under an edited value showing what the device holds now.
+pub(crate) fn was_note(text: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .text_xs()
+        .italic()
+        .text_color(theme.muted_foreground)
+        .child(format!("was {}", text.into()))
 }

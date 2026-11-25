@@ -6,6 +6,7 @@ members = [
     "crates/drivers/driver-logitech",
     "crates/drivers/driver-lamzu",
     "crates/drivers/driver-atk",
+    "crates/drivers/driver-mchose",
     "crates/drivers/driver-razer",
     "crates/drivers/driver-pulsar",
     "crates/drivers/driver-finalmouse",
@@ -30,6 +31,7 @@ agnoperiph-driver-endgame-gear = { path = "crates/drivers/driver-endgame-gear" }
 agnoperiph-driver-finalmouse = { path = "crates/drivers/driver-finalmouse" }
 agnoperiph-driver-lamzu = { path = "crates/drivers/driver-lamzu" }
 agnoperiph-driver-logitech = { path = "crates/drivers/driver-logitech" }
+agnoperiph-driver-mchose = { path = "crates/drivers/driver-mchose" }
 agnoperiph-driver-pulsar = { path = "crates/drivers/driver-pulsar" }
 agnoperiph-driver-razer = { path = "crates/drivers/driver-razer" }
 agnoperiph-driver-via = { path = "crates/drivers/driver-via" }
@@ -65,3 +67,6 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 return_self_not_must_use = "allow"
 struct_excessive_bools = "allow"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"

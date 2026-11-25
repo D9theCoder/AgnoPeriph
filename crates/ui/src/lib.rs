@@ -13,14 +13,18 @@
 
 pub mod app;
 pub mod backend;
+pub mod battery_alerts;
 mod calibration;
 mod controls;
+mod dirty_bar;
+pub mod draft;
 pub mod game_profiles;
 mod game_profiles_view;
 mod hall_effect_panel;
 pub mod icons;
 mod inspector_drawer;
 mod key_matrix;
+pub mod key_tester;
 mod keyboard_config_panel;
 pub mod keycodes;
 pub mod keymap;
@@ -28,10 +32,14 @@ mod keymap_panel;
 mod macro_panel;
 mod pointer_panel;
 mod profile_bar;
+pub mod profile_io;
+pub mod quick_presets;
 mod rgb_panel;
+pub mod shortcuts;
 pub mod sidebar;
 mod smooth_scroll;
 pub mod system;
+pub mod tray_model;
 
 pub use app::{AgnoPeriphApp, AppOptions, Banner, KeyboardTab, Route};
 pub use hall_effect_panel::snap_travel;

@@ -14,7 +14,10 @@ Before implementing Rust driver code for any newly discovered protocol or comman
 ## Specifications
 - `logitech-hidpp.md` — Logitech HID++ 1.0 / 2.0 mice & keyboards
 - `lamzu-compx.md` — Lamzu Atlantis CompX / Aurora mice
-- `atk-rs7.md` — ATK RS7 Hall Effect keyboard
+- `atk-rs7.md` — ATK RS7 / DuckBread (`0xFF60`) Hall Effect keyboards
+- `atk-mice.md` — ATK / VGN / VXE (`0x08` EEPROM) gaming mice
+- `atk-ff01.md` — ATK68 / ATK75 (`0xFF01` GTech) Hall Effect keyboards
+- `mchose.md` — MCHOSE V2 (`0x11`/`0x12`), V3 (`0x4D`), and A5 Gen1 (`0x2023`) gaming mice
 - `razer-hid.md` — Razer 90-byte Feature Report mice (Viper, DeathAdder, Basilisk, Naga, Orochi)
 - `pulsar-hid.md` — Pulsar Report-8 Flash & XS-1 mice (X2, X2V2, X2H, X2 CrazyLight, Xlite, X3)
 - `finalmouse-hid.md` — Finalmouse UltralightX & Starlight X mice

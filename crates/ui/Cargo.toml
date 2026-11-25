@@ -20,6 +20,7 @@ agnoperiph-driver-endgame-gear = { workspace = true }
 agnoperiph-driver-finalmouse = { workspace = true }
 agnoperiph-driver-lamzu = { workspace = true }
 agnoperiph-driver-logitech = { workspace = true }
+agnoperiph-driver-mchose = { workspace = true }
 agnoperiph-driver-pulsar = { workspace = true }
 agnoperiph-driver-razer = { workspace = true }
 agnoperiph-driver-via = { workspace = true }

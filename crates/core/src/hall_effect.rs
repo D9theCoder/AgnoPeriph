@@ -354,6 +354,8 @@ pub struct HallEffectCapabilities {
     pub max_dks_bindings: u8,
     pub max_socd_pairs: u8,
     pub supports_calibration_status: bool,
+    #[serde(default)]
+    pub supports_live_travel: bool,
 }
 
 impl HallEffectCapabilities {
@@ -375,6 +377,7 @@ impl HallEffectCapabilities {
             max_dks_bindings: 0,
             max_socd_pairs: 0,
             supports_calibration_status: false,
+            supports_live_travel: false,
         }
     }
 
@@ -403,6 +406,15 @@ impl HallEffectCapabilities {
     pub const fn with_calibration_status(mut self, supported: bool) -> Self {
         self.supports_calibration_status = supported;
         self
+    }
+
+    pub const fn with_live_travel(mut self, supported: bool) -> Self {
+        self.supports_live_travel = supported;
+        self
+    }
+
+    pub const fn has_live_travel(&self) -> bool {
+        self.supports_live_travel
     }
 
     pub const fn has_rapid_trigger(&self) -> bool {
@@ -586,6 +598,20 @@ impl HallEffectSnapshot {
     }
 }
 
+/// Single live analog key travel reading for the Hall Effect key tester.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct KeyTravelSample {
+    pub key: KeyIndex,
+    pub travel: TravelHundredthsMm,
+}
+
+impl KeyTravelSample {
+    pub const fn new(key: KeyIndex, travel: TravelHundredthsMm) -> Self {
+        Self { key, travel }
+    }
+}
+
 /// Capability trait for magnetic / Hall Effect keyboards (e.g., ATK RS7).
 pub trait HallEffectKeyboard: Send + Sync {
     /// Returns supported travel bounds, Rapid Trigger, DKS, SOCD, and calibration limits.
@@ -701,5 +727,10 @@ pub trait HallEffectKeyboard: Send + Sync {
     /// Polls per-key calibration completion flags (`true` = calibrated).
     fn read_calibration_key_progress(&mut self) -> CoreResult<Vec<bool>> {
         Err(CoreError::UnsupportedCapability("calibration_control"))
+    }
+
+    /// Polls live per-key analog travel depth for currently pressed keys.
+    fn read_live_key_travel(&mut self) -> CoreResult<Vec<KeyTravelSample>> {
+        Err(CoreError::UnsupportedCapability("live_key_travel"))
     }
 }

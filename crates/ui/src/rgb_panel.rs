@@ -19,8 +19,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, muted_note, section};
-use crate::backend::{DeviceSnapshot, RgbState, SettingChange};
+use crate::backend::{DeviceSnapshot, RgbState};
 use crate::controls::{SliderRole, sync_input, sync_slider, to_units};
+use crate::draft::{ChangeId, EditKey, ZoneDraft};
 
 /// Swatch column from ATK HUB, read in pairs: the spectrum plus white.
 const SWATCHES: [(&str, RgbColor); 12] = [
@@ -153,7 +154,7 @@ impl LightingUi {
     }
 }
 
-fn effect_label(kind: RgbEffectKind) -> &'static str {
+pub(crate) fn effect_label(kind: RgbEffectKind) -> &'static str {
     match kind {
         RgbEffectKind::Off => "Off",
         RgbEffectKind::Static => "Static",
@@ -286,15 +287,17 @@ impl AgnoPeriphApp {
         info.presets.into_iter().find(|p| p.id == id)
     }
 
+    /// Stages the zone's effect and brightness as one unsaved edit.
     fn write_zone(&mut self, effect: RgbEffect, brightness: Brightness, cx: &mut Context<Self>) {
         let Some((_, state)) = self.active_zone() else {
             return;
         };
-        self.apply_change(
-            SettingChange::Rgb {
-                zone: state.zone,
-                effect,
-                brightness,
+        let zone = state.zone.value();
+        self.edit_draft(
+            EditKey::Change(ChangeId::Lighting(zone)),
+            false,
+            move |draft, _| {
+                draft.rgb.insert(zone, ZoneDraft { effect, brightness });
             },
             cx,
         );

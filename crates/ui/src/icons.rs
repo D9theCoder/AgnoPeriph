@@ -48,7 +48,18 @@ pub fn advanced_svg(icon: AdvancedIcon, icon_size: Rems, color: Hsla) -> Svg {
         .text_color(color)
 }
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [Pencil]);
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [
+        Pencil,
+        Keyboard,
+        Download,
+        Upload,
+        SlidersHorizontal,
+        Ellipsis,
+        FileText
+    ]
+);
 
 /// Asset source combining AgnoPeriph's embedded custom SVGs with GPUI Kit's Lucide icons.
 #[derive(Clone, Copy, Debug, Default)]

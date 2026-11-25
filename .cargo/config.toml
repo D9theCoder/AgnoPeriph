@@ -1,0 +1,5 @@
+# Optional fast Windows linker:
+# If you have LLVM's `lld-link.exe` on PATH (e.g. `winget install LLVM.LLVM`),
+# uncomment the lines below to speed up incremental Windows links.
+# [target.x86_64-pc-windows-msvc]
+# linker = "lld-link"

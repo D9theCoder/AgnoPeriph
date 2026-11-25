@@ -5,18 +5,30 @@
 //! actuation & Rapid Trigger, dead zones, paired/advanced keys, lighting, and keyboard config)
 //! is diffed and pushed through [`crate::backend::PeripheralService`] when switched.
 
-use agnoperiph_core::{DeviceId, KeyIndex, ProfileSlot};
+use std::path::{Path, PathBuf};
+
+use agnoperiph_core::{DeviceId, ExportedProfile, KeyIndex, ProfileSlot};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable,
-    button::{Button, ButtonGroup},
+    ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
+    alert::Alert,
+    button::{Button, ButtonGroup, ButtonVariants},
+    dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
+    menu::{DropdownMenu, PopupMenuItem},
+    notification::Notification,
+    tag::Tag,
+    v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::AgnoPeriphApp;
+use crate::app::{AfterApply, AgnoPeriphApp};
 use crate::backend::{ActuationTarget, DeviceSnapshot, SettingChange};
+use crate::draft::EditKey;
 use crate::game_profiles::SavedKeyboardPreset;
+use crate::profile_io::{ImportPreview, export_file_name, export_json, stage_import};
+use crate::quick_presets::QuickPreset;
 
 /// Computes the exact ordered diff that transitions `current` into `preset`.
 ///
@@ -207,21 +219,148 @@ pub(crate) fn capture_preset(device: &DeviceSnapshot) -> SavedKeyboardPreset {
 }
 
 impl AgnoPeriphApp {
-    /// Activates `slot` on `device`.
-    pub(crate) fn request_profile_switch(
+    /// Activates `slot` on `device`, asking first when that device has unsaved edits.
+    pub fn request_profile_switch(
         &mut self,
         device: &DeviceId,
         slot: u8,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.is_busy() || self.is_loading() {
             return;
         }
+        if self.is_dirty() && self.draft_device.as_ref() == Some(device) {
+            let target = self.config.preset_name(device, ProfileSlot::new(slot));
+            crate::dirty_bar::open_guard(
+                self,
+                AfterApply::SwitchProfile {
+                    device: device.clone(),
+                    slot,
+                },
+                &target,
+                window,
+                cx,
+            );
+            return;
+        }
         self.switch_profile(device, slot, cx);
     }
 
-    fn switch_profile(&mut self, device: &DeviceId, slot: u8, cx: &mut Context<Self>) {
+    /// Stages a built-in quick preset on the selected device as one undo step.
+    pub fn load_quick_preset(&mut self, preset: QuickPreset, cx: &mut Context<Self>) {
+        self.edit_draft(
+            EditKey::Bulk,
+            false,
+            move |draft, raw| preset.stage(raw, draft),
+            cx,
+        );
+    }
+
+    /// Stages every supported section of an imported profile.
+    pub fn import_profile(&mut self, profile: ExportedProfile, cx: &mut Context<Self>) {
+        self.edit_draft(
+            EditKey::Bulk,
+            false,
+            move |draft, raw| stage_import(&profile, raw, draft),
+            cx,
+        );
+    }
+
+    /// The selected device's values (with unsaved edits) as profile JSON.
+    pub fn export_profile_json(&self) -> Option<(String, String)> {
+        let device = self.selected_device()?;
+        let preset = self
+            .current_slot(device.id())
+            .map(|slot| self.config.preset_name(device.id(), ProfileSlot::new(slot)));
+        let name = preset
+            .clone()
+            .unwrap_or_else(|| device.info.model_name.clone());
+        Some((
+            export_file_name(device, preset.as_deref()),
+            export_json(device, &name),
+        ))
+    }
+
+    /// Asks where to save the export, then writes it off the UI thread.
+    pub fn begin_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((file_name, json)) = self.export_profile_json() else {
+            return;
+        };
+        let directory = default_profile_dir();
+        let chosen = cx.prompt_for_new_path(&directory, Some(&file_name));
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            let target = path.clone();
+            let written = cx
+                .background_spawn(async move { std::fs::write(&target, json) })
+                .await;
+            let note = match written {
+                Ok(()) => Notification::success(format!("Exported to {}", display_name(&path))),
+                Err(err) => Notification::error(format!("Couldn’t export the profile: {err}.")),
+            };
+            let _ = cx.update_window(handle, |_, window, cx| window.push_notification(note, cx));
+        })
+        .detach();
+    }
+
+    /// Asks for a profile file, then reads it off the UI thread and opens the preview.
+    pub fn begin_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let source = path.clone();
+            let read = cx
+                .background_spawn(async move { std::fs::read_to_string(&source) })
+                .await;
+            let name = display_name(&path);
+            let _ = cx.update_window(handle, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| match read {
+                    Ok(text) => this.open_import_preview(&name, &text, window, cx),
+                    Err(err) => window.push_notification(
+                        Notification::error(format!("Couldn’t read {name}: {err}.")),
+                        cx,
+                    ),
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Validates `text` against the selected device and shows what an import would load.
+    pub fn open_import_preview(
+        &mut self,
+        file_name: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(raw) = self.selected_raw() else {
+            return;
+        };
+        let preview = ImportPreview::parse(file_name, text, raw);
+        let model = raw.info.model_name.clone();
+        let entity = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            render_import_dialog(dialog, &preview, &model, &entity, cx)
+        });
+    }
+
+    pub(crate) fn switch_profile(&mut self, device: &DeviceId, slot: u8, cx: &mut Context<Self>) {
         if let Some(job) = self.profile_switch_job(device, slot, false) {
             self.enqueue(job, cx);
         } else {
@@ -289,6 +428,80 @@ impl AgnoPeriphApp {
     }
 }
 
+/// Quick presets and the profile file menu, shown for every device that has settings.
+fn render_profile_tools(
+    device: &DeviceSnapshot,
+    busy: bool,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> impl IntoElement + use<> {
+    let presets = QuickPreset::available(device);
+    let entity = cx.entity().downgrade();
+    let presets_menu = (!presets.is_empty()).then(|| {
+        let entity = entity.clone();
+        Button::new("quick-presets")
+            .outline()
+            .small()
+            .icon(Icon::new(IconName::SlidersHorizontal))
+            .label("Quick presets")
+            .dropdown_caret(true)
+            .disabled(busy)
+            .dropdown_menu(move |mut menu, _, cx| {
+                let muted = cx.theme().muted_foreground;
+                for preset in &presets {
+                    let preset = *preset;
+                    let entity = entity.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            v_flex().gap_0p5().child(preset.label()).child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(preset.description()),
+                            )
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ =
+                                entity.update(cx, |this, cx| this.load_quick_preset(preset, cx));
+                        }),
+                    );
+                }
+                menu.separator()
+                    .label("Loads as unsaved changes. Nothing is sent until you apply.")
+            })
+    });
+    let file_entity = entity.clone();
+    let file_menu = Button::new("profile-file-menu")
+        .outline()
+        .small()
+        .icon(Icon::new(IconName::Ellipsis))
+        .accessibility_label("Profile file actions")
+        .tooltip("Import or export a profile file")
+        .disabled(busy)
+        .dropdown_menu(move |menu, _, _| {
+            let import = file_entity.clone();
+            let export = file_entity.clone();
+            menu.item(
+                PopupMenuItem::new("Import from JSON…")
+                    .icon(Icon::new(IconName::Download))
+                    .on_click(move |_, window, cx| {
+                        let _ = import.update(cx, |this, cx| this.begin_import(window, cx));
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Export to JSON…")
+                    .icon(Icon::new(IconName::Upload))
+                    .on_click(move |_, window, cx| {
+                        let _ = export.update(cx, |this, cx| this.begin_export(window, cx));
+                    }),
+            )
+        });
+    h_flex()
+        .id("profile-tools")
+        .gap_2()
+        .children(presets_menu)
+        .child(file_menu)
+}
+
 pub(crate) fn render(
     app: &AgnoPeriphApp,
     device: &DeviceSnapshot,
@@ -298,8 +511,13 @@ pub(crate) fn render(
     let busy = app.is_busy() || app.is_loading();
     let hardware = device.profiles.as_ref();
     let is_keyboard = device.capabilities.has_hall_effect();
+    let tools = render_profile_tools(device, busy, cx);
     if hardware.is_none() && !is_keyboard {
-        return div().into_any_element();
+        return h_flex()
+            .id("profile-bar")
+            .gap_2()
+            .child(tools)
+            .into_any_element();
     }
     let (slots, active, prefix): (Vec<u8>, u8, &'static str) = if let Some(profiles) = hardware {
         (
@@ -367,5 +585,153 @@ pub(crate) fn render(
                     this.open_rename_preset(rename_device.clone(), active, window, cx);
                 })),
         )
+        .child(div().flex_1())
+        .child(tools)
         .into_any_element()
+}
+
+fn default_profile_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(|home| PathBuf::from(home).join("Documents"))
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn render_import_dialog(
+    dialog: gpui_kit::component::dialog::Dialog,
+    preview: &ImportPreview,
+    model: &str,
+    entity: &WeakEntity<AgnoPeriphApp>,
+    cx: &mut App,
+) -> gpui_kit::component::dialog::Dialog {
+    let theme = cx.theme();
+    let can_import = preview.can_import();
+    let title = if can_import {
+        format!("Import “{}”", preview.file_name)
+    } else {
+        format!("Can’t import “{}”", preview.file_name)
+    };
+    let row = |label: &'static str, value: AnyElement| {
+        h_flex()
+            .gap_4()
+            .items_start()
+            .text_sm()
+            .child(
+                div()
+                    .w_24()
+                    .flex_shrink_0()
+                    .text_color(theme.muted_foreground)
+                    .child(label),
+            )
+            .child(div().flex_1().min_w_0().child(value))
+    };
+    let made_for = preview.made_for.clone().map(|name| {
+        h_flex()
+            .gap_2()
+            .child(name)
+            .child(if preview.matches_model {
+                Tag::secondary().xsmall().child("Matches")
+            } else {
+                Tag::warning().xsmall().child(format!("Not {model}"))
+            })
+            .into_any_element()
+    });
+    let sections = v_flex()
+        .gap_1()
+        .children(preview.sections.iter().map(|section| {
+            h_flex()
+                .id(SharedString::from(format!(
+                    "import-section-{}",
+                    section.name.to_lowercase().replace(' ', "-")
+                )))
+                .gap_2()
+                .items_start()
+                .child(
+                    v_flex().flex_1().min_w_0().child(section.name).child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(section.detail.clone()),
+                    ),
+                )
+                .child(if section.loads {
+                    Tag::secondary().xsmall().child("Loads")
+                } else {
+                    Tag::secondary().outline().xsmall().child("Skipped")
+                })
+        }));
+    let profile = preview.profile.clone();
+    let profile_name = profile.as_ref().map(|p| p.name.clone());
+
+    let body = v_flex()
+        .id(if can_import {
+            "import-preview"
+        } else {
+            "import-error"
+        })
+        .gap_3()
+        .when_some(preview.error.clone(), |this, error| {
+            this.child(Alert::error("import-error-alert", error))
+        })
+        .when_some(profile_name, |this, name| {
+            this.child(row("Profile", div().child(name).into_any_element()))
+        })
+        .when_some(made_for, |this, made_for| {
+            this.child(row("Made for", made_for))
+        })
+        .when(!preview.sections.is_empty(), |this| {
+            this.child(row("Contains", sections.into_any_element()))
+        })
+        .when(can_import, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Values load as unsaved changes. Nothing is sent until you apply."),
+            )
+        });
+
+    let footer = DialogFooter::new()
+        .gap_2()
+        .child(DialogClose::new().child(Button::new("import-cancel").outline().label("Cancel")))
+        .map(|footer| {
+            if can_import {
+                let entity = entity.clone();
+                footer.child(
+                    DialogAction::new().child(
+                        Button::new("import-confirm")
+                            .primary()
+                            .label("Import")
+                            .on_click(move |_, _, cx| {
+                                if let Some(profile) = profile.clone() {
+                                    let _ = entity
+                                        .update(cx, |this, cx| this.import_profile(profile, cx));
+                                }
+                            }),
+                    ),
+                )
+            } else {
+                let entity = entity.clone();
+                footer.child(
+                    DialogAction::new().child(
+                        Button::new("import-choose-another")
+                            .outline()
+                            .icon(Icon::new(IconName::FileText))
+                            .label("Choose another file…")
+                            .on_click(move |_, window, cx| {
+                                let _ = entity.update(cx, |this, cx| this.begin_import(window, cx));
+                            }),
+                    ),
+                )
+            }
+        });
+
+    dialog.title(title).w(px(480.)).child(body).footer(footer)
 }

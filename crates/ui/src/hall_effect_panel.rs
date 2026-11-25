@@ -9,8 +9,8 @@ use agnoperiph_core::{
     TravelHundredthsMm,
 };
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable, Theme, WindowExt,
-    button::{Button, ButtonVariant, ButtonVariants},
+    ActiveTheme, Disableable, Selectable, Sizable, Theme,
+    button::{Button, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
@@ -21,9 +21,12 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, DraftScope, JobOrigin, field, mm, muted_note, readout, section};
-use crate::backend::{ActuationTarget, DeviceSnapshot, HallEffectState, SettingChange};
+use crate::app::{
+    AgnoPeriphApp, DraftScope, JobOrigin, field, mm, muted_note, readout, section, was_note,
+};
+use crate::backend::{DeviceSnapshot, HallEffectState, SettingChange};
 use crate::controls::{ConfiguredPairKey, SliderRole, sync_slider, to_units};
+use crate::draft::{ChangeId, EditKey};
 use crate::icons::{AdvancedIcon, advanced_svg};
 use crate::key_matrix::{self, KeyFace, KeyTone};
 use crate::keycodes::{HID_KEYS, KeyGroup, hid_name};
@@ -284,32 +287,32 @@ impl AgnoPeriphApp {
     /// The primary key's values with unsaved edits applied.
     pub(crate) fn key_values(&self) -> Option<(TravelHundredthsMm, RapidTriggerConfig)> {
         let config = self.hall_effect_state()?.key(self.selected_key)?;
-        Some((
-            self.key_draft.actuation.unwrap_or(config.actuation),
-            self.key_draft.rapid_trigger.unwrap_or(config.rapid_trigger),
-        ))
+        Some((config.actuation, config.rapid_trigger))
     }
 
-    fn deadzone_values(&self) -> Option<(TravelHundredthsMm, TravelHundredthsMm)> {
-        let he = self.hall_effect_state()?;
-        let first = he.snapshot.keys.first();
-        Some((
-            self.deadzone_draft
-                .top
-                .or_else(|| first.and_then(|k| k.top_deadzone))
-                .unwrap_or(t(0)),
-            self.deadzone_draft
-                .bottom
-                .or_else(|| first.and_then(|k| k.bottom_deadzone))
-                .unwrap_or(t(0)),
-        ))
+    /// The primary key's values as the device holds them, before unsaved edits.
+    fn saved_key_values(&self) -> Option<(TravelHundredthsMm, RapidTriggerConfig)> {
+        let config = self
+            .selected_raw()?
+            .hall_effect
+            .as_ref()?
+            .key(self.selected_key)?;
+        Some((config.actuation, config.rapid_trigger))
+    }
+
+    pub(crate) fn deadzone_values(&self) -> Option<(TravelHundredthsMm, TravelHundredthsMm)> {
+        Some(deadzones_of(self.hall_effect_state()?))
+    }
+
+    fn saved_deadzone_values(&self) -> Option<(TravelHundredthsMm, TravelHundredthsMm)> {
+        Some(deadzones_of(self.selected_raw()?.hall_effect.as_ref()?))
     }
 
     fn selection(&self) -> Vec<KeyIndex> {
         self.selected_keys.iter().copied().collect()
     }
 
-    fn set_actuation_draft(&mut self, value: i32, cx: &mut Context<Self>) {
+    fn set_actuation_draft(&mut self, value: i32, coalesce: bool, cx: &mut Context<Self>) {
         let Some(he) = self.hall_effect_state() else {
             return;
         };
@@ -320,9 +323,20 @@ impl AgnoPeriphApp {
             caps.actuation_max,
             caps.actuation_step,
         );
-        self.key_draft.actuation = Some(next);
-        self.request_sync(cx);
-        cx.notify();
+        let keys = self.selection();
+        if keys.is_empty() {
+            return;
+        }
+        self.edit_draft(
+            EditKey::Change(ChangeId::Actuation),
+            coalesce,
+            move |draft, _| {
+                for key in keys {
+                    draft.actuation.insert(key, next);
+                }
+            },
+            cx,
+        );
     }
 
     fn step_actuation(&mut self, direction: i32, cx: &mut Context<Self>) {
@@ -330,64 +344,29 @@ impl AgnoPeriphApp {
             return;
         };
         let step = i32::from(he.capabilities.actuation_step.as_hundredths().max(1));
-        self.set_actuation_draft(i32::from(actuation.as_hundredths()) + direction * step, cx);
+        self.set_actuation_draft(
+            i32::from(actuation.as_hundredths()) + direction * step,
+            false,
+            cx,
+        );
     }
 
-    fn apply_actuation(&mut self, cx: &mut Context<Self>) {
+    /// Stages the primary key's actuation for every key with its own trigger travel.
+    fn stage_actuation_for_all_keys(&mut self, cx: &mut Context<Self>) {
         let Some((point, _)) = self.key_values() else {
             return;
         };
-        let keys = self.selection();
-        let change = match keys.as_slice() {
-            [] => return,
-            [key] => SettingChange::Actuation {
-                target: ActuationTarget::Key(*key),
-                point,
+        let keys = self.selectable_layout_keys();
+        self.edit_draft(
+            EditKey::Bulk,
+            false,
+            move |draft, _| {
+                for key in keys {
+                    draft.actuation.insert(key, point);
+                }
             },
-            _ => SettingChange::ActuationMany { keys, point },
-        };
-        self.apply_change(change, cx);
-    }
-
-    fn apply_global_actuation(&mut self, cx: &mut Context<Self>) {
-        if let Some((point, _)) = self.key_values() {
-            self.apply_change(
-                SettingChange::Actuation {
-                    target: ActuationTarget::AllKeys,
-                    point,
-                },
-                cx,
-            );
-        }
-    }
-
-    fn request_global_actuation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(he), Some((point, _))) = (self.hall_effect_state(), self.key_values()) else {
-            return;
-        };
-        if self.is_dry_run() {
-            self.apply_global_actuation(cx);
-            return;
-        }
-        let key_count = he.capabilities.key_count;
-        let app = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let app = app.clone();
-            alert
-                .confirm()
-                .title("Write actuation to all keys?")
-                .description(format!(
-                    "This erases and rewrites the onboard actuation table for all {key_count} keys to {} mm.",
-                    mm(point)
-                ))
-                .ok_text("Write all keys")
-                .ok_variant(ButtonVariant::Warning)
-                .cancel_text("Cancel")
-                .on_ok(move |_, _, cx| {
-                    let _ = app.update(cx, super::app::AgnoPeriphApp::apply_global_actuation);
-                    true
-                })
-        });
+            cx,
+        );
     }
 
     fn rapid_trigger_bounds(
@@ -399,6 +378,29 @@ impl AgnoPeriphApp {
             caps.rapid_trigger_max?,
             caps.actuation_step,
         ))
+    }
+
+    /// Stages `config` for every selected key.
+    fn stage_rapid_trigger(
+        &mut self,
+        config: RapidTriggerConfig,
+        coalesce: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let keys = self.selection();
+        if keys.is_empty() {
+            return;
+        }
+        self.edit_draft(
+            EditKey::Change(ChangeId::RapidTrigger),
+            coalesce,
+            move |draft, _| {
+                for key in keys {
+                    draft.rapid_trigger.insert(key, config);
+                }
+            },
+            cx,
+        );
     }
 
     fn set_rapid_trigger_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -424,13 +426,20 @@ impl AgnoPeriphApp {
             max,
             step,
         );
-        self.key_draft.rapid_trigger =
-            Some(RapidTriggerConfig::new(enabled, continuous, press, release));
-        self.request_sync(cx);
-        cx.notify();
+        self.stage_rapid_trigger(
+            RapidTriggerConfig::new(enabled, continuous, press, release),
+            false,
+            cx,
+        );
     }
 
-    fn set_sensitivity(&mut self, is_press: bool, value: i32, cx: &mut Context<Self>) {
+    fn set_sensitivity(
+        &mut self,
+        is_press: bool,
+        value: i32,
+        coalesce: bool,
+        cx: &mut Context<Self>,
+    ) {
         let (Some((_, mut config)), Some((min, max, step))) =
             (self.key_values(), self.rapid_trigger_bounds())
         else {
@@ -442,9 +451,7 @@ impl AgnoPeriphApp {
         } else {
             config.release_sensitivity = next;
         }
-        self.key_draft.rapid_trigger = Some(config);
-        self.request_sync(cx);
-        cx.notify();
+        self.stage_rapid_trigger(config, coalesce, cx);
     }
 
     fn step_sensitivity(&mut self, is_press: bool, direction: i32, cx: &mut Context<Self>) {
@@ -459,26 +466,12 @@ impl AgnoPeriphApp {
             config.release_sensitivity
         };
         let delta = direction * i32::from(step.as_hundredths().max(1));
-        self.set_sensitivity(is_press, i32::from(current.as_hundredths()) + delta, cx);
-    }
-
-    fn apply_rapid_trigger(&mut self, cx: &mut Context<Self>) {
-        let Some((_, config)) = self.key_values() else {
-            return;
-        };
-        let keys = self.selection();
-        let change = match keys.as_slice() {
-            [] => return,
-            [key] => SettingChange::RapidTrigger { key: *key, config },
-            _ => SettingChange::RapidTriggerMany { keys, config },
-        };
-        self.apply_change(change, cx);
-    }
-
-    fn discard_key_draft(&mut self, cx: &mut Context<Self>) {
-        self.key_draft = crate::app::KeyDraft::default();
-        self.request_sync(cx);
-        cx.notify();
+        self.set_sensitivity(
+            is_press,
+            i32::from(current.as_hundredths()) + delta,
+            false,
+            cx,
+        );
     }
 
     fn step_deadzone(&mut self, is_top: bool, direction: i32, cx: &mut Context<Self>) {
@@ -486,24 +479,26 @@ impl AgnoPeriphApp {
             return;
         };
         let current = if is_top { top } else { bottom };
-        self.set_deadzone(is_top, i32::from(current.as_hundredths()) + direction, cx);
+        self.set_deadzone(
+            is_top,
+            i32::from(current.as_hundredths()) + direction,
+            false,
+            cx,
+        );
     }
 
-    fn set_deadzone(&mut self, is_top: bool, value: i32, cx: &mut Context<Self>) {
+    fn set_deadzone(&mut self, is_top: bool, value: i32, coalesce: bool, cx: &mut Context<Self>) {
+        let Some((top, bottom)) = self.deadzone_values() else {
+            return;
+        };
         let next = snap_travel(value, t(0), t(100), t(1));
-        if is_top {
-            self.deadzone_draft.top = Some(next);
-        } else {
-            self.deadzone_draft.bottom = Some(next);
-        }
-        self.request_sync(cx);
-        cx.notify();
-    }
-
-    fn apply_deadzones(&mut self, cx: &mut Context<Self>) {
-        if let Some((top, bottom)) = self.deadzone_values() {
-            self.apply_change(SettingChange::Deadzones { top, bottom }, cx);
-        }
+        let pair = if is_top { (next, bottom) } else { (top, next) };
+        self.edit_draft(
+            EditKey::Change(ChangeId::Deadzones),
+            coalesce,
+            move |draft, _| draft.deadzones = Some(pair),
+            cx,
+        );
     }
 
     fn layout_keys(&self) -> Vec<KeyIndex> {
@@ -532,7 +527,7 @@ impl AgnoPeriphApp {
         if let Some(&first) = self.selected_keys.iter().next() {
             self.selected_key = first;
         }
-        self.key_draft = crate::app::KeyDraft::default();
+        self.end_edit_group();
         self.request_sync(cx);
         cx.notify();
     }
@@ -543,35 +538,44 @@ impl AgnoPeriphApp {
         if let Some(first) = self.selected_keys.iter().next() {
             self.selected_key = *first;
         }
-        self.key_draft = crate::app::KeyDraft::default();
+        self.end_edit_group();
         self.request_sync(cx);
         cx.notify();
     }
 
     fn clear_key_selection(&mut self, cx: &mut Context<Self>) {
         self.selected_keys.clear();
-        self.key_draft = crate::app::KeyDraft::default();
+        self.end_edit_group();
         cx.notify();
     }
 
+    /// Stages the default actuation with Rapid Trigger off for the selected keys.
     fn restore_default_keys(&mut self, cx: &mut Context<Self>) {
         let keys = self.selection();
         if keys.is_empty() {
             return;
         }
-        self.key_draft = crate::app::KeyDraft::default();
-        self.apply_changes(
-            vec![
-                SettingChange::ActuationMany {
-                    keys: keys.clone(),
-                    point: DEFAULT_ACTUATION,
-                },
-                SettingChange::RapidTriggerMany {
-                    keys,
-                    config: RapidTriggerConfig::disabled(),
-                },
-            ],
-            JobOrigin::User(DraftScope::None),
+        let has_rt = self
+            .hall_effect_state()
+            .is_some_and(|he| he.capabilities.has_rapid_trigger());
+        self.edit_draft(
+            EditKey::Bulk,
+            false,
+            move |draft, raw| {
+                let he = raw.hall_effect.as_ref();
+                for key in keys {
+                    draft.actuation.insert(key, DEFAULT_ACTUATION);
+                    let current = he.and_then(|he| he.key(key)).map(|k| k.rapid_trigger);
+                    // A key that already has Rapid Trigger off keeps its stored encoding.
+                    if has_rt && current.is_some_and(|c| c.is_enabled()) {
+                        draft
+                            .rapid_trigger
+                            .insert(key, RapidTriggerConfig::disabled());
+                    } else {
+                        draft.rapid_trigger.remove(&key);
+                    }
+                }
+            },
             cx,
         );
     }
@@ -1034,22 +1038,35 @@ pub(crate) fn sync_controls(
     }
 }
 
+/// Slider drags stage one value per event and form one undo step until released.
 pub(crate) fn on_slider(
     app: &mut AgnoPeriphApp,
     role: SliderRole,
     value: f32,
+    released: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) {
     let units = i32::from(to_units(value));
     match role {
-        SliderRole::Travel => app.set_actuation_draft(units, cx),
+        SliderRole::Travel => app.set_actuation_draft(units, true, cx),
         SliderRole::PairTravel => app.set_pair_trigger_point(units, cx),
-        SliderRole::RtPress => app.set_sensitivity(true, units, cx),
-        SliderRole::RtRelease => app.set_sensitivity(false, units, cx),
-        SliderRole::DeadzoneTop => app.set_deadzone(true, units, cx),
-        SliderRole::DeadzoneBottom => app.set_deadzone(false, units, cx),
+        SliderRole::RtPress => app.set_sensitivity(true, units, true, cx),
+        SliderRole::RtRelease => app.set_sensitivity(false, units, true, cx),
+        SliderRole::DeadzoneTop => app.set_deadzone(true, units, true, cx),
+        SliderRole::DeadzoneBottom => app.set_deadzone(false, units, true, cx),
         _ => {}
     }
+    if released {
+        app.end_edit_group();
+    }
+}
+
+fn deadzones_of(he: &HallEffectState) -> (TravelHundredthsMm, TravelHundredthsMm) {
+    let first = he.snapshot.keys.first();
+    (
+        first.and_then(|k| k.top_deadzone).unwrap_or(t(0)),
+        first.and_then(|k| k.bottom_deadzone).unwrap_or(t(0)),
+    )
 }
 
 /// Minimum workspace width (px) to place Paired & Advanced Keys beside the keyboard matrix
@@ -1329,137 +1346,6 @@ fn render_matrix(
     )
 }
 
-/// Vertical travel gauge: where the primary key actuates, its Rapid Trigger band and
-/// the keyboard's dead zones, read top (rest) to bottom (bottomed out).
-fn render_gauge(
-    app: &AgnoPeriphApp,
-    he: &HallEffectState,
-    cx: &mut Context<AgnoPeriphApp>,
-) -> impl IntoElement + use<> {
-    let theme = cx.theme();
-    let max = f32::from(he.capabilities.actuation_max.as_hundredths().max(1));
-    let (actuation, rt) = app.key_values().unwrap_or((
-        he.capabilities.actuation_min,
-        RapidTriggerConfig::disabled(),
-    ));
-    let (top, bottom) = app.deadzone_values().unwrap_or((t(0), t(0)));
-    let frac = |v: TravelHundredthsMm| (f32::from(v.as_hundredths()) / max).clamp(0.0, 1.0);
-    let depth = frac(actuation);
-    let band = rt.is_enabled().then(|| {
-        let start = (f32::from(actuation.as_hundredths())
-            - f32::from(rt.release_sensitivity.as_hundredths()))
-            / max;
-        let end = (f32::from(actuation.as_hundredths())
-            + f32::from(rt.press_sensitivity.as_hundredths()))
-            / max;
-        (start.clamp(0.0, 1.0), end.clamp(0.0, 1.0))
-    });
-
-    v_flex()
-        .id("travel-gauge")
-        .w_24()
-        .flex_shrink_0()
-        .gap_2()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Trigger demo"),
-        )
-        .child(
-            h_flex()
-                .items_stretch()
-                .gap_2()
-                .h_40()
-                .child(
-                    v_flex()
-                        .justify_between()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child("0.00")
-                        .child(mm(he.capabilities.actuation_max)),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .w_5()
-                        .h_full()
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.muted)
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(relative(frac(top)))
-                                .bg(theme.border),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(relative(frac(bottom)))
-                                .bg(theme.border),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(relative(depth))
-                                .rounded(theme.radius)
-                                .bg(theme.primary.opacity(0.35)),
-                        )
-                        .when_some(band, |this, (start, end)| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .right_0()
-                                    .top(relative(start))
-                                    .h(relative((end - start).max(0.01)))
-                                    .bg(theme.warning.opacity(0.45)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .top(relative(depth))
-                                .h_0p5()
-                                .bg(theme.primary),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .font_family(theme.mono_font_family.clone())
-                .child(format!("{} mm", mm(actuation))),
-        )
-        .child(muted_note(
-            if rt.is_enabled() {
-                format!(
-                    "RT ↓{} ↑{}",
-                    mm(rt.press_sensitivity),
-                    mm(rt.release_sensitivity)
-                )
-            } else {
-                "Rapid Trigger off".to_owned()
-            },
-            theme,
-        ))
-}
-
 fn stepper<F>(
     prefix: &'static str,
     value: TravelHundredthsMm,
@@ -1508,10 +1394,10 @@ fn slider_row(
             h_flex()
                 .justify_between()
                 .gap_1()
+                // Labels are short; keep them whole and let the gap absorb tight widths.
                 .child(
                     div()
-                        .min_w_0()
-                        .truncate()
+                        .flex_none()
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(label),
@@ -1547,7 +1433,7 @@ fn render_deck(
     workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let gauge = render_gauge(app, he, cx);
+    let gauge = crate::key_tester::render(app, he, layout, cx);
     let travel = render_travel_column(app, he, layout, workspace_width, cx);
     let rapid = he
         .capabilities
@@ -1558,7 +1444,7 @@ fn render_deck(
     h_flex()
         .id("trigger-deck")
         .items_stretch()
-        .gap_5()
+        .gap_4()
         .p_4()
         .rounded(theme.radius_lg)
         .border_1()
@@ -1596,15 +1482,17 @@ fn render_travel_column(
     let top_slider = controls.map(|c| c.deadzone_top.clone());
     let bottom_slider = controls.map(|c| c.deadzone_bottom.clone());
     let (top, bottom) = app.deadzone_values().unwrap_or((t(0), t(0)));
-    let has_deadzone_draft = app.deadzone_draft != crate::app::DeadzoneDraft::default();
+    let saved_actuation = app
+        .saved_key_values()
+        .map(|(a, _)| a)
+        .filter(|a| *a != actuation);
+    let saved_deadzones = app
+        .saved_deadzone_values()
+        .filter(|saved| *saved != (top, bottom));
     let target: SharedString = match count {
         0 => "Trigger travel".into(),
         1 => format!("Trigger travel: {}", layout.label(app.selected_key())).into(),
         n => format!("Trigger travel: {n} keys").into(),
-    };
-    let apply_label = match count {
-        0 | 1 => "Apply to key".to_owned(),
-        n => format!("Apply to {n} keys"),
     };
 
     let actuation_stepper = stepper(
@@ -1647,47 +1535,52 @@ fn render_travel_column(
             h_flex()
                 .gap_2()
                 .child(
-                    div()
+                    h_flex()
                         .flex_1()
                         .min_w_0()
-                        .whitespace_nowrap()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(range_note),
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(range_note),
+                        )
+                        .when_some(saved_actuation, |this, saved| {
+                            this.child(
+                                was_note(format!("{} mm", mm(saved)), theme)
+                                    .id("actuation-was")
+                                    .flex_shrink_0(),
+                            )
+                        }),
                 )
                 .child(
-                    Button::new("apply-actuation-all")
-                        .ghost()
+                    Button::new("actuation-all-keys")
+                        .outline()
                         .small()
-                        .label("Apply to all keys")
+                        .label("Use for all keys")
+                        .tooltip("Stage this actuation point for every key")
                         .disabled(locked)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.request_global_actuation(window, cx);
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.stage_actuation_for_all_keys(cx);
                         })),
-                )
-                .child(
-                    Button::new("apply-actuation-key")
-                        .primary()
-                        .small()
-                        .label(apply_label)
-                        .loading(busy)
-                        .disabled(count == 0 || app.key_draft.actuation.is_none())
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_actuation(cx))),
                 ),
         )
         .child(div().h_px().my_1().w_full().bg(theme.border))
-        .child(
-            deck_title("Dead zones, all keys", theme).child(
-                Button::new("apply-deadzones")
-                    .outline()
-                    .small()
-                    .label("Apply dead zones")
-                    .loading(busy)
-                    .disabled(!has_deadzone_draft)
-                    .on_click(cx.listener(|this, _, _, cx| this.apply_deadzones(cx))),
-            ),
-        )
+        .child(deck_title("Dead zones, all keys", theme).when_some(
+            saved_deadzones,
+            |this, (saved_top, saved_bottom)| {
+                this.child(
+                    was_note(
+                        format!("{} / {} mm", mm(saved_top), mm(saved_bottom)),
+                        theme,
+                    )
+                    .id("deadzones-was"),
+                )
+            },
+        ))
         .child(if workspace_width < 900.0 {
             v_flex()
                 .gap_2()
@@ -1733,7 +1626,10 @@ fn render_rapid_trigger_column(
         .key_values()
         .map_or(RapidTriggerConfig::disabled(), |(_, rt)| rt);
     let rt_enabled = rapid_trigger.is_enabled();
-    let has_draft = app.key_draft != crate::app::KeyDraft::default();
+    let saved_rt = app
+        .saved_key_values()
+        .map(|(_, rt)| rt)
+        .filter(|saved| *saved != rapid_trigger);
     let controls = app.controls.as_ref();
     let press_slider = controls.map(|c| c.rt_press.clone());
     let release_slider = controls.map(|c| c.rt_release.clone());
@@ -1751,10 +1647,6 @@ fn render_rapid_trigger_column(
         |this, direction, cx| this.step_sensitivity(false, direction, cx),
         cx,
     );
-    let apply_label = match count {
-        0 | 1 => "Apply Rapid Trigger".to_owned(),
-        n => format!("Apply to {n} keys"),
-    };
     let theme = cx.theme();
     v_flex()
         .id("rapid-trigger-group")
@@ -1786,30 +1678,18 @@ fn render_rapid_trigger_column(
             locked || !rt_enabled,
             theme,
         ))
-        .child(
-            h_flex()
-                .gap_2()
-                .justify_end()
-                .when(has_draft, |this| {
-                    this.child(
-                        Button::new("discard-key-draft")
-                            .ghost()
-                            .small()
-                            .label("Discard edits")
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.discard_key_draft(cx))),
-                    )
-                })
-                .child(
-                    Button::new("apply-rapid-trigger")
-                        .primary()
-                        .small()
-                        .label(apply_label)
-                        .loading(busy)
-                        .disabled(count == 0 || app.key_draft.rapid_trigger.is_none())
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_rapid_trigger(cx))),
-                ),
-        )
+        .when_some(saved_rt, |this, saved| {
+            let text = if saved.is_enabled() {
+                format!(
+                    "{} / {} mm",
+                    mm(saved.press_sensitivity),
+                    mm(saved.release_sensitivity)
+                )
+            } else {
+                "off".to_owned()
+            };
+            this.child(was_note(text, theme).id("rapid-trigger-was"))
+        })
 }
 
 /// Button that opens a grouped HID key menu and passes the chosen usage to `on_pick`.

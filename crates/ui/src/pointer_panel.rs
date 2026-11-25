@@ -1,7 +1,8 @@
 //! Pointer editor, rendered for devices whose capabilities include a pointer.
 
 use agnoperiph_core::{
-    DebounceMs, DpiStage, DpiValue, LiftOffDistance, PointerCapabilities, PollingRateHz,
+    DebounceMs, DpiStage, DpiValue, LiftOffDistance, PointerCapabilities, PointerSnapshot,
+    PollingRateHz,
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable,
@@ -13,8 +14,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, field, readout, section};
+use crate::app::{AgnoPeriphApp, field, readout, section, was_note};
 use crate::backend::{DeviceSnapshot, PointerChange, PointerState, SettingChange};
+use crate::draft::{ChangeId, EditKey};
 
 /// Snaps a DPI value onto the device grid `dpi_min + k * dpi_step` inside its range.
 pub fn snap_dpi(value: i64, caps: &PointerCapabilities) -> u32 {
@@ -46,10 +48,7 @@ impl AgnoPeriphApp {
             return;
         };
         let caps = pointer.capabilities.clone();
-        let mut stages = self
-            .dpi_draft
-            .clone()
-            .unwrap_or_else(|| pointer.snapshot.dpi_stages.clone());
+        let mut stages = pointer.snapshot.dpi_stages.clone();
         let Some(stage) = stages.iter_mut().find(|s| s.index == stage_ix) else {
             return;
         };
@@ -67,22 +66,40 @@ impl AgnoPeriphApp {
         {
             stage.y = None;
         }
-        self.dpi_draft = Some(stages);
-        cx.notify();
+        self.edit_draft(
+            EditKey::Change(ChangeId::DpiStages),
+            false,
+            |draft, _| draft.pointer.dpi_stages = Some(stages),
+            cx,
+        );
     }
 
-    pub(crate) fn discard_dpi_draft(&mut self, cx: &mut Context<Self>) {
-        self.dpi_draft = None;
-        cx.notify();
-    }
-
-    pub(crate) fn apply_dpi_draft(&mut self, cx: &mut Context<Self>) {
-        let (Some(stages), Some(pointer)) = (self.dpi_draft.clone(), self.pointer_state()) else {
-            return;
+    /// Stages one pointer setting.
+    fn stage_pointer(&mut self, change: PointerChange, cx: &mut Context<Self>) {
+        let id = match change {
+            PointerChange::PollingRate(_) => ChangeId::PollingRate,
+            PointerChange::LiftOffDistance(_) => ChangeId::LiftOff,
+            PointerChange::Debounce(_) => ChangeId::Debounce,
+            PointerChange::MotionSync(_) => ChangeId::MotionSync,
+            PointerChange::AngleSnapping(_) => ChangeId::AngleSnapping,
+            PointerChange::RippleControl(_) => ChangeId::RippleControl,
+            _ => return,
         };
-        let active = pointer.snapshot.active_dpi_stage;
-        self.apply_change(
-            SettingChange::Pointer(PointerChange::DpiStages { stages, active }),
+        self.edit_draft(
+            EditKey::Change(id),
+            false,
+            move |draft, _| {
+                let p = &mut draft.pointer;
+                match change {
+                    PointerChange::PollingRate(rate) => p.polling_rate = Some(rate),
+                    PointerChange::LiftOffDistance(lod) => p.lod = Some(lod),
+                    PointerChange::Debounce(ms) => p.debounce = Some(ms),
+                    PointerChange::MotionSync(on) => p.motion_sync = Some(on),
+                    PointerChange::AngleSnapping(on) => p.angle_snapping = Some(on),
+                    PointerChange::RippleControl(on) => p.ripple_control = Some(on),
+                    _ => {}
+                }
+            },
             cx,
         );
     }
@@ -108,18 +125,25 @@ pub(crate) fn render(
         cx.theme(),
     );
     let busy = app.is_busy();
+    let raw = app
+        .selected_raw()
+        .and_then(|d| d.pointer.as_ref())
+        .map(|p| p.snapshot.clone());
+    let saved = raw.clone().unwrap_or_else(|| pointer.snapshot.clone());
 
-    base.child(render_dpi_stages(app, pointer, busy, cx))
-        .child(render_polling(pointer, busy, cx))
+    base.child(render_dpi_stages(pointer, &saved, busy, cx))
+        .child(render_polling(pointer, &saved, busy, cx))
         .when(!pointer.capabilities.supported_lods.is_empty(), |this| {
-            this.child(render_lod(pointer, busy, cx))
+            this.child(render_lod(pointer, &saved, busy, cx))
         })
         .when_some(
             pointer
                 .capabilities
                 .debounce_range_ms
                 .zip(pointer.snapshot.debounce_ms),
-            |this, (range, current)| this.child(render_debounce(range, current, busy, cx)),
+            |this, (range, current)| {
+                this.child(render_debounce(range, current, saved.debounce_ms, busy, cx))
+            },
         )
         .when_some(
             pointer
@@ -130,6 +154,7 @@ pub(crate) fn render(
                 this.child(render_sensor_switch(
                     SensorSwitch::MotionSync,
                     enabled,
+                    saved.motion_sync,
                     busy,
                     cx,
                 ))
@@ -144,6 +169,7 @@ pub(crate) fn render(
                 this.child(render_sensor_switch(
                     SensorSwitch::AngleSnapping,
                     enabled,
+                    saved.angle_snapping,
                     busy,
                     cx,
                 ))
@@ -158,6 +184,7 @@ pub(crate) fn render(
                 this.child(render_sensor_switch(
                     SensorSwitch::RippleControl,
                     enabled,
+                    saved.ripple_control,
                     busy,
                     cx,
                 ))
@@ -166,75 +193,45 @@ pub(crate) fn render(
 }
 
 fn render_dpi_stages(
-    app: &AgnoPeriphApp,
     pointer: &PointerState,
+    saved: &PointerSnapshot,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let stages: Vec<DpiStage> = app
-        .dpi_draft
-        .clone()
-        .unwrap_or_else(|| pointer.snapshot.dpi_stages.clone());
-    let has_draft = app
-        .dpi_draft
-        .as_ref()
-        .is_some_and(|draft| *draft != pointer.snapshot.dpi_stages);
+    let stages: Vec<DpiStage> = pointer.snapshot.dpi_stages.clone();
     let active = pointer.snapshot.active_dpi_stage;
     let caps = &pointer.capabilities;
 
     let rows: Vec<AnyElement> = stages
         .iter()
         .map(|stage| {
-            render_stage_row(stage, stage.index == active, caps, busy, cx).into_any_element()
+            let was = saved
+                .dpi_stages
+                .iter()
+                .find(|s| s.index == stage.index)
+                .filter(|s| s.x != stage.x || s.y != stage.y)
+                .map(|s| s.x.value());
+            render_stage_row(stage, was, stage.index == active, caps, busy, cx).into_any_element()
         })
         .collect();
 
     let theme = cx.theme();
     field("DPI stages", theme).items_start().child(
-        v_flex()
-            .flex_1()
-            .gap_2()
-            .children(rows)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "{} to {} DPI in steps of {}. Select a stage to make it active.",
-                        caps.dpi_min, caps.dpi_max, caps.dpi_step
-                    )),
-            )
-            .when(has_draft, |this| {
-                this.child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("dpi-apply")
-                                .primary()
-                                .small()
-                                .label("Apply DPI stages")
-                                .loading(busy)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.apply_dpi_draft(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("dpi-discard")
-                                .ghost()
-                                .small()
-                                .label("Discard")
-                                .disabled(busy)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.discard_dpi_draft(cx);
-                                })),
-                        ),
-                )
-            }),
+        v_flex().flex_1().gap_2().children(rows).child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(format!(
+                    "{} to {} DPI in steps of {}. Select a stage to make it active.",
+                    caps.dpi_min, caps.dpi_max, caps.dpi_step
+                )),
+        ),
     )
 }
 
 fn render_stage_row(
     stage: &DpiStage,
+    was: Option<u32>,
     is_active: bool,
     caps: &PointerCapabilities,
     busy: bool,
@@ -296,6 +293,11 @@ fn render_stage_row(
                 .label(if is_active { "Active" } else { "Use" })
                 .selected(is_active)
                 .disabled(busy)
+                .tooltip(if is_active {
+                    "The mouse is using this stage"
+                } else {
+                    "Switch the mouse to this stage now"
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if !is_active {
                         this.apply_change(
@@ -305,14 +307,19 @@ fn render_stage_row(
                     }
                 })),
         )
+        .when_some(was, |this, was| {
+            this.child(was_note(was.to_string(), cx.theme()).id(("dpi-was", id)))
+        })
 }
 
 fn render_polling(
     pointer: &PointerState,
+    saved: &PointerSnapshot,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let current = pointer.snapshot.polling_rate;
+    let was = (saved.polling_rate != current).then(|| polling_label(saved.polling_rate));
     let buttons = pointer
         .capabilities
         .supported_polling_rates
@@ -324,10 +331,7 @@ fn render_polling(
                 .disabled(busy)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if rate != current {
-                        this.apply_change(
-                            SettingChange::Pointer(PointerChange::PollingRate(rate)),
-                            cx,
-                        );
+                        this.stage_pointer(PointerChange::PollingRate(rate), cx);
                     }
                 }))
         });
@@ -335,7 +339,12 @@ fn render_polling(
         .outline()
         .small()
         .children(buttons);
-    field("Polling rate", cx.theme()).child(group)
+    let theme = cx.theme();
+    field("Polling rate", theme)
+        .child(group)
+        .when_some(was, |this, was| {
+            this.child(was_note(was, theme).id("polling-was"))
+        })
 }
 
 fn polling_label(rate: PollingRateHz) -> String {
@@ -347,10 +356,13 @@ fn polling_label(rate: PollingRateHz) -> String {
 
 fn render_lod(
     pointer: &PointerState,
+    saved: &PointerSnapshot,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let current = pointer.snapshot.lod;
+    let was =
+        (saved.lod != current).then(|| saved.lod.map_or_else(|| "–".to_owned(), |l| l.to_string()));
     let buttons = pointer.capabilities.supported_lods.iter().map(|&lod| {
         let key = match lod {
             LiftOffDistance::Low => 1,
@@ -364,10 +376,7 @@ fn render_lod(
             .disabled(busy)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if Some(lod) != current {
-                    this.apply_change(
-                        SettingChange::Pointer(PointerChange::LiftOffDistance(lod)),
-                        cx,
-                    );
+                    this.stage_pointer(PointerChange::LiftOffDistance(lod), cx);
                 }
             }))
     });
@@ -375,25 +384,29 @@ fn render_lod(
         .outline()
         .small()
         .children(buttons);
-    field("Lift-off distance", cx.theme()).child(group)
+    let theme = cx.theme();
+    field("Lift-off distance", theme)
+        .child(group)
+        .when_some(was, |this, was| {
+            this.child(was_note(was, theme).id("lod-was"))
+        })
 }
 
 fn render_debounce(
     (min, max): (u8, u8),
     current: DebounceMs,
+    saved: Option<DebounceMs>,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let value = current.value();
+    let was = saved.filter(|s| *s != current);
     let set = move |next: u8| {
         move |this: &mut AgnoPeriphApp,
               _: &ClickEvent,
               _: &mut Window,
               cx: &mut Context<AgnoPeriphApp>| {
-            this.apply_change(
-                SettingChange::Pointer(PointerChange::Debounce(DebounceMs::new(next))),
-                cx,
-            );
+            this.stage_pointer(PointerChange::Debounce(DebounceMs::new(next)), cx);
         }
     };
     let theme = cx.theme();
@@ -418,7 +431,10 @@ fn render_debounce(
                     .accessibility_label("Longer debounce")
                     .disabled(busy || value >= max)
                     .on_click(cx.listener(set(value.saturating_add(1)))),
-            ),
+            )
+            .when_some(was, |this, was| {
+                this.child(was_note(was.to_string(), cx.theme()).id("debounce-was"))
+            }),
     )
 }
 
@@ -459,18 +475,25 @@ impl SensorSwitch {
 fn render_sensor_switch(
     kind: SensorSwitch,
     enabled: bool,
+    saved: Option<bool>,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    field(kind.label(), cx.theme()).child(
-        Switch::new(kind.id())
-            .checked(enabled)
-            .disabled(busy)
-            .accessibility_label(kind.label())
-            .on_change(cx.listener(move |this, checked: &bool, _, cx| {
-                this.apply_change(SettingChange::Pointer(kind.change(*checked)), cx);
-            })),
-    )
+    let was = saved
+        .filter(|s| *s != enabled)
+        .map(|s| if s { "on" } else { "off" });
+    let theme = cx.theme();
+    field(kind.label(), theme)
+        .child(
+            Switch::new(kind.id())
+                .checked(enabled)
+                .disabled(busy)
+                .accessibility_label(kind.label())
+                .on_change(cx.listener(move |this, checked: &bool, _, cx| {
+                    this.stage_pointer(kind.change(*checked), cx);
+                })),
+        )
+        .when_some(was, |this, was| this.child(was_note(was, theme)))
 }
 
 #[cfg(test)]

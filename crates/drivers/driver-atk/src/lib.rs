@@ -1,8 +1,13 @@
-//! ATK RS7 Hall Effect keyboard driver implementing `Peripheral`, `HallEffectKeyboard`,
-//! and `RgbController` over the verified DuckBread Raw HID protocol (`0x373B:0x1044`).
+//! Universal ATK / VGN / VXE peripheral driver covering three modular protocol families:
+//!
+//! 1. **DuckBread (`0xFF60:0x0061`) Hall Effect Keyboards** (ATK RS7 and parameterized siblings)
+//! 2. **ATK68 / ATK75 (`0xFF01` GTech) Hall Effect Keyboards** (`ff01`)
+//! 3. **ATK / VGN / VXE (`0xFF02:0x0002`, Report `0x08`) Gaming Mice** (`mouse`)
 
 #![forbid(unsafe_code)]
 
+pub mod ff01;
+pub mod mouse;
 pub mod protocol;
 
 use std::fmt;
@@ -10,16 +15,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agnoperiph_core::{
-    Brightness, CalibrationStatus, Capabilities, ConnectionKind, CoreError, CoreResult, DeviceId,
-    DeviceInfo, DeviceMatchRule, DksBinding, DriverDescriptor, HallEffectCapabilities,
-    HallEffectKeyboard, HallEffectSnapshot, KeyCode, KeyHallEffectConfig, KeyIndex,
-    KeyboardConfigCapabilities, KeyboardConfigController, KeyboardConfigSnapshot,
-    KeymapCapabilities, KeymapController, KeymapSnapshot, MacroCapabilities, MacroController,
-    MacroSlot, ModTapBinding, Peripheral, PollingRateHz, RapidSwitchPair, RapidTriggerConfig,
-    RgbCapabilities, RgbController, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId, RgbZoneInfo,
-    RgbZoneState, SocdPair, ToggleKeyBinding, TravelHundredthsMm, VendorKind,
+    BatteryMonitor, Brightness, CalibrationStatus, Capabilities, ConnectionKind, CoreError,
+    CoreResult, DeviceId, DeviceInfo, DeviceMatchRule, DksBinding, DriverDescriptor,
+    HallEffectCapabilities, HallEffectKeyboard, HallEffectSnapshot, KeyCode, KeyHallEffectConfig,
+    KeyIndex, KeyTravelSample, KeyboardConfigCapabilities, KeyboardConfigController,
+    KeyboardConfigSnapshot, KeymapCapabilities, KeymapController, KeymapSnapshot,
+    MacroCapabilities, MacroController, MacroSlot, ModTapBinding, Peripheral, PointerDevice,
+    PollingRateHz, ProfileManager, RapidSwitchPair, RapidTriggerConfig, RgbCapabilities,
+    RgbController, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId, RgbZoneInfo, RgbZoneState,
+    SocdPair, ToggleKeyBinding, TravelHundredthsMm, VendorKind,
 };
 use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
+
+use crate::ff01::{ATK_FF01_USAGE_PAGE, AtkFf01Keyboard, ff01_match_rules};
+use crate::mouse::{ATK_MOUSE_USAGE_PAGE, AtkMouseDevice, mouse_match_rules};
 
 use crate::protocol::{
     ATK_RS7_PID, ATK_RS7_USAGE_ID, ATK_RS7_USAGE_PAGE, ATK_VID, RS7_COLS, RS7_KEY_COUNT,
@@ -61,23 +70,272 @@ pub struct TapDanceEntry {
     pub hold_delay_ms: u16,
 }
 
-/// Returns the declarative `DriverDescriptor` registering ATK RS7 (`0x373B:0x1044`, `0xFF60:0x0061`).
-pub fn driver_descriptor() -> DriverDescriptor {
-    DriverDescriptor::new(
-        "atk-rs7",
-        VendorKind::Atk,
-        vec![
-            DeviceMatchRule::new(ATK_VID, ConnectionKind::WiredUsb, "ATK RS7 Hall Effect")
-                .with_pid(ATK_RS7_PID)
-                .with_usage_page(ATK_RS7_USAGE_PAGE)
-                .with_usage_id(ATK_RS7_USAGE_ID),
-        ],
-    )
+/// Declarative hardware profile for a DuckBread Raw HID (`0xFF60:0x0061`) Hall Effect keyboard.
+///
+/// Sibling boards sharing the DuckBread protocol can be added here declaratively without
+/// duplicating transport or codec logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuckBreadBoardSpec {
+    pub vid: u16,
+    pub pid: u16,
+    pub model_name: &'static str,
+    pub rows: u8,
+    pub cols: u8,
+    pub layers: u8,
+    pub travel_min: TravelHundredthsMm,
+    pub travel_max: TravelHundredthsMm,
+    pub step_normal: TravelHundredthsMm,
+    pub step_extreme: TravelHundredthsMm,
+    pub rt_min: TravelHundredthsMm,
+    pub rt_max: TravelHundredthsMm,
+    pub has_logo_light: bool,
 }
 
-/// Active ATK RS7 Hall Effect keyboard backed by a safety-guarded [`GuardedTransport`].
+impl DuckBreadBoardSpec {
+    pub const fn key_count(self) -> u16 {
+        (self.rows as u16) * (self.cols as u16)
+    }
+
+    pub fn key_to_row_col(self, key: KeyIndex) -> CoreResult<(u8, u8)> {
+        if key.value() >= self.key_count() {
+            return Err(CoreError::OutOfRange {
+                field: "key_index",
+                actual: key.value().to_string(),
+                expected: format!("0..{}", self.key_count()),
+            });
+        }
+        let cols = u16::from(self.cols);
+        let row = u8::try_from(key.value() / cols).unwrap_or(0);
+        let col = u8::try_from(key.value() % cols).unwrap_or(0);
+        Ok((row, col))
+    }
+}
+
+/// Verified DuckBread (`0xFF60:0x0061`) Hall Effect keyboard board table.
+pub const DUCKBREAD_BOARDS: &[DuckBreadBoardSpec] = &[DuckBreadBoardSpec {
+    vid: ATK_VID,
+    pid: ATK_RS7_PID,
+    model_name: "ATK RS7 RGB",
+    rows: RS7_ROWS,
+    cols: RS7_COLS,
+    layers: RS7_LAYERS,
+    travel_min: RS7_TRAVEL_MIN,
+    travel_max: RS7_TRAVEL_MAX,
+    step_normal: RS7_STEP_NORMAL,
+    step_extreme: RS7_STEP_EXTREME,
+    rt_min: RS7_RT_MIN,
+    rt_max: RS7_RT_MAX,
+    has_logo_light: true,
+}];
+
+/// Looks up a DuckBread board specification by `(vid, pid)`.
+pub fn find_duckbread_board(vid: u16, pid: u16) -> Option<&'static DuckBreadBoardSpec> {
+    DUCKBREAD_BOARDS
+        .iter()
+        .find(|b| b.vid == vid && b.pid == pid)
+}
+
+/// Returns the declarative `DriverDescriptor` registering all ATK / VGN / VXE families:
+/// DuckBread (`0xFF60`), ATK68/ATK75 (`0xFF01`), and ATK/VGN/VXE mice (`0xFF02`).
+pub fn driver_descriptor() -> DriverDescriptor {
+    let mut rules: Vec<DeviceMatchRule> = DUCKBREAD_BOARDS
+        .iter()
+        .map(|board| {
+            DeviceMatchRule::new(board.vid, ConnectionKind::WiredUsb, board.model_name)
+                .with_pid(board.pid)
+                .with_usage_page(ATK_RS7_USAGE_PAGE)
+                .with_usage_id(ATK_RS7_USAGE_ID)
+        })
+        .collect();
+    rules.extend(ff01_match_rules());
+    rules.extend(mouse_match_rules());
+    DriverDescriptor::new("atk-rs7", VendorKind::Atk, rules)
+}
+
+/// Unified ATK / VGN / VXE peripheral handle dispatching across DuckBread (`0xFF60`),
+/// GTech (`0xFF01`), and EEPROM mouse (`0xFF02`) protocol families.
+#[derive(Debug)]
+pub enum AtkDevice<T: HidTransport> {
+    DuckBread(Box<AtkRs7Device<T>>),
+    Ff01Keyboard(Box<AtkFf01Keyboard<T>>),
+    Mouse(Box<AtkMouseDevice<T>>),
+}
+
+impl<T: HidTransport> AtkDevice<T> {
+    /// Opens any matched ATK / VGN / VXE interface by dispatching on its HID usage page.
+    pub fn open(
+        transport: T,
+        dry_run: bool,
+        sink: Option<Arc<dyn PacketSink>>,
+    ) -> CoreResult<Self> {
+        let usage_page = transport.descriptor().usage_page;
+        match usage_page {
+            ATK_RS7_USAGE_PAGE => Ok(Self::DuckBread(Box::new(AtkRs7Device::open(
+                transport, dry_run, sink,
+            )?))),
+            ATK_FF01_USAGE_PAGE => Ok(Self::Ff01Keyboard(Box::new(AtkFf01Keyboard::open(
+                transport, dry_run, sink,
+            )?))),
+            ATK_MOUSE_USAGE_PAGE => Ok(Self::Mouse(Box::new(AtkMouseDevice::open(
+                transport, dry_run, sink,
+            )?))),
+            other => Err(CoreError::Validation(format!(
+                "unsupported ATK/VGN/VXE usage page 0x{other:04X}"
+            ))),
+        }
+    }
+}
+
+impl<T: HidTransport> Peripheral for AtkDevice<T> {
+    fn info(&self) -> &DeviceInfo {
+        match self {
+            Self::DuckBread(d) => d.info(),
+            Self::Ff01Keyboard(d) => d.info(),
+            Self::Mouse(d) => d.info(),
+        }
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        match self {
+            Self::DuckBread(d) => d.capabilities(),
+            Self::Ff01Keyboard(d) => d.capabilities(),
+            Self::Mouse(d) => d.capabilities(),
+        }
+    }
+
+    fn refresh(&mut self) -> CoreResult<()> {
+        match self {
+            Self::DuckBread(d) => d.refresh(),
+            Self::Ff01Keyboard(d) => d.refresh(),
+            Self::Mouse(d) => d.refresh(),
+        }
+    }
+
+    fn as_pointer(&self) -> Option<&dyn PointerDevice> {
+        match self {
+            Self::Mouse(d) => d.as_pointer(),
+            _ => None,
+        }
+    }
+
+    fn as_pointer_mut(&mut self) -> Option<&mut dyn PointerDevice> {
+        match self {
+            Self::Mouse(d) => d.as_pointer_mut(),
+            _ => None,
+        }
+    }
+
+    fn as_hall_effect(&self) -> Option<&dyn HallEffectKeyboard> {
+        match self {
+            Self::DuckBread(d) => d.as_hall_effect(),
+            Self::Ff01Keyboard(d) => d.as_hall_effect(),
+            Self::Mouse(_) => None,
+        }
+    }
+
+    fn as_hall_effect_mut(&mut self) -> Option<&mut dyn HallEffectKeyboard> {
+        match self {
+            Self::DuckBread(d) => d.as_hall_effect_mut(),
+            Self::Ff01Keyboard(d) => d.as_hall_effect_mut(),
+            Self::Mouse(_) => None,
+        }
+    }
+
+    fn as_rgb(&self) -> Option<&dyn RgbController> {
+        match self {
+            Self::DuckBread(d) => d.as_rgb(),
+            Self::Ff01Keyboard(d) => d.as_rgb(),
+            Self::Mouse(_) => None,
+        }
+    }
+
+    fn as_rgb_mut(&mut self) -> Option<&mut dyn RgbController> {
+        match self {
+            Self::DuckBread(d) => d.as_rgb_mut(),
+            Self::Ff01Keyboard(d) => d.as_rgb_mut(),
+            Self::Mouse(_) => None,
+        }
+    }
+
+    fn as_battery(&self) -> Option<&dyn BatteryMonitor> {
+        match self {
+            Self::Mouse(d) => d.as_battery(),
+            _ => None,
+        }
+    }
+
+    fn as_battery_mut(&mut self) -> Option<&mut dyn BatteryMonitor> {
+        match self {
+            Self::Mouse(d) => d.as_battery_mut(),
+            _ => None,
+        }
+    }
+
+    fn as_profiles(&self) -> Option<&dyn ProfileManager> {
+        match self {
+            Self::Ff01Keyboard(d) => d.as_profiles(),
+            Self::Mouse(d) => d.as_profiles(),
+            Self::DuckBread(_) => None,
+        }
+    }
+
+    fn as_profiles_mut(&mut self) -> Option<&mut dyn ProfileManager> {
+        match self {
+            Self::Ff01Keyboard(d) => d.as_profiles_mut(),
+            Self::Mouse(d) => d.as_profiles_mut(),
+            Self::DuckBread(_) => None,
+        }
+    }
+
+    fn as_keymap(&self) -> Option<&dyn KeymapController> {
+        match self {
+            Self::DuckBread(d) => d.as_keymap(),
+            _ => None,
+        }
+    }
+
+    fn as_keymap_mut(&mut self) -> Option<&mut dyn KeymapController> {
+        match self {
+            Self::DuckBread(d) => d.as_keymap_mut(),
+            _ => None,
+        }
+    }
+
+    fn as_macros(&self) -> Option<&dyn MacroController> {
+        match self {
+            Self::DuckBread(d) => d.as_macros(),
+            _ => None,
+        }
+    }
+
+    fn as_macros_mut(&mut self) -> Option<&mut dyn MacroController> {
+        match self {
+            Self::DuckBread(d) => d.as_macros_mut(),
+            _ => None,
+        }
+    }
+
+    fn as_keyboard_config(&self) -> Option<&dyn KeyboardConfigController> {
+        match self {
+            Self::DuckBread(d) => d.as_keyboard_config(),
+            Self::Ff01Keyboard(d) => d.as_keyboard_config(),
+            Self::Mouse(_) => None,
+        }
+    }
+
+    fn as_keyboard_config_mut(&mut self) -> Option<&mut dyn KeyboardConfigController> {
+        match self {
+            Self::DuckBread(d) => d.as_keyboard_config_mut(),
+            Self::Ff01Keyboard(d) => d.as_keyboard_config_mut(),
+            Self::Mouse(_) => None,
+        }
+    }
+}
+
+/// Active DuckBread (`0xFF60`) Hall Effect keyboard backed by a safety-guarded [`GuardedTransport`].
 pub struct AtkRs7Device<T: HidTransport> {
     transport: GuardedTransport<T>,
+    spec: DuckBreadBoardSpec,
     info: DeviceInfo,
     capabilities: Capabilities,
     he_caps: HallEffectCapabilities,
@@ -112,12 +370,14 @@ impl<T: HidTransport> AtkRs7Device<T> {
         sink: Option<Arc<dyn PacketSink>>,
     ) -> CoreResult<Self> {
         let desc = transport.descriptor().clone();
-        if desc.vid != ATK_VID || desc.pid != ATK_RS7_PID {
-            return Err(CoreError::Validation(format!(
-                "expected ATK RS7 0x{ATK_VID:04X}:0x{ATK_RS7_PID:04X}, got 0x{:04X}:0x{:04X}",
-                desc.vid, desc.pid
-            )));
-        }
+        let spec = find_duckbread_board(desc.vid, desc.pid)
+            .copied()
+            .ok_or_else(|| {
+                CoreError::Validation(format!(
+                    "expected DuckBread ATK board (e.g. 0x{ATK_VID:04X}:0x{ATK_RS7_PID:04X}), got 0x{:04X}:0x{:04X}",
+                    desc.vid, desc.pid
+                ))
+            })?;
 
         let mut guarded = GuardedTransport::new(transport)
             .with_validator(Arc::new(atk_rs7_validator()))
@@ -136,7 +396,7 @@ impl<T: HidTransport> AtkRs7Device<T> {
         let mut info = DeviceInfo::new(
             stable_id,
             VendorKind::Atk,
-            desc.product.unwrap_or_else(|| "ATK RS7 RGB".to_owned()),
+            desc.product.unwrap_or_else(|| spec.model_name.to_owned()),
             ConnectionKind::WiredUsb,
             desc.vid,
             desc.pid,
@@ -147,6 +407,7 @@ impl<T: HidTransport> AtkRs7Device<T> {
 
         let mut dev = Self {
             transport: guarded,
+            spec,
             info,
             capabilities: Capabilities::empty()
                 .with_hall_effect(true)
@@ -154,7 +415,7 @@ impl<T: HidTransport> AtkRs7Device<T> {
                 .with_keymap(true)
                 .with_macros(true)
                 .with_keyboard_config(true),
-            he_caps: build_he_caps(false),
+            he_caps: build_he_caps(&spec, false),
             extreme_mode: false,
             polling_rate: None,
             socd_slots: None,
@@ -165,6 +426,11 @@ impl<T: HidTransport> AtkRs7Device<T> {
 
         dev.discover_readonly()?;
         Ok(dev)
+    }
+
+    /// Returns the board specification for this DuckBread keyboard.
+    pub const fn board_spec(&self) -> DuckBreadBoardSpec {
+        self.spec
     }
 
     /// Returns the underlying [`GuardedTransport`] (for mock & dry-run verification).
@@ -226,7 +492,7 @@ impl<T: HidTransport> AtkRs7Device<T> {
 
         if let Ok(gm) = self.exchange(req_game_mode(), false) {
             self.extreme_mode = gm[3] == 1;
-            self.he_caps = build_he_caps(self.extreme_mode);
+            self.he_caps = build_he_caps(&self.spec, self.extreme_mode);
         }
 
         if let Ok(rr) = self.exchange(req_report_rate(), false) {
@@ -276,17 +542,18 @@ impl<T: HidTransport> AtkRs7Device<T> {
     }
 }
 
-const fn build_he_caps(extreme_mode: bool) -> HallEffectCapabilities {
+const fn build_he_caps(spec: &DuckBreadBoardSpec, extreme_mode: bool) -> HallEffectCapabilities {
     let step = if extreme_mode {
-        RS7_STEP_EXTREME
+        spec.step_extreme
     } else {
-        RS7_STEP_NORMAL
+        spec.step_normal
     };
-    HallEffectCapabilities::new(RS7_KEY_COUNT, RS7_TRAVEL_MIN, RS7_TRAVEL_MAX, step)
-        .with_rapid_trigger_range(RS7_RT_MIN, RS7_RT_MAX, true)
+    HallEffectCapabilities::new(spec.key_count(), spec.travel_min, spec.travel_max, step)
+        .with_rapid_trigger_range(spec.rt_min, spec.rt_max, true)
         .with_max_dks_bindings(RS7_MAX_DKS_SLOTS)
         .with_max_socd_pairs(RS7_MAX_SOCD_SLOTS)
         .with_calibration_status(true)
+        .with_live_travel(true)
 }
 
 impl<T: HidTransport> Peripheral for AtkRs7Device<T> {
@@ -755,8 +1022,9 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
     }
 
     fn read_calibration_key_progress(&mut self) -> CoreResult<Vec<bool>> {
-        let mut flags = Vec::with_capacity(usize::from(RS7_KEY_COUNT));
-        for chunk_ix in 0..(RS7_KEY_COUNT / 4) {
+        let key_count = self.spec.key_count();
+        let mut flags = Vec::with_capacity(usize::from(key_count));
+        for chunk_ix in 0..(key_count / 4) {
             let offset = chunk_ix * 4;
             let resp = self.exchange(req_calibration_live_status_get(offset, 4), false)?;
             for k in 0..4usize {
@@ -764,6 +1032,27 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
             }
         }
         Ok(flags)
+    }
+
+    fn read_live_key_travel(&mut self) -> CoreResult<Vec<KeyTravelSample>> {
+        let key_count = self.spec.key_count();
+        let mut samples = Vec::new();
+        for chunk_ix in 0..(key_count / 4) {
+            let offset = chunk_ix * 4;
+            let resp = self.exchange(req_calibration_live_status_get(offset, 4), false)?;
+            for k in 0..4usize {
+                let base = 8 + k * 5;
+                let travel_raw = u16::from_be_bytes([resp[base + 2], resp[base + 3]]);
+                if travel_raw > 0 {
+                    let key_ix = offset + u16::try_from(k).unwrap_or(0);
+                    samples.push(KeyTravelSample::new(
+                        KeyIndex::new(key_ix),
+                        TravelHundredthsMm::from_hundredths(travel_raw),
+                    ));
+                }
+            }
+        }
+        Ok(samples)
     }
 }
 
@@ -967,7 +1256,7 @@ impl<T: HidTransport> KeyboardConfigController for AtkRs7Device<T> {
             .unwrap_or(PollingRateHz::Hz1000);
 
         self.extreme_mode = extreme_mode;
-        self.he_caps = build_he_caps(extreme_mode);
+        self.he_caps = build_he_caps(&self.spec, extreme_mode);
         self.polling_rate = Some(polling_rate);
 
         Ok(KeyboardConfigSnapshot::new(
@@ -1001,7 +1290,7 @@ impl<T: HidTransport> KeyboardConfigController for AtkRs7Device<T> {
         self.exchange(rate_req, true)?;
         if !self.transport.is_dry_run() {
             self.extreme_mode = config.extreme_mode;
-            self.he_caps = build_he_caps(config.extreme_mode);
+            self.he_caps = build_he_caps(&self.spec, config.extreme_mode);
             self.polling_rate = Some(config.polling_rate);
         }
         Ok(())
@@ -1453,5 +1742,57 @@ mod tests {
         assert_eq!(rs_frame[11], 0); // withGlobal = 0
         assert_eq!(rs_frame[12], 1); // rt = on
         assert_eq!(decode_rs_slot(&rs_frame), Some(rs));
+    }
+
+    #[test]
+    fn atk_device_dispatches_and_reads_live_key_travel() {
+        // 1. DuckBread 0xFF60 dispatch + live key travel decoding (0x1C chunks)
+        let mut mock = MockHidTransport::new(rs7_descriptor());
+        push_open_replies(&mut mock, true);
+        for chunk_ix in 0..(RS7_KEY_COUNT / 4) {
+            let mut resp = vec![0u8; RS7_PAYLOAD_LEN];
+            resp[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+            if chunk_ix == 8 {
+                // key index 33 = chunk 8, k = 1 -> 1.85 mm (185 = 0x00B9)
+                let base = 8 + 5;
+                resp[base + 2..base + 4].copy_from_slice(&185u16.to_be_bytes());
+            }
+            mock.push_input_response(resp);
+        }
+
+        let mut dev = AtkDevice::open(mock, false, None).unwrap();
+        assert!(matches!(dev, AtkDevice::DuckBread(_)));
+        let he = dev.as_hall_effect_mut().unwrap();
+        assert!(he.hall_effect_capabilities().has_live_travel());
+        let samples = he.read_live_key_travel().unwrap();
+        assert_eq!(
+            samples,
+            vec![KeyTravelSample::new(
+                KeyIndex::new(33),
+                TravelHundredthsMm::from_hundredths(185),
+            )]
+        );
+
+        // 2. Unsupported usage page returns validation error
+        let bad = HidDeviceDescriptor::new(ATK_VID, 0x9999, 0x0001, 0x0006, 0, "mock://bad");
+        assert!(AtkDevice::open(MockHidTransport::new(bad), false, None).is_err());
+
+        // 3. Descriptor covers all three protocol families
+        let desc = driver_descriptor();
+        assert!(
+            desc.rules
+                .iter()
+                .any(|r| r.usage_page == Some(ATK_RS7_USAGE_PAGE))
+        );
+        assert!(
+            desc.rules
+                .iter()
+                .any(|r| r.usage_page == Some(ATK_FF01_USAGE_PAGE))
+        );
+        assert!(
+            desc.rules
+                .iter()
+                .any(|r| r.usage_page == Some(ATK_MOUSE_USAGE_PAGE))
+        );
     }
 }

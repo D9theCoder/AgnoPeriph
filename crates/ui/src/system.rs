@@ -283,6 +283,7 @@ mod tests {
         assert!(config.notify_on_game_switch);
         assert!(config.close_to_tray);
         assert!(!config.start_with_windows);
+        assert!(config.low_battery_alerts);
     }
 
     #[test]
