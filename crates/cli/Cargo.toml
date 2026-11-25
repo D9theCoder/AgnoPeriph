@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 agnoperiph-core = { workspace = true }
+agnoperiph-driver-atk = { workspace = true }
 agnoperiph-driver-lamzu = { workspace = true }
 agnoperiph-driver-logitech = { workspace = true }
 agnoperiph-transport = { workspace = true }

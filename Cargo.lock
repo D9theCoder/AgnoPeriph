@@ -7,6 +7,7 @@ name = "agnoperiph-cli"
 version = "0.1.0"
 dependencies = [
  "agnoperiph-core",
+ "agnoperiph-driver-atk",
  "agnoperiph-driver-lamzu",
  "agnoperiph-driver-logitech",
  "agnoperiph-transport",
@@ -25,6 +26,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "agnoperiph-driver-atk"
+version = "0.1.0"
+dependencies = [
+ "agnoperiph-core",
+ "agnoperiph-transport",
+ "hex",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

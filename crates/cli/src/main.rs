@@ -5,9 +5,11 @@
 use std::sync::Arc;
 
 use agnoperiph_core::{
-    BatteryStatus, DebounceMs, DeviceInfo, DeviceRegistry, DpiStage, DpiValue, LiftOffDistance,
-    Peripheral, PointerSnapshot, PollingRateHz, ProfileSlot, ProfileSnapshot,
+    BatteryStatus, DebounceMs, DeviceInfo, DeviceRegistry, DpiStage, DpiValue, HallEffectSnapshot,
+    KeyIndex, LiftOffDistance, Peripheral, PointerSnapshot, PollingRateHz, ProfileSlot,
+    ProfileSnapshot, RapidTriggerConfig, RgbSnapshot, TravelHundredthsMm,
 };
+use agnoperiph_driver_atk::AtkRs7Device;
 use agnoperiph_driver_lamzu::LamzuAtlantisDevice;
 use agnoperiph_driver_logitech::LogitechHidppDevice;
 use agnoperiph_transport::{
@@ -107,6 +109,26 @@ enum Command {
         /// Select onboard profile slot (zero-based index).
         #[arg(long)]
         profile_slot: Option<u8>,
+
+        /// Set global Hall Effect actuation point in hundredths of mm (e.g., 150 = 1.50 mm).
+        #[arg(long)]
+        actuation_hundredths_mm: Option<u16>,
+
+        /// Optional single key index (row * 16 + col) for per-key actuation or Rapid Trigger.
+        #[arg(long)]
+        key_index: Option<u16>,
+
+        /// Enable/disable Rapid Trigger on `--key-index` (requires `--rt-press` and `--rt-release`).
+        #[arg(long)]
+        rapid_trigger: Option<bool>,
+
+        /// Rapid Trigger press sensitivity in hundredths of mm (e.g., 20 = 0.20 mm).
+        #[arg(long)]
+        rt_press_hundredths_mm: Option<u16>,
+
+        /// Rapid Trigger release sensitivity in hundredths of mm (e.g., 20 = 0.20 mm).
+        #[arg(long)]
+        rt_release_hundredths_mm: Option<u16>,
     },
 }
 
@@ -116,6 +138,8 @@ struct ProbedDeviceReport {
     info: DeviceInfo,
     battery: Option<BatteryStatus>,
     pointer: Option<PointerSnapshot>,
+    hall_effect: Option<HallEffectSnapshot>,
+    rgb: Option<RgbSnapshot>,
     profiles: Option<ProfileSnapshot>,
     warnings: Vec<String>,
 }
@@ -147,6 +171,11 @@ fn main() -> Result<()> {
             debounce_ms,
             motion_sync,
             profile_slot,
+            actuation_hundredths_mm,
+            key_index,
+            rapid_trigger,
+            rt_press_hundredths_mm,
+            rt_release_hundredths_mm,
         } => run_set(
             vid,
             pid,
@@ -157,6 +186,11 @@ fn main() -> Result<()> {
                 debounce_ms,
                 motion_sync,
                 profile_slot,
+                actuation_hundredths_mm,
+                key_index,
+                rapid_trigger,
+                rt_press_hundredths_mm,
+                rt_release_hundredths_mm,
             },
             cli.dry_run,
             &sink,
@@ -172,12 +206,18 @@ struct SetParams {
     debounce_ms: Option<u8>,
     motion_sync: Option<bool>,
     profile_slot: Option<u8>,
+    actuation_hundredths_mm: Option<u16>,
+    key_index: Option<u16>,
+    rapid_trigger: Option<bool>,
+    rt_press_hundredths_mm: Option<u16>,
+    rt_release_hundredths_mm: Option<u16>,
 }
 
 fn build_registry() -> DeviceRegistry {
     let mut registry = DeviceRegistry::new();
     registry.register_driver(agnoperiph_driver_logitech::driver_descriptor());
     registry.register_driver(agnoperiph_driver_lamzu::driver_descriptor());
+    registry.register_driver(agnoperiph_driver_atk::driver_descriptor());
     registry
 }
 
@@ -313,6 +353,11 @@ fn open_matched_driver(
                 .context("failed to probe Lamzu Atlantis device")?;
             Ok(Box::new(dev))
         }
+        "atk-rs7" => {
+            let dev = AtkRs7Device::open(wrapped, dry_run, Some(sink))
+                .context("failed to probe ATK RS7 Hall Effect keyboard")?;
+            Ok(Box::new(dev))
+        }
         other => bail!("unsupported driver id '{other}'"),
     }
 }
@@ -371,51 +416,7 @@ fn run_probe(
                 }
             };
 
-        let mut warnings = Vec::new();
-        let battery = if let Some(b) = peripheral.as_battery_mut() {
-            match b.read_battery() {
-                Ok(status) => Some(status),
-                Err(err) => {
-                    warnings.push(format!("battery: {err}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let pointer = if let Some(p) = peripheral.as_pointer_mut() {
-            match p.read_pointer_state() {
-                Ok(snap) => Some(snap),
-                Err(err) => {
-                    warnings.push(format!("pointer: {err}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let profiles = if let Some(pr) = peripheral.as_profiles_mut() {
-            match pr.read_profile_state() {
-                Ok(snap) => Some(snap),
-                Err(err) => {
-                    warnings.push(format!("profiles: {err}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        reports.push(ProbedDeviceReport {
-            driver_id: matched.driver_id,
-            info: peripheral.info().clone(),
-            battery,
-            pointer,
-            profiles,
-            warnings,
-        });
+        reports.push(collect_probe_report(matched.driver_id, peripheral.as_mut()));
     }
 
     if as_json {
@@ -425,6 +426,67 @@ fn run_probe(
 
     print_probe_reports(&reports, &skipped_errors, devices.len(), dry_run);
     Ok(())
+}
+
+fn collect_probe_report(driver_id: String, peripheral: &mut dyn Peripheral) -> ProbedDeviceReport {
+    let mut warnings = Vec::new();
+    let battery = peripheral
+        .as_battery_mut()
+        .and_then(|b| match b.read_battery() {
+            Ok(status) => Some(status),
+            Err(err) => {
+                warnings.push(format!("battery: {err}"));
+                None
+            }
+        });
+    let pointer = peripheral
+        .as_pointer_mut()
+        .and_then(|p| match p.read_pointer_state() {
+            Ok(snap) => Some(snap),
+            Err(err) => {
+                warnings.push(format!("pointer: {err}"));
+                None
+            }
+        });
+    let hall_effect =
+        peripheral
+            .as_hall_effect_mut()
+            .and_then(|he| match he.read_hall_effect_state() {
+                Ok(snap) => Some(snap),
+                Err(err) => {
+                    warnings.push(format!("hall_effect: {err}"));
+                    None
+                }
+            });
+    let rgb = peripheral
+        .as_rgb_mut()
+        .and_then(|r| match r.read_rgb_state() {
+            Ok(snap) => Some(snap),
+            Err(err) => {
+                warnings.push(format!("rgb: {err}"));
+                None
+            }
+        });
+    let profiles = peripheral
+        .as_profiles_mut()
+        .and_then(|pr| match pr.read_profile_state() {
+            Ok(snap) => Some(snap),
+            Err(err) => {
+                warnings.push(format!("profiles: {err}"));
+                None
+            }
+        });
+
+    ProbedDeviceReport {
+        driver_id,
+        info: peripheral.info().clone(),
+        battery,
+        pointer,
+        hall_effect,
+        rgb,
+        profiles,
+        warnings,
+    }
 }
 
 fn print_probe_reports(
@@ -439,52 +501,7 @@ fn print_probe_reports(
     );
 
     for report in reports {
-        println!(
-            "\n[{}] {} ({:04X}:{:04X}, {})",
-            report.driver_id,
-            report.info.model_name,
-            report.info.vid,
-            report.info.pid,
-            report.info.connection
-        );
-        if let Some(fw) = &report.info.firmware_version {
-            println!("  Firmware : {fw}");
-        }
-        if let Some(batt) = &report.battery {
-            println!(
-                "  Battery  : {}% ({}, voltage={:?} mV)",
-                batt.percentage
-                    .map_or_else(|| "?".to_owned(), |p| p.to_string()),
-                batt.state,
-                batt.voltage_mv
-            );
-        }
-        if let Some(ptr) = &report.pointer {
-            let dpis: Vec<String> = ptr.dpi_stages.iter().map(|s| s.x.to_string()).collect();
-            println!(
-                "  Pointer  : polling={}, active_stage={}, stages=[{}]",
-                ptr.polling_rate,
-                ptr.active_dpi_stage,
-                dpis.join(", ")
-            );
-            if ptr.lod.is_some() || ptr.debounce_ms.is_some() || ptr.motion_sync.is_some() {
-                println!(
-                    "  Sensor   : lod={:?}, debounce={:?}, motion_sync={:?}",
-                    ptr.lod, ptr.debounce_ms, ptr.motion_sync
-                );
-            }
-        }
-        if let Some(prof) = &report.profiles {
-            println!(
-                "  Profiles : active={}, mode={}, slots={}",
-                prof.active_slot,
-                prof.mode,
-                prof.profiles.len()
-            );
-        }
-        for warn in &report.warnings {
-            println!("  Warning  : {warn}");
-        }
+        print_single_probe_report(report);
     }
 
     if !skipped_errors.is_empty() {
@@ -495,6 +512,102 @@ fn print_probe_reports(
         for err in skipped_errors {
             println!("  - {err}");
         }
+    }
+}
+
+fn print_single_probe_report(report: &ProbedDeviceReport) {
+    println!(
+        "\n[{}] {} ({:04X}:{:04X}, {})",
+        report.driver_id,
+        report.info.model_name,
+        report.info.vid,
+        report.info.pid,
+        report.info.connection
+    );
+    if let Some(fw) = &report.info.firmware_version {
+        println!("  Firmware : {fw}");
+    }
+    if let Some(batt) = &report.battery {
+        println!(
+            "  Battery  : {}% ({}, voltage={:?} mV)",
+            batt.percentage
+                .map_or_else(|| "?".to_owned(), |p| p.to_string()),
+            batt.state,
+            batt.voltage_mv
+        );
+    }
+    if let Some(ptr) = &report.pointer {
+        let dpis: Vec<String> = ptr.dpi_stages.iter().map(|s| s.x.to_string()).collect();
+        println!(
+            "  Pointer  : polling={}, active_stage={}, stages=[{}]",
+            ptr.polling_rate,
+            ptr.active_dpi_stage,
+            dpis.join(", ")
+        );
+        if ptr.lod.is_some() || ptr.debounce_ms.is_some() || ptr.motion_sync.is_some() {
+            println!(
+                "  Sensor   : lod={:?}, debounce={:?}, motion_sync={:?}",
+                ptr.lod, ptr.debounce_ms, ptr.motion_sync
+            );
+        }
+    }
+    if let Some(he) = &report.hall_effect {
+        let min_act = he
+            .keys
+            .iter()
+            .map(|k| k.actuation)
+            .min()
+            .unwrap_or(TravelHundredthsMm::from_hundredths(0));
+        let max_act = he
+            .keys
+            .iter()
+            .map(|k| k.actuation)
+            .max()
+            .unwrap_or(TravelHundredthsMm::from_hundredths(0));
+        let rt_on = he
+            .keys
+            .iter()
+            .filter(|k| k.rapid_trigger.is_enabled())
+            .count();
+        let dz = he
+            .keys
+            .first()
+            .map_or((None, None), |k| (k.top_deadzone, k.bottom_deadzone));
+        println!(
+            "  HallEff  : keys={}, actuation={}..{}, rt_enabled={}/{}, socd_pairs={}, dks={}, calibration={:?}",
+            he.keys.len(),
+            min_act,
+            max_act,
+            rt_on,
+            he.keys.len(),
+            he.socd_pairs.len(),
+            he.dks_bindings.len(),
+            he.calibration
+        );
+        if dz.0.is_some() || dz.1.is_some() {
+            println!("  Deadzone : top={:?}, bottom={:?}", dz.0, dz.1);
+        }
+    }
+    if let Some(rgb) = &report.rgb {
+        for zone in &rgb.zones {
+            println!(
+                "  RGB Z{}  : {:?} @ {}%",
+                zone.zone.value(),
+                zone.effect,
+                zone.brightness.percent()
+            );
+        }
+    }
+    if let Some(prof) = &report.profiles {
+        println!(
+            "  Profiles : active={}, mode={}, slots={}",
+            prof.active_slot,
+            prof.mode,
+            prof.profiles.len()
+        );
+    }
+    for warn in &report.warnings {
+        println!("  Warning  : {warn}");
     }
 }
 
@@ -590,6 +703,48 @@ fn run_set(
         println!("Applied active profile slot={slot} (dry_run={dry_run}).");
     }
 
+    apply_hall_effect_set_params(peripheral.as_mut(), params, dry_run)
+}
+
+fn apply_hall_effect_set_params(
+    peripheral: &mut dyn Peripheral,
+    params: SetParams,
+    dry_run: bool,
+) -> Result<()> {
+    if let Some(hundredths) = params.actuation_hundredths_mm {
+        let he = peripheral
+            .as_hall_effect_mut()
+            .context("device does not expose HallEffectKeyboard capability")?;
+        let point = TravelHundredthsMm::from_hundredths(hundredths);
+        if let Some(key_ix) = params.key_index {
+            he.set_key_actuation(KeyIndex::new(key_ix), point)?;
+            println!("Applied key[{key_ix}] actuation={point} (dry_run={dry_run}).");
+        } else {
+            he.set_global_actuation(point)?;
+            println!("Applied global actuation={point} (dry_run={dry_run}).");
+        }
+    }
+
+    if let Some(rt_enabled) = params.rapid_trigger {
+        let he = peripheral
+            .as_hall_effect_mut()
+            .context("device does not expose HallEffectKeyboard capability")?;
+        let key_ix = params
+            .key_index
+            .context("--rapid-trigger requires --key-index")?;
+        let press =
+            TravelHundredthsMm::from_hundredths(params.rt_press_hundredths_mm.unwrap_or(20));
+        let release =
+            TravelHundredthsMm::from_hundredths(params.rt_release_hundredths_mm.unwrap_or(20));
+        he.set_rapid_trigger(
+            KeyIndex::new(key_ix),
+            RapidTriggerConfig::new(rt_enabled, rt_enabled, press, release),
+        )?;
+        println!(
+            "Applied key[{key_ix}] rapid_trigger={rt_enabled} (press={press}, release={release}, dry_run={dry_run})."
+        );
+    }
+
     Ok(())
 }
 
@@ -634,8 +789,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_registers_logitech_and_lamzu_drivers() {
+    fn registry_registers_all_three_vendor_drivers() {
         let registry = build_registry();
-        assert_eq!(registry.drivers().len(), 2);
+        assert_eq!(registry.drivers().len(), 3);
     }
 }

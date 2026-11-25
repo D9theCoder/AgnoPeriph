@@ -5,9 +5,9 @@ members = [
     "crates/transport",
     "crates/drivers/driver-logitech",
     "crates/drivers/driver-lamzu",
+    "crates/drivers/driver-atk",
     "crates/cli",
 ]
-# Phase 3: "crates/drivers/driver-atk"
 # Phase 4: "crates/ui"
 
 [workspace.package]
@@ -18,6 +18,7 @@ authors = ["AgnoPeriph Contributors"]
 
 [workspace.dependencies]
 agnoperiph-core = { path = "crates/core" }
+agnoperiph-driver-atk = { path = "crates/drivers/driver-atk" }
 agnoperiph-driver-lamzu = { path = "crates/drivers/driver-lamzu" }
 agnoperiph-driver-logitech = { path = "crates/drivers/driver-logitech" }
 agnoperiph-transport = { path = "crates/transport" }
