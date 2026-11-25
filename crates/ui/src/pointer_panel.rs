@@ -2,7 +2,6 @@
 
 use agnoperiph_core::{
     DebounceMs, DpiStage, DpiValue, LiftOffDistance, PointerCapabilities, PollingRateHz,
-    ProfileSlot,
 };
 use gpui_kit::component::{
     ActiveTheme, Disableable, Selectable, Sizable,
@@ -129,16 +128,6 @@ pub(crate) fn render(
                 .filter(|_| pointer.capabilities.supports_motion_sync),
             |this, enabled| this.child(render_motion_sync(enabled, busy, cx)),
         )
-        .when(device.capabilities.has_profiles(), |this| {
-            this.when_some(device.profiles.as_ref(), |this, profiles| {
-                this.child(render_profiles(
-                    profiles.snapshot.active_slot,
-                    profiles.capabilities.slot_count,
-                    busy,
-                    cx,
-                ))
-            })
-        })
 }
 
 fn render_dpi_stages(
@@ -414,31 +403,6 @@ fn render_motion_sync(
                 );
             })),
     )
-}
-
-fn render_profiles(
-    active: ProfileSlot,
-    slot_count: u8,
-    busy: bool,
-    cx: &mut Context<AgnoPeriphApp>,
-) -> impl IntoElement + use<> {
-    let buttons = (0..slot_count).map(ProfileSlot::new).map(|slot| {
-        Button::new(("profile", u64::from(slot.index())))
-            .label(format!("{}", slot.display_number()))
-            .accessibility_label(slot.to_string())
-            .selected(slot == active)
-            .disabled(busy)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if slot != active {
-                    this.apply_change(SettingChange::Profile(slot), cx);
-                }
-            }))
-    });
-    let group = ButtonGroup::new("profiles")
-        .outline()
-        .small()
-        .children(buttons);
-    field("Onboard profile", cx.theme()).child(group)
 }
 
 #[cfg(test)]

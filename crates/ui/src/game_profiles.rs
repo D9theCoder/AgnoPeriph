@@ -104,6 +104,7 @@ impl GameProfile {
 /// Snapshot of device settings saved inside a host-managed software profile slot
 /// (used for devices like ATK RS7 whose firmware only has a single onboard slot).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct SavedKeyboardPreset {
     pub global_actuation: Option<TravelHundredthsMm>,
@@ -111,6 +112,17 @@ pub struct SavedKeyboardPreset {
     pub bottom_deadzone: Option<TravelHundredthsMm>,
     pub rgb_zones: Vec<RgbZoneState>,
     pub keyboard_config: Option<KeyboardConfigSnapshot>,
+}
+
+impl SavedKeyboardPreset {
+    /// Returns `true` when nothing has been saved into this preset yet.
+    pub fn is_empty(&self) -> bool {
+        self.global_actuation.is_none()
+            && self.top_deadzone.is_none()
+            && self.bottom_deadzone.is_none()
+            && self.rgb_zones.is_empty()
+            && self.keyboard_config.is_none()
+    }
 }
 
 /// One host-managed software profile slot for a device.
@@ -155,7 +167,10 @@ impl Default for DeviceSoftwareProfiles {
 }
 
 /// Persistent AgnoPeriph user configuration (custom preset names, software profiles, game profiles).
+///
+/// Missing fields fall back to their defaults so configs written by older builds still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct AppConfig {
     pub auto_switch_enabled: bool,
@@ -167,6 +182,10 @@ pub struct AppConfig {
     pub game_profiles: Vec<GameProfile>,
     /// Fallback per-device profile slots restored when no configured game is running.
     pub default_targets: BTreeMap<String, u8>,
+    /// Closing the window keeps AgnoPeriph running in the notification area.
+    pub close_to_tray: bool,
+    /// Launch AgnoPeriph when the user signs in to Windows.
+    pub start_with_windows: bool,
 }
 
 impl Default for AppConfig {
@@ -177,6 +196,8 @@ impl Default for AppConfig {
             software_profiles: BTreeMap::new(),
             game_profiles: Vec::new(),
             default_targets: BTreeMap::new(),
+            close_to_tray: true,
+            start_with_windows: false,
         }
     }
 }
@@ -268,6 +289,44 @@ impl AppConfig {
         } else {
             self.game_profiles.push(profile);
         }
+    }
+
+    /// Returns the Game Profile with `id`.
+    pub fn game_profile(&self, id: &str) -> Option<&GameProfile> {
+        self.game_profiles.iter().find(|p| p.id == id)
+    }
+
+    /// Returns a mutable Game Profile with `id`.
+    pub fn game_profile_mut(&mut self, id: &str) -> Option<&mut GameProfile> {
+        self.game_profiles.iter_mut().find(|p| p.id == id)
+    }
+
+    /// Returns an id derived from `name` that no existing Game Profile uses.
+    pub fn unique_game_profile_id(&self, name: &str) -> String {
+        let base: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned();
+        let base = if base.is_empty() {
+            "game".to_owned()
+        } else {
+            base
+        };
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while self.game_profile(&candidate).is_some() {
+            candidate = format!("{base}-{n}");
+            n += 1;
+        }
+        candidate
     }
 
     /// Deletes a Game Profile by id.

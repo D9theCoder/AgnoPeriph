@@ -1,19 +1,23 @@
-//! Root window view: owns device state, selection, dry-run mode and async orchestration.
+//! Root window view: owns device state, selection, dry-run mode, the write queue,
+//! persistent configuration and the automatic Game Profile switcher.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use agnoperiph_core::{
-    CoreResult, DeviceId, DpiStage, KeyIndex, RapidTriggerConfig, TravelHundredthsMm,
+    CoreResult, DeviceId, DpiStage, KeyIndex, ProfileSlot, RapidTriggerConfig, TravelHundredthsMm,
 };
-use agnoperiph_transport::PacketTraceEntry;
+use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants},
     h_flex,
-    scroll::ScrollableElement,
+    input::InputEvent,
     spinner::Spinner,
     switch::Switch,
+    tab::{Tab, TabBar},
     tag::Tag,
     v_flex,
 };
@@ -21,7 +25,17 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::backend::{ApplyError, DeviceSnapshot, PeripheralService, PointerChange, SettingChange};
-use crate::{hall_effect_panel, inspector_drawer, pointer_panel, rgb_panel, sidebar};
+use crate::controls::{Controls, InputRole, SliderRange, SliderRole};
+use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
+use crate::smooth_scroll::SmoothScroll;
+use crate::system::{DetachedSystem, SystemIntegration};
+use crate::{
+    calibration, game_profiles_view, hall_effect_panel, inspector_drawer, keyboard_config_panel,
+    keymap_panel, macro_panel, pointer_panel, profile_bar, rgb_panel, sidebar,
+};
+
+/// How often the process watcher looks for configured games.
+pub const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// Notice shown above the workspace after a failed operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,19 +54,28 @@ impl Banner {
     }
 }
 
-/// Unsaved edits for the selected key; `None` fields fall back to the device snapshot.
+/// Unsaved edits for the selected keys; `None` fields fall back to the device snapshot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct KeyDraft {
     pub(crate) actuation: Option<TravelHundredthsMm>,
     pub(crate) rapid_trigger: Option<RapidTriggerConfig>,
 }
 
-/// Which unsaved edits a change commits, so a successful write clears only those.
+/// Keyboard-wide dead zone edits, separate from per-key drafts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DeadzoneDraft {
+    pub(crate) top: Option<TravelHundredthsMm>,
+    pub(crate) bottom: Option<TravelHundredthsMm>,
+}
+
+/// Which unsaved edits a write commits, so a successful write clears only those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DraftScope {
+pub(crate) enum DraftScope {
     DpiStages,
     Actuation,
     RapidTrigger,
+    Deadzones,
+    Macros,
     None,
 }
 
@@ -60,28 +83,174 @@ impl DraftScope {
     fn of(change: &SettingChange) -> Self {
         match change {
             SettingChange::Pointer(PointerChange::DpiStages { .. }) => Self::DpiStages,
-            SettingChange::Actuation { .. } => Self::Actuation,
-            SettingChange::RapidTrigger { .. } => Self::RapidTrigger,
+            SettingChange::Actuation { .. } | SettingChange::ActuationMany { .. } => {
+                Self::Actuation
+            }
+            SettingChange::RapidTrigger { .. } | SettingChange::RapidTriggerMany { .. } => {
+                Self::RapidTrigger
+            }
+            SettingChange::Deadzones { .. } => Self::Deadzones,
+            SettingChange::Macros(_) => Self::Macros,
             _ => Self::None,
         }
+    }
+}
+
+/// Why a queued write exists, which decides what happens after it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JobOrigin {
+    /// A user edit; clears the matching draft on success.
+    User(DraftScope),
+    /// Activates a profile slot, from the profile bar or the Game Profile switcher.
+    ProfileSwitch {
+        slot: u8,
+        is_software: bool,
+        is_automatic: bool,
+    },
+    /// Starts a calibration run; marks calibration active only once the write succeeds.
+    CalibrationStart,
+    /// Periodic calibration progress read; never marks the window busy.
+    CalibrationPoll,
+}
+
+impl JobOrigin {
+    fn is_background(&self) -> bool {
+        matches!(self, Self::CalibrationPoll)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WriteJob {
+    pub(crate) device: DeviceId,
+    pub(crate) changes: Vec<SettingChange>,
+    pub(crate) origin: JobOrigin,
+}
+
+/// Top-level destination shown in the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    Device,
+    GameProfiles,
+}
+
+/// Sub-view of a keyboard's workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardTab {
+    Triggers,
+    Keybinds,
+    Lighting,
+    Macros,
+    Advanced,
+}
+
+impl KeyboardTab {
+    pub const ALL: [Self; 5] = [
+        Self::Triggers,
+        Self::Keybinds,
+        Self::Lighting,
+        Self::Macros,
+        Self::Advanced,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Triggers => "Triggers & paired keys",
+            Self::Keybinds => "Keybinds",
+            Self::Lighting => "Lighting",
+            Self::Macros => "Macros",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
+
+type GameDiscovery = Arc<dyn Fn() -> Vec<DetectedGame> + Send + Sync>;
+
+/// Construction options for [`AgnoPeriphApp`].
+///
+/// The default is fully detached from the host: no config file, no registry access,
+/// no process polling and an empty game scan. The binary opts in with [`Self::live`].
+#[non_exhaustive]
+pub struct AppOptions {
+    system: Arc<dyn SystemIntegration>,
+    config: AppConfig,
+    discover_games: GameDiscovery,
+    watch_processes: bool,
+}
+
+impl std::fmt::Debug for AppOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppOptions")
+            .field("watch_processes", &self.watch_processes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AppOptions {
+    fn default() -> Self {
+        Self {
+            system: Arc::new(DetachedSystem),
+            config: AppConfig::default(),
+            discover_games: Arc::new(Vec::new),
+            watch_processes: false,
+        }
+    }
+}
+
+impl AppOptions {
+    /// Options for the real desktop app: config on disk, installed game scan, process watcher.
+    pub fn live(system: Arc<dyn SystemIntegration>, config: AppConfig) -> Self {
+        Self {
+            system,
+            config,
+            discover_games: Arc::new(crate::game_profiles::discover_installed_games),
+            watch_processes: true,
+        }
+    }
+
+    pub fn with_system(mut self, system: Arc<dyn SystemIntegration>) -> Self {
+        self.system = system;
+        self
+    }
+
+    pub fn with_config(mut self, config: AppConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_game_discovery(
+        mut self,
+        discover: impl Fn() -> Vec<DetectedGame> + Send + Sync + 'static,
+    ) -> Self {
+        self.discover_games = Arc::new(discover);
+        self
+    }
+
+    pub fn with_process_watcher(mut self, enabled: bool) -> Self {
+        self.watch_processes = enabled;
+        self
     }
 }
 
 /// The AgnoPeriph main window.
 ///
 /// Owns the loaded device snapshots and all view state. Every service call runs on the
-/// background executor; replies to superseded refreshes are dropped by revision.
+/// background executor; replies to superseded refreshes are dropped by revision, and
+/// writes run one job at a time from a queue so automatic switches never drop.
 pub struct AgnoPeriphApp {
     service: Arc<dyn PeripheralService>,
+    pub(crate) system: Arc<dyn SystemIntegration>,
+    pub(crate) discover_games: GameDiscovery,
     devices: Vec<DeviceSnapshot>,
     selected: Option<DeviceId>,
+    route: Route,
     /// Incremented by every refresh; a reply carrying an older revision is stale.
     revision: u64,
     has_loaded: bool,
     is_loading: bool,
-    /// A write is in flight. Only one runs at a time and it is never cancelled,
+    queue: VecDeque<WriteJob>,
+    /// Origin of the write in flight. Only one runs at a time and it is never cancelled,
     /// because a superseded write has still reached the device.
-    is_busy: bool,
+    in_flight: Option<JobOrigin>,
     dry_run: bool,
     is_inspector_open: bool,
     banner: Option<Banner>,
@@ -92,10 +261,32 @@ pub struct AgnoPeriphApp {
     /// arriving from an in-flight refresh or write are dropped.
     cleared_through_sequence: u64,
     pub(crate) selected_key: KeyIndex,
+    pub(crate) selected_keys: BTreeSet<KeyIndex>,
     pub(crate) key_draft: KeyDraft,
+    pub(crate) deadzone_draft: DeadzoneDraft,
     pub(crate) dpi_draft: Option<Vec<DpiStage>>,
-    pub(crate) socd_first: Option<KeyIndex>,
+    pub(crate) keyboard_tab: KeyboardTab,
+    pub(crate) paired: hall_effect_panel::PairedKeysUi,
+    pub(crate) keymap_ui: keymap_panel::KeymapUi,
+    pub(crate) lighting: rgb_panel::LightingUi,
+    pub(crate) macros_ui: macro_panel::MacroUi,
+    pub(crate) games_ui: game_profiles_view::GamesUi,
+    pub(crate) config: AppConfig,
+    pub(crate) active_game: Option<String>,
+    /// Profile slot last confirmed active per device by the Game Profile switcher.
+    pub(crate) applied_targets: BTreeMap<String, u8>,
+    /// Devices with an automatic switch queued or in flight.
+    pending_targets: BTreeSet<String>,
+    pub(crate) auto_switch_note: Option<SharedString>,
+    pub(crate) calibration: calibration::CalibrationUi,
+    pub(crate) controls: Option<Controls>,
+    window_handle: Option<AnyWindowHandle>,
+    pub(crate) smooth_scroll: SmoothScroll,
+    pending_save: Arc<Mutex<Option<AppConfig>>>,
+    save_lock: Arc<Mutex<()>>,
+    watcher: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+    control_subscriptions: Vec<Subscription>,
 }
 
 impl std::fmt::Debug for AgnoPeriphApp {
@@ -104,24 +295,37 @@ impl std::fmt::Debug for AgnoPeriphApp {
             .field("devices", &self.devices.len())
             .field("selected", &self.selected)
             .field("dry_run", &self.dry_run)
-            .field("is_busy", &self.is_busy)
+            .field("in_flight", &self.in_flight)
             .finish_non_exhaustive()
     }
 }
 
 impl AgnoPeriphApp {
-    /// Creates the view and starts the initial device scan.
+    /// Creates the view with detached options. Call [`Self::attach_window`] before rendering.
     pub fn new(service: Arc<dyn PeripheralService>, cx: &mut Context<Self>) -> Self {
+        Self::with_options(service, AppOptions::default(), cx)
+    }
+
+    /// Creates the view and starts the initial device scan.
+    pub fn with_options(
+        service: Arc<dyn PeripheralService>,
+        options: AppOptions,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let dry_run = service.is_dry_run();
         let theme_subscription = cx.observe_global::<Theme>(|_, cx| cx.notify());
         let mut app = Self {
             service,
+            system: options.system,
+            discover_games: options.discover_games,
             devices: Vec::new(),
             selected: None,
+            route: Route::Device,
             revision: 0,
             has_loaded: false,
             is_loading: false,
-            is_busy: false,
+            queue: VecDeque::new(),
+            in_flight: None,
             dry_run,
             is_inspector_open: true,
             banner: None,
@@ -130,17 +334,142 @@ impl AgnoPeriphApp {
             suppressed_packets: 0,
             cleared_through_sequence: 0,
             selected_key: KeyIndex::new(0),
+            selected_keys: BTreeSet::from([KeyIndex::new(0)]),
             key_draft: KeyDraft::default(),
+            deadzone_draft: DeadzoneDraft::default(),
             dpi_draft: None,
-            socd_first: None,
+            keyboard_tab: KeyboardTab::Triggers,
+            paired: hall_effect_panel::PairedKeysUi::default(),
+            keymap_ui: keymap_panel::KeymapUi::default(),
+            lighting: rgb_panel::LightingUi::default(),
+            macros_ui: macro_panel::MacroUi::default(),
+            games_ui: game_profiles_view::GamesUi::default(),
+            config: options.config,
+            active_game: None,
+            applied_targets: BTreeMap::new(),
+            pending_targets: BTreeSet::new(),
+            auto_switch_note: None,
+            calibration: calibration::CalibrationUi::default(),
+            controls: None,
+            window_handle: None,
+            smooth_scroll: SmoothScroll::default(),
+            pending_save: Arc::new(Mutex::new(None)),
+            save_lock: Arc::new(Mutex::new(())),
+            watcher: None,
             _subscriptions: vec![theme_subscription],
+            control_subscriptions: Vec::new(),
         };
+        if options.watch_processes {
+            app.watcher = Some(Self::spawn_process_watcher(cx));
+        }
         app.refresh(cx);
         app
     }
 
+    /// Creates the app entity for `window` in one step, as `open_window` expects.
+    pub fn build(
+        service: Arc<dyn PeripheralService>,
+        options: AppOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let app = cx.new(|cx| Self::with_options(service, options, cx));
+        app.update(cx, |app, cx| app.attach_window(window, cx));
+        app
+    }
+
+    /// Binds the app to a (new) window: rebuilds window-bound controls and syncs them.
+    ///
+    /// The app outlives its window when it runs in the notification area, so this is
+    /// called again whenever the window is reopened.
+    pub fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_handle = Some(window.window_handle());
+        self.rebuild_controls(window, cx);
+        self.sync_controls(window, cx);
+        cx.notify();
+    }
+
+    fn device_ranges(&self) -> (SliderRange, SliderRange, f32) {
+        let (travel, rt) = self
+            .selected_device()
+            .and_then(|d| d.hall_effect.as_ref())
+            .map_or(
+                (
+                    SliderRange::new(10u16, 340u16, 2u16),
+                    SliderRange::new(2u16, 340u16, 2u16),
+                ),
+                |he| {
+                    let caps = &he.capabilities;
+                    let travel = SliderRange::travel(
+                        caps.actuation_min,
+                        caps.actuation_max,
+                        caps.actuation_step,
+                    );
+                    let rt = match (caps.rapid_trigger_min, caps.rapid_trigger_max) {
+                        (Some(min), Some(max)) => {
+                            SliderRange::travel(min, max, caps.actuation_step)
+                        }
+                        _ => travel,
+                    };
+                    (travel, rt)
+                },
+            );
+        let speed = f32::from(
+            self.selected_device()
+                .and_then(|d| d.rgb.as_ref())
+                .and_then(|rgb| {
+                    rgb.capabilities
+                        .zones
+                        .iter()
+                        .find(|z| z.id == self.lighting.zone)
+                        .map(|z| z.max_speed)
+                })
+                .unwrap_or(255),
+        );
+        (travel, rt, speed)
+    }
+
+    fn rebuild_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (travel, rt, speed) = self.device_ranges();
+        let (controls, subscriptions) = Controls::new(travel, rt, speed, window, cx);
+        self.controls = Some(controls);
+        self.control_subscriptions = subscriptions;
+    }
+
+    /// Pushes the current model values into sliders and inputs.
+    pub(crate) fn sync_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (travel, rt, speed) = self.device_ranges();
+        let needs_rebuild = self.controls.as_ref().is_some_and(|c| {
+            c.travel_range != travel
+                || c.rt_range != rt
+                || (c.speed_max - speed).abs() > f32::EPSILON
+        });
+        if needs_rebuild {
+            self.rebuild_controls(window, cx);
+        }
+        hall_effect_panel::sync_controls(self, window, cx);
+        rgb_panel::sync_controls(self, window, cx);
+    }
+
+    /// Schedules [`Self::sync_controls`] once the current update finishes.
+    pub(crate) fn request_sync(&self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window_handle else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let _ = cx.update_window(handle, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| this.sync_controls(window, cx));
+            });
+        })
+        .detach();
+    }
+
     pub fn devices(&self) -> &[DeviceSnapshot] {
         &self.devices
+    }
+
+    pub fn device(&self, id: &DeviceId) -> Option<&DeviceSnapshot> {
+        self.devices.iter().find(|device| device.id() == id)
     }
 
     pub fn selected_device_id(&self) -> Option<&DeviceId> {
@@ -148,12 +477,53 @@ impl AgnoPeriphApp {
     }
 
     pub fn selected_device(&self) -> Option<&DeviceSnapshot> {
-        let id = self.selected.as_ref()?;
-        self.devices.iter().find(|device| device.id() == id)
+        self.device(self.selected.as_ref()?)
+    }
+
+    pub fn route(&self) -> Route {
+        self.route
+    }
+
+    pub fn keyboard_tab(&self) -> KeyboardTab {
+        self.keyboard_tab
+    }
+
+    /// Whether a calibration run is active on the selected keyboard.
+    pub fn is_calibrating(&self) -> bool {
+        self.calibration.is_active
+    }
+
+    /// Calibration progress reads completed since the current run started.
+    pub fn calibration_polls(&self) -> usize {
+        self.calibration.polls
     }
 
     pub fn selected_key(&self) -> KeyIndex {
         self.selected_key
+    }
+
+    pub fn selected_keys(&self) -> &BTreeSet<KeyIndex> {
+        &self.selected_keys
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    /// Id of the Game Profile whose executable is running, if auto switching matched one.
+    pub fn active_game(&self) -> Option<&str> {
+        self.active_game.as_deref()
+    }
+
+    /// Display name of the active Game Profile, or `None` on the desktop default.
+    pub fn active_game_name(&self) -> Option<&str> {
+        let id = self.active_game.as_deref()?;
+        self.config.game_profile(id).map(|p| p.name.as_str())
+    }
+
+    /// Explains a part of a Game Profile switch that wasn't written automatically.
+    pub fn auto_switch_note(&self) -> Option<&SharedString> {
+        self.auto_switch_note.as_ref()
     }
 
     pub fn is_dry_run(&self) -> bool {
@@ -164,8 +534,13 @@ impl AgnoPeriphApp {
         self.is_loading
     }
 
+    /// `true` while a user-visible write is in flight; background polls don't count.
     pub fn is_busy(&self) -> bool {
-        self.is_busy
+        self.in_flight.as_ref().is_some_and(|o| !o.is_background())
+    }
+
+    pub fn has_pending_writes(&self) -> bool {
+        self.in_flight.is_some() || !self.queue.is_empty()
     }
 
     pub fn is_inspector_open(&self) -> bool {
@@ -199,7 +574,7 @@ impl AgnoPeriphApp {
 
     /// Switches dry-run mode. Device handles reopen in the new mode before any further write.
     pub fn set_dry_run(&mut self, dry_run: bool, cx: &mut Context<Self>) {
-        if self.is_busy || dry_run == self.dry_run {
+        if self.has_pending_writes() || dry_run == self.dry_run {
             return;
         }
         let service = self.service.clone();
@@ -236,9 +611,18 @@ impl AgnoPeriphApp {
         self.suppressed_packets = self
             .packets
             .iter()
-            .filter(|p| p.outcome == agnoperiph_transport::PacketOutcome::DryRunSuppressed)
+            .filter(|p| p.outcome == PacketOutcome::DryRunSuppressed)
             .count();
         self.formatted_packets = Arc::new(inspector_drawer::format_packets(&self.packets));
+    }
+
+    fn clear_drafts(&mut self) {
+        self.dpi_draft = None;
+        self.key_draft = KeyDraft::default();
+        self.deadzone_draft = DeadzoneDraft::default();
+        self.paired = hall_effect_panel::PairedKeysUi::default();
+        self.lighting.clear_draft();
+        self.macros_ui.clear_draft();
     }
 
     fn finish_refresh(
@@ -254,9 +638,10 @@ impl AgnoPeriphApp {
         self.has_loaded = true;
         self.dry_run = dry_run;
         self.set_packets(packets);
-        self.dpi_draft = None;
-        self.key_draft = KeyDraft::default();
-        self.socd_first = None;
+        self.clear_drafts();
+        self.keymap_ui.clear_history();
+        // Fresh handles hold whatever the device stores; the switcher re-checks every target.
+        self.applied_targets.clear();
         match devices {
             Ok(devices) => {
                 let previous = self.selected.clone();
@@ -270,13 +655,19 @@ impl AgnoPeriphApp {
                     self.selected = self.devices.first().map(|d| d.id().clone());
                 }
                 if self.selected != previous {
-                    self.selected_key = KeyIndex::new(0);
+                    self.reset_key_selection();
+                    self.keymap_ui = keymap_panel::KeymapUi::default();
+                }
+                for device in &self.devices {
+                    if device.profiles.is_none() && device.capabilities.has_hall_effect() {
+                        self.config.ensure_software_profiles(device.id());
+                    }
                 }
             }
             Err(err) => {
                 self.devices.clear();
                 self.selected = None;
-                self.selected_key = KeyIndex::new(0);
+                self.reset_key_selection();
                 self.banner = Some(Banner {
                     title: "Couldn’t scan for devices".into(),
                     message: format!(
@@ -286,111 +677,308 @@ impl AgnoPeriphApp {
                 });
             }
         }
+        self.request_sync(cx);
+        self.pump_queue(cx);
         cx.notify();
     }
 
+    fn reset_key_selection(&mut self) {
+        self.selected_key = KeyIndex::new(0);
+        self.selected_keys = BTreeSet::from([KeyIndex::new(0)]);
+    }
+
     /// Validates and applies one change to the selected device.
+    ///
+    /// User edits are ignored while a write or refresh is running; their controls are
+    /// disabled in that state, so nothing the user sees is silently dropped.
     pub(crate) fn apply_change(&mut self, change: SettingChange, cx: &mut Context<Self>) {
-        if self.is_busy || self.is_loading {
+        let scope = DraftScope::of(&change);
+        self.apply_changes(vec![change], JobOrigin::User(scope), cx);
+    }
+
+    /// Applies several changes to the selected device as one job, stopping at the first failure.
+    pub(crate) fn apply_changes(
+        &mut self,
+        changes: Vec<SettingChange>,
+        origin: JobOrigin,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_busy() || self.is_loading {
             return;
         }
         let Some(device) = self.selected.clone() else {
             return;
         };
-        self.is_busy = true;
+        self.enqueue(
+            WriteJob {
+                device,
+                changes,
+                origin,
+            },
+            cx,
+        );
+    }
+
+    /// Queues a write job. Jobs run strictly one after another.
+    pub(crate) fn enqueue(&mut self, job: WriteJob, cx: &mut Context<Self>) {
+        self.queue.push_back(job);
+        self.pump_queue(cx);
         cx.notify();
-        let applied = DraftScope::of(&change);
+    }
+
+    fn pump_queue(&mut self, cx: &mut Context<Self>) {
+        if self.in_flight.is_some() || self.is_loading {
+            return;
+        }
+        let Some(job) = self.queue.pop_front() else {
+            return;
+        };
+        self.in_flight = Some(job.origin.clone());
         let service = self.service.clone();
+        let WriteJob {
+            device,
+            changes,
+            origin,
+        } = job;
         cx.spawn(async move |this, cx| {
+            let device_for_reply = device.clone();
             let reply = cx
                 .background_spawn(async move {
-                    let result = service.apply(&device, change);
-                    (result, service.packet_log())
+                    let total = changes.len();
+                    let mut last = None;
+                    let mut failure = None;
+                    for (ix, change) in changes.into_iter().enumerate() {
+                        match service.apply(&device, change) {
+                            Ok(snapshot) => last = Some(snapshot),
+                            Err(err) => {
+                                failure = Some((ix, total, err));
+                                break;
+                            }
+                        }
+                    }
+                    (last, failure, service.packet_log())
                 })
                 .await;
-            let _ = this.update(cx, |this, cx| this.finish_apply(applied, reply, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.finish_job(&device_for_reply, &origin, reply, cx);
+            });
         })
         .detach();
     }
 
-    fn finish_apply(
+    #[allow(clippy::type_complexity)]
+    fn finish_job(
         &mut self,
-        applied: DraftScope,
-        (result, packets): (Result<DeviceSnapshot, ApplyError>, Vec<PacketTraceEntry>),
+        device: &DeviceId,
+        origin: &JobOrigin,
+        (last, failure, packets): (
+            Option<DeviceSnapshot>,
+            Option<(usize, usize, ApplyError)>,
+            Vec<PacketTraceEntry>,
+        ),
         cx: &mut Context<Self>,
     ) {
-        self.is_busy = false;
+        self.in_flight = None;
         self.set_packets(packets);
-        match result {
-            Ok(snapshot) => {
-                if let Some(slot) = self.devices.iter_mut().find(|d| d.id() == snapshot.id()) {
-                    *slot = snapshot;
+        if let Some(snapshot) = last {
+            self.store_snapshot(snapshot);
+        }
+        match failure {
+            None => {
+                if !origin.is_background() {
+                    self.banner = None;
                 }
-                self.banner = None;
-                // Only the edits this change committed are cleared; unrelated drafts survive.
-                match applied {
-                    DraftScope::DpiStages => self.dpi_draft = None,
-                    DraftScope::Actuation => self.key_draft.actuation = None,
-                    DraftScope::RapidTrigger => self.key_draft.rapid_trigger = None,
-                    DraftScope::None => {}
-                }
+                self.finish_origin(device, origin);
             }
-            Err(failure) => {
-                self.socd_first = None;
-                let refreshed = failure.refreshed_snapshot.is_some();
-                if let Some(snapshot) = failure.refreshed_snapshot
-                    && let Some(slot) = self.devices.iter_mut().find(|d| d.id() == snapshot.id())
-                {
-                    *slot = *snapshot;
-                }
-                let message = if failure.rejected_before_send {
-                    format!(
-                        "{}. Nothing was written. Adjust the value, or refresh if the device was disconnected.",
-                        failure.error
-                    )
-                } else if self.dry_run {
-                    format!(
-                        "{}. Dry run is enabled, so no write reached the device.",
-                        failure.error
-                    )
-                } else if refreshed {
-                    format!(
-                        "{}. Some frames may have already reached the device; the view was refreshed with the device’s current state.",
-                        failure.error
-                    )
-                } else {
-                    format!(
-                        "{}. Some frames may have already reached the device. Refresh to verify its current state.",
-                        failure.error
-                    )
-                };
-                self.banner = Some(Banner {
-                    title: "Couldn’t apply the change".into(),
-                    message: message.into(),
-                });
+            Some((step, total, failure)) => {
+                self.report_failure(device, origin, step, total, failure);
             }
         }
+        if let JobOrigin::ProfileSwitch {
+            is_automatic: true, ..
+        } = origin
+        {
+            self.pending_targets.remove(device.as_str());
+        }
+        self.request_sync(cx);
+        self.pump_queue(cx);
         cx.notify();
+    }
+
+    fn store_snapshot(&mut self, snapshot: DeviceSnapshot) {
+        if let Some(slot) = self.devices.iter_mut().find(|d| d.id() == snapshot.id()) {
+            *slot = snapshot;
+        }
+    }
+
+    fn finish_origin(&mut self, device: &DeviceId, origin: &JobOrigin) {
+        match origin {
+            JobOrigin::User(scope) => match scope {
+                DraftScope::DpiStages => self.dpi_draft = None,
+                DraftScope::Actuation => self.key_draft.actuation = None,
+                DraftScope::RapidTrigger => self.key_draft.rapid_trigger = None,
+                DraftScope::Deadzones => self.deadzone_draft = DeadzoneDraft::default(),
+                DraftScope::Macros => self.macros_ui.clear_draft(),
+                DraftScope::None => {}
+            },
+            JobOrigin::ProfileSwitch {
+                slot,
+                is_software,
+                is_automatic,
+            } => {
+                if *is_software {
+                    self.config.ensure_software_profiles(device).active_slot = *slot;
+                    self.save_config();
+                }
+                if *is_automatic {
+                    self.applied_targets
+                        .insert(device.as_str().to_owned(), *slot);
+                }
+            }
+            JobOrigin::CalibrationStart => {
+                self.calibration.is_starting = false;
+                self.calibration.is_active = true;
+                self.calibration.polls = 0;
+            }
+            JobOrigin::CalibrationPoll => self.calibration.polls += 1,
+        }
+    }
+
+    fn report_failure(
+        &mut self,
+        device: &DeviceId,
+        origin: &JobOrigin,
+        step: usize,
+        total: usize,
+        failure: ApplyError,
+    ) {
+        self.paired.cancel_pick();
+        if matches!(origin, JobOrigin::CalibrationStart) {
+            self.calibration.is_starting = false;
+            self.calibration.is_active = false;
+        }
+        let refreshed = failure.refreshed_snapshot.is_some();
+        if let Some(snapshot) = failure.refreshed_snapshot {
+            self.store_snapshot(*snapshot);
+        }
+        let device_name = self
+            .device(device)
+            .map_or_else(|| device.to_string(), |d| d.info.model_name.clone());
+        let step_note = if total > 1 {
+            format!(
+                " Step {} of {total} failed; earlier steps were applied.",
+                step + 1
+            )
+        } else {
+            String::new()
+        };
+        let message = if failure.rejected_before_send {
+            format!(
+                "{}. Nothing was written for this step. Adjust the value, or refresh if the device was disconnected.{step_note}",
+                failure.error
+            )
+        } else if self.dry_run {
+            format!(
+                "{}. Dry run is enabled, so no write reached the device.{step_note}",
+                failure.error
+            )
+        } else if refreshed {
+            format!(
+                "{}. Some frames may have already reached the device; the view was refreshed with the device’s current state.{step_note}",
+                failure.error
+            )
+        } else {
+            format!(
+                "{}. Some frames may have already reached the device. Refresh to verify its current state.{step_note}",
+                failure.error
+            )
+        };
+        let title = match origin {
+            JobOrigin::ProfileSwitch {
+                is_automatic: true, ..
+            } => format!("Couldn’t switch {device_name} automatically"),
+            JobOrigin::ProfileSwitch { .. } => format!("Couldn’t switch {device_name}’s profile"),
+            _ => "Couldn’t apply the change".to_owned(),
+        };
+        if let JobOrigin::ProfileSwitch {
+            slot,
+            is_automatic: true,
+            ..
+        } = origin
+        {
+            // Remember the failed target so the switcher doesn't retry it every poll.
+            self.applied_targets
+                .insert(device.as_str().to_owned(), *slot);
+        }
+        self.banner = Some(Banner {
+            title: title.into(),
+            message: message.into(),
+        });
     }
 
     pub fn select_device(&mut self, device: DeviceId, cx: &mut Context<Self>) {
-        if self.selected.as_ref() == Some(&device) {
+        if self.route == Route::Device && self.selected.as_ref() == Some(&device) {
             return;
         }
-        self.selected = Some(device);
-        self.selected_key = KeyIndex::new(0);
-        self.dpi_draft = None;
-        self.key_draft = KeyDraft::default();
-        self.socd_first = None;
+        let changed = self.selected.as_ref() != Some(&device);
+        self.route = Route::Device;
+        if changed {
+            self.selected = Some(device);
+            self.reset_key_selection();
+            self.clear_drafts();
+            self.keymap_ui = keymap_panel::KeymapUi::default();
+            self.lighting = rgb_panel::LightingUi::default();
+            self.macros_ui = macro_panel::MacroUi::default();
+        }
+        self.smooth_scroll.reset();
+        self.request_sync(cx);
         cx.notify();
     }
 
-    pub fn select_key(&mut self, key: KeyIndex, cx: &mut Context<Self>) {
-        if self.selected_key != key {
-            self.selected_key = key;
-            self.key_draft = KeyDraft::default();
+    pub fn open_game_profiles(&mut self, cx: &mut Context<Self>) {
+        if self.route != Route::GameProfiles {
+            self.route = Route::GameProfiles;
+            self.smooth_scroll.reset();
             cx.notify();
         }
+    }
+
+    pub fn set_keyboard_tab(&mut self, tab: KeyboardTab, cx: &mut Context<Self>) {
+        if self.keyboard_tab != tab {
+            self.keyboard_tab = tab;
+            self.paired.cancel_pick();
+            self.smooth_scroll.reset();
+            self.request_sync(cx);
+            cx.notify();
+        }
+    }
+
+    /// Selects `key` alone, or toggles it in a multi-key selection when `extend` is set.
+    pub fn select_key(&mut self, key: KeyIndex, extend: bool, cx: &mut Context<Self>) {
+        if self.paired.accept_pick(key) {
+            cx.notify();
+            return;
+        }
+        if extend {
+            if self.selected_keys.contains(&key) && self.selected_keys.len() > 1 {
+                self.selected_keys.remove(&key);
+                if self.selected_key == key {
+                    self.selected_key = *self.selected_keys.iter().next().unwrap_or(&key);
+                }
+            } else {
+                self.selected_keys.insert(key);
+                self.selected_key = key;
+            }
+        } else {
+            if self.selected_key == key && self.selected_keys.len() == 1 {
+                return;
+            }
+            self.selected_key = key;
+            self.selected_keys = BTreeSet::from([key]);
+        }
+        self.key_draft = KeyDraft::default();
+        self.request_sync(cx);
+        cx.notify();
     }
 
     pub fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
@@ -410,13 +998,267 @@ impl AgnoPeriphApp {
         cx.notify();
     }
 
+    /// Persists the configuration off the UI thread. The newest snapshot always wins.
+    pub(crate) fn save_config(&self) {
+        let pending = self.pending_save.clone();
+        let lock = self.save_lock.clone();
+        let system = self.system.clone();
+        *crate::backend_lock(&pending) = Some(self.config.clone());
+        std::thread::spawn(move || {
+            let _guard = crate::backend_lock(&lock);
+            let next = crate::backend_lock(&pending).take();
+            if let Some(config) = next {
+                let _ = system.save_config(&config);
+            }
+        });
+    }
+
+    pub fn set_close_to_tray(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.config.close_to_tray == enabled {
+            return;
+        }
+        self.config.close_to_tray = enabled;
+        if self.config.start_with_windows {
+            let _ = self.system.set_start_with_windows(true, enabled);
+        }
+        self.save_config();
+        cx.notify();
+    }
+
+    pub fn set_start_with_windows(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        match self
+            .system
+            .set_start_with_windows(enabled, self.config.close_to_tray)
+        {
+            Ok(()) => {
+                self.config.start_with_windows = enabled;
+                self.save_config();
+            }
+            Err(err) => {
+                self.banner = Some(Banner {
+                    title: "Couldn’t change Start with Windows".into(),
+                    message: format!("{err}.").into(),
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    // ---- Game Profile switcher -------------------------------------------------------
+
+    fn spawn_process_watcher(cx: &mut Context<Self>) -> Task<()> {
+        let watcher = Arc::new(Mutex::new(ActiveProcessWatcher::new()));
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PROCESS_POLL_INTERVAL).await;
+                let watcher = watcher.clone();
+                let exes = cx
+                    .background_spawn(async move { crate::backend_lock(&watcher).running_exes() })
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.handle_running_exes(&exes, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Matches running executables against Game Profiles and queues profile switches.
+    ///
+    /// The process watcher calls this every [`PROCESS_POLL_INTERVAL`]; tests call it directly.
+    pub fn handle_running_exes(&mut self, running: &HashSet<String>, cx: &mut Context<Self>) {
+        let matched = self
+            .config
+            .match_running_game(running)
+            .map(|p| p.id.clone());
+        let mut changed = false;
+        if matched != self.active_game {
+            self.active_game = matched;
+            self.applied_targets.clear();
+            self.auto_switch_note = None;
+            changed = true;
+        }
+        if !self.config.auto_switch_enabled || self.is_loading {
+            if changed {
+                cx.notify();
+            }
+            return;
+        }
+        let targets = match self.active_game.as_deref() {
+            Some(id) => self
+                .config
+                .game_profile(id)
+                .map_or_default(|p| p.device_targets.clone()),
+            None => self.config.default_targets.clone(),
+        };
+        let device_ids: Vec<DeviceId> = self.devices.iter().map(|d| d.id().clone()).collect();
+        for device in device_ids {
+            let key = device.as_str().to_owned();
+            let Some(&slot) = targets.get(&key) else {
+                continue;
+            };
+            if self.applied_targets.get(&key) == Some(&slot) || self.pending_targets.contains(&key)
+            {
+                continue;
+            }
+            if self.current_slot(&device) == Some(slot) {
+                self.applied_targets.insert(key, slot);
+                continue;
+            }
+            if let Some(job) = self.profile_switch_job(&device, slot, true) {
+                self.pending_targets.insert(key);
+                self.queue.push_back(job);
+                changed = true;
+            } else {
+                self.applied_targets.insert(key, slot);
+            }
+        }
+        if changed {
+            self.pump_queue(cx);
+            cx.notify();
+        }
+    }
+
+    /// The device's active profile slot: onboard for hardware profiles, host-managed otherwise.
+    pub fn current_slot(&self, device: &DeviceId) -> Option<u8> {
+        let snapshot = self.device(device)?;
+        if let Some(profiles) = &snapshot.profiles {
+            return Some(profiles.snapshot.active_slot.index());
+        }
+        self.config
+            .software_profiles
+            .get(device.as_str())
+            .map(|sw| sw.active_slot)
+    }
+
+    /// Builds the job that activates `slot` on `device`, or `None` when nothing needs writing.
+    ///
+    /// An unattended switch never sends the flash-erasing all-keys actuation write in live
+    /// mode; that part of a software preset needs the user's confirmation.
+    pub(crate) fn profile_switch_job(
+        &mut self,
+        device: &DeviceId,
+        slot: u8,
+        is_automatic: bool,
+    ) -> Option<WriteJob> {
+        let snapshot = self.device(device)?;
+        if snapshot.profiles.is_some() {
+            return Some(WriteJob {
+                device: device.clone(),
+                changes: vec![SettingChange::Profile(ProfileSlot::new(slot))],
+                origin: JobOrigin::ProfileSwitch {
+                    slot,
+                    is_software: false,
+                    is_automatic,
+                },
+            });
+        }
+        let model_name = snapshot.info.model_name.clone();
+        let preset = self
+            .config
+            .ensure_software_profiles(device)
+            .slots
+            .iter()
+            .find(|s| s.slot == slot)
+            .map_or_default(|s| s.saved.clone());
+        let skip_actuation = is_automatic && !self.dry_run;
+        let changes = profile_bar::preset_changes(&preset, !skip_actuation);
+        if skip_actuation && preset.global_actuation.is_some() {
+            self.auto_switch_note = Some(
+                format!(
+                    "{model_name}: the preset’s actuation depth wasn’t written automatically. Switch the preset from the device page to write it."
+                )
+                .into(),
+            );
+        }
+        if changes.is_empty() {
+            self.config.ensure_software_profiles(device).active_slot = slot;
+            self.save_config();
+            return None;
+        }
+        Some(WriteJob {
+            device: device.clone(),
+            changes,
+            origin: JobOrigin::ProfileSwitch {
+                slot,
+                is_software: true,
+                is_automatic,
+            },
+        })
+    }
+
+    // ---- Control events --------------------------------------------------------------
+
+    pub(crate) fn on_slider(
+        &mut self,
+        role: SliderRole,
+        value: f32,
+        released: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match role {
+            SliderRole::Travel
+            | SliderRole::RtPress
+            | SliderRole::RtRelease
+            | SliderRole::DeadzoneTop
+            | SliderRole::DeadzoneBottom => {
+                hall_effect_panel::on_slider(self, role, value, cx);
+            }
+            SliderRole::Brightness
+            | SliderRole::Speed
+            | SliderRole::Hue
+            | SliderRole::Saturation
+            | SliderRole::Value => {
+                rgb_panel::on_slider(self, role, value, released, window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn on_input(
+        &mut self,
+        role: InputRole,
+        event: &InputEvent,
+        value: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match role {
+            InputRole::Hex => rgb_panel::on_hex_input(self, event, &value, window, cx),
+            InputRole::KeySearch => {
+                if matches!(event, InputEvent::Change) {
+                    self.keymap_ui.search = value;
+                    cx.notify();
+                }
+            }
+            InputRole::GameSearch => {
+                if matches!(event, InputEvent::Change) {
+                    self.games_ui.search = value;
+                    cx.notify();
+                }
+            }
+            InputRole::Rename
+            | InputRole::ManualName
+            | InputRole::ManualExe
+            | InputRole::ProfileExe => {
+                if let InputEvent::PressEnter { .. } = event {
+                    game_profiles_view::on_enter(self, role, window, cx);
+                }
+            }
+        }
+    }
+
+    // ---- Header and chrome -----------------------------------------------------------
+
     fn request_dry_run_change(
         &mut self,
         dry_run: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_busy || self.is_loading || dry_run == self.dry_run {
+        if self.has_pending_writes() || self.is_loading || dry_run == self.dry_run {
             return;
         }
         if dry_run {
@@ -464,6 +1306,7 @@ impl AgnoPeriphApp {
         } else {
             Tag::warning().small().child("Writes go to devices")
         };
+        let locked = self.has_pending_writes() || self.is_loading;
 
         h_flex()
             .id("header")
@@ -477,8 +1320,9 @@ impl AgnoPeriphApp {
             .bg(theme.title_bar)
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_2()
                     .min_w_0()
+                    .child(logo_mark(theme))
                     .child(
                         div()
                             .text_base()
@@ -487,6 +1331,7 @@ impl AgnoPeriphApp {
                     )
                     .child(
                         div()
+                            .ml_1()
                             .text_sm()
                             .text_color(theme.muted_foreground)
                             .child(device_count_label(self.devices.len())),
@@ -499,7 +1344,7 @@ impl AgnoPeriphApp {
                         Switch::new("dry-run")
                             .label("Dry run")
                             .checked(self.dry_run)
-                            .disabled(self.is_busy || self.is_loading)
+                            .disabled(locked)
                             .tooltip("Validate and log writes without sending them to devices")
                             .on_change(cx.listener(|this, checked: &bool, window, cx| {
                                 this.request_dry_run_change(*checked, window, cx);
@@ -514,7 +1359,7 @@ impl AgnoPeriphApp {
                             .icon(IconName::RefreshCw)
                             .label("Refresh")
                             .loading(self.is_loading)
-                            .disabled(self.is_busy)
+                            .disabled(self.has_pending_writes())
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     )
                     .child(
@@ -547,15 +1392,9 @@ impl AgnoPeriphApp {
             )
     }
 
-    fn render_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        let content = v_flex()
-            .id("workspace")
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .p_6()
-            .gap_6()
+    fn render_notices(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .gap_3()
             .when_some(self.banner.clone(), |this, banner| {
                 this.child(
                     h_flex()
@@ -585,15 +1424,23 @@ impl AgnoPeriphApp {
                         ))
                         .test_support(),
                 )
-            });
+            })
+    }
 
-        let body = match self.selected_device() {
-            Some(device) => self.render_device(device, cx).into_any_element(),
-            None if !self.has_loaded => loading_state(theme).into_any_element(),
-            None => self.render_empty_state(cx).into_any_element(),
+    fn render_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let background = cx.theme().background;
+        let notices = self.render_notices(cx);
+        let body = match self.route {
+            Route::GameProfiles => game_profiles_view::render(self, cx).into_any_element(),
+            Route::Device => match self.selected_device().cloned() {
+                Some(device) => self.render_device(&device, cx).into_any_element(),
+                None if !self.has_loaded => loading_state(cx.theme()).into_any_element(),
+                None => self.render_empty_state(cx).into_any_element(),
+            },
         };
-
-        content.child(body).overflow_y_scrollbar()
+        let content = v_flex().p_6().gap_6().child(notices).child(body);
+        self.smooth_scroll
+            .wrap("workspace", content, background, cx)
     }
 
     fn render_device(
@@ -611,54 +1458,127 @@ impl AgnoPeriphApp {
             facts.push(format!("Firmware {firmware}").into());
         }
         facts.push(format!("{:04X}:{:04X}", info.vid, info.pid).into());
+        let caps = device.capabilities;
+        let is_keyboard = caps.has_hall_effect()
+            || caps.has_keymap()
+            || caps.has_macros()
+            || caps.has_keyboard_config();
 
-        let header = v_flex()
-            .gap_1()
+        let header = h_flex()
+            .gap_4()
+            .items_start()
+            .justify_between()
             .child(
-                h_flex()
-                    .gap_3()
+                v_flex()
+                    .gap_1()
+                    .min_w_0()
                     .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(info.model_name.clone()),
+                        h_flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(info.model_name.clone()),
+                            )
+                            .when(device.is_preview, |this| {
+                                this.child(
+                                    Tag::info()
+                                        .small()
+                                        .child("Dry-run preview, device unchanged"),
+                                )
+                            }),
                     )
-                    .when(device.is_preview, |this| {
-                        this.child(
-                            Tag::info()
-                                .small()
-                                .child("Dry-run preview, device unchanged"),
-                        )
-                    }),
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .children(facts),
+                    ),
             )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .children(facts),
+            .when(
+                caps.has_hall_effect() && device.hall_effect.is_some(),
+                |this| {
+                    this.child(
+                        Button::new("open-calibration")
+                            .outline()
+                            .small()
+                            .icon(IconName::Frame)
+                            .label("Calibrate…")
+                            .disabled(self.is_busy())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                calibration::open(this, window, cx);
+                            })),
+                    )
+                },
             );
 
-        let caps = device.capabilities;
-        v_flex()
-            .gap_8()
+        let mut body = v_flex()
+            .gap_6()
             .child(header)
+            .child(profile_bar::render(self, device, cx))
             .children(device.warnings.iter().map(|warning| {
                 let id = ElementId::Name(
                     format!("device-warning-{}-{}", device.id(), warning.capability).into(),
                 );
                 Alert::warning(id, warning.message.clone())
                     .title(format!("{} partly loaded", warning.capability))
-            }))
-            .when(caps.has_pointer(), |this| {
-                this.child(pointer_panel::render(self, device, cx))
+            }));
+
+        if caps.has_pointer() {
+            body = body.child(pointer_panel::render(self, device, cx));
+        }
+        if is_keyboard {
+            body = body.child(self.render_keyboard(device, cx));
+        } else if caps.has_rgb() {
+            body = body.child(rgb_panel::render(self, device, cx));
+        }
+        body
+    }
+
+    fn render_keyboard(
+        &self,
+        device: &DeviceSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let caps = device.capabilities;
+        let tabs: Vec<KeyboardTab> = KeyboardTab::ALL
+            .into_iter()
+            .filter(|tab| match tab {
+                KeyboardTab::Triggers => caps.has_hall_effect(),
+                KeyboardTab::Keybinds => caps.has_keymap(),
+                KeyboardTab::Lighting => caps.has_rgb(),
+                KeyboardTab::Macros => caps.has_macros(),
+                KeyboardTab::Advanced => caps.has_keyboard_config(),
             })
-            .when(caps.has_hall_effect(), |this| {
-                this.child(hall_effect_panel::render(self, device, cx))
-            })
-            .when(caps.has_rgb(), |this| {
-                this.child(rgb_panel::render(self, device, cx))
-            })
+            .collect();
+        let current = if tabs.contains(&self.keyboard_tab) {
+            self.keyboard_tab
+        } else {
+            tabs.first().copied().unwrap_or(KeyboardTab::Triggers)
+        };
+        let selected_ix = tabs.iter().position(|t| *t == current).unwrap_or(0);
+        let tab_list = tabs.clone();
+        let bar = TabBar::new("keyboard-tabs")
+            .underline()
+            .selected_index(selected_ix)
+            .children(tabs.iter().map(|tab| Tab::new().label(tab.label())))
+            .on_click(cx.listener(move |this, ix: &usize, _, cx| {
+                if let Some(tab) = tab_list.get(*ix) {
+                    this.set_keyboard_tab(*tab, cx);
+                }
+            }));
+        let panel = match current {
+            KeyboardTab::Triggers => hall_effect_panel::render(self, device, cx).into_any_element(),
+            KeyboardTab::Keybinds => keymap_panel::render(self, device, cx).into_any_element(),
+            KeyboardTab::Lighting => rgb_panel::render(self, device, cx).into_any_element(),
+            KeyboardTab::Macros => macro_panel::render(self, device, cx).into_any_element(),
+            KeyboardTab::Advanced => {
+                keyboard_config_panel::render(self, device, cx).into_any_element()
+            }
+        };
+        v_flex().gap_6().child(bar).child(panel)
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -697,6 +1617,24 @@ impl AgnoPeriphApp {
     }
 }
 
+/// Embedded AgnoPeriph brand mark, compiled into the binary so standalone executables
+/// always render the icon regardless of working directory.
+static LOGO_IMAGE: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../assets/logo.png").to_vec(),
+    ))
+});
+
+/// The header's brand mark.
+fn logo_mark(theme: &Theme) -> AnyElement {
+    img(LOGO_IMAGE.clone())
+        .id("app-logo")
+        .size_6()
+        .rounded(theme.radius)
+        .into_any_element()
+}
+
 fn device_count_label(count: usize) -> String {
     match count {
         0 => "No devices".to_owned(),
@@ -719,18 +1657,26 @@ fn loading_state(theme: &Theme) -> impl IntoElement + use<> {
 impl Render for AgnoPeriphApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let background = theme.background;
+        let foreground = theme.foreground;
+        if self.controls.is_none() {
+            return v_flex().size_full().bg(background).text_color(foreground);
+        }
+        let header = self.render_header(cx);
+        let sidebar = sidebar::render(self, cx);
+        let workspace = self.render_workspace(cx);
         v_flex()
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            .child(self.render_header(cx))
+            .bg(background)
+            .text_color(foreground)
+            .child(header)
             .child(
                 h_flex()
                     .items_stretch()
                     .flex_1()
                     .min_h_0()
-                    .child(sidebar::render(self, cx))
-                    .child(self.render_workspace(cx)),
+                    .child(sidebar)
+                    .child(workspace),
             )
             .when(self.is_inspector_open, |this| {
                 this.child(inspector_drawer::render(self, cx))
@@ -745,27 +1691,43 @@ pub(crate) fn section(
     description: &'static str,
     theme: &Theme,
 ) -> Stateful<Div> {
+    v_flex().id(id).gap_4().child(
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(description),
+            ),
+    )
+}
+
+/// A titled group inside a panel: a quiet surface with a hairline boundary.
+pub(crate) fn group(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
     v_flex()
         .id(id)
-        .gap_4()
-        .pt_6()
-        .border_t_1()
+        .gap_3()
+        .p_4()
+        .rounded(theme.radius_lg)
+        .border_1()
         .border_color(theme.border)
+        .bg(theme.group_box)
         .child(
-            v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .text_base()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(description),
-                ),
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title.into()),
         )
 }
 
@@ -789,4 +1751,17 @@ pub(crate) fn readout(value: impl Into<SharedString>, theme: &Theme) -> Div {
         .text_center()
         .font_family(theme.mono_font_family.clone())
         .child(value.into())
+}
+
+pub(crate) fn muted_note(text: impl Into<SharedString>, theme: &Theme) -> Div {
+    div()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(text.into())
+}
+
+/// Formats hundredths of a millimetre as `0.00`.
+pub(crate) fn mm(value: TravelHundredthsMm) -> String {
+    let raw = value.as_hundredths();
+    format!("{}.{:02}", raw / 100, raw % 100)
 }

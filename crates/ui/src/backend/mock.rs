@@ -51,10 +51,11 @@ impl MockCodec {
         change: &SettingChange,
         key_count: u16,
         previous_socd_len: usize,
+        previous_rs_len: usize,
     ) -> CoreResult<Vec<Vec<u8>>> {
         match self {
             Self::LamzuAtlantis(family) => encode_lamzu(family, change),
-            Self::AtkRs7 => encode_atk(change, key_count, previous_socd_len),
+            Self::AtkRs7 => encode_atk(change, key_count, previous_socd_len, previous_rs_len),
         }
     }
 }
@@ -117,6 +118,7 @@ fn encode_atk(
     change: &SettingChange,
     key_count: u16,
     previous_socd_len: usize,
+    previous_rs_len: usize,
 ) -> CoreResult<Vec<Vec<u8>>> {
     let payloads = match change {
         SettingChange::Actuation {
@@ -189,11 +191,17 @@ fn encode_atk(
             }
             frames
         }
-        SettingChange::RapidSwitch(pairs) => pairs
-            .iter()
-            .enumerate()
-            .map(|(ix, pair)| atk::req_rs_pair_set(u8::try_from(ix).unwrap_or(0), Some(pair)))
-            .collect::<CoreResult<Vec<_>>>()?,
+        SettingChange::RapidSwitch(pairs) => {
+            let mut frames: Vec<[u8; atk::RS7_PAYLOAD_LEN]> = pairs
+                .iter()
+                .enumerate()
+                .map(|(ix, pair)| atk::req_rs_pair_set(u8::try_from(ix).unwrap_or(0), Some(pair)))
+                .collect::<CoreResult<Vec<_>>>()?;
+            for ix in pairs.len()..previous_rs_len {
+                frames.push(atk::req_rs_pair_set(u8::try_from(ix).unwrap_or(0), None)?);
+            }
+            frames
+        }
         SettingChange::ModTap(binding) => {
             let (row, col) = atk::key_to_row_col(binding.key)?;
             vec![
@@ -455,13 +463,20 @@ impl PeripheralService for MockPeripheralService {
             .ok_or_else(|| ApplyError::rejected(CoreError::DeviceNotFound(device.to_string())))?;
 
         validate_change(&target.presented, &change).map_err(ApplyError::rejected)?;
-        let (key_count, previous_socd_len) =
-            target.presented.hall_effect.as_ref().map_or((0, 0), |he| {
-                (he.capabilities.key_count, he.snapshot.socd_pairs.len())
+        let (key_count, previous_socd_len, previous_rs_len) = target
+            .presented
+            .hall_effect
+            .as_ref()
+            .map_or((0, 0, 0), |he| {
+                (
+                    he.capabilities.key_count,
+                    he.snapshot.socd_pairs.len(),
+                    he.snapshot.rapid_switch_pairs.len(),
+                )
             });
         let frames = target
             .codec
-            .encode(&change, key_count, previous_socd_len)
+            .encode(&change, key_count, previous_socd_len, previous_rs_len)
             .map_err(ApplyError::rejected)?;
         for frame in frames {
             target
@@ -472,9 +487,15 @@ impl PeripheralService for MockPeripheralService {
 
         if dry_run {
             apply_change_to_snapshot(&mut target.presented, &change);
+            if matches!(change, SettingChange::ResetKeymap) {
+                target.presented.keymap = atk_rs7_snapshot().keymap;
+            }
             target.presented.is_preview = true;
         } else {
             apply_change_to_snapshot(&mut target.stored, &change);
+            if matches!(change, SettingChange::ResetKeymap) {
+                target.stored.keymap = atk_rs7_snapshot().keymap;
+            }
             target.presented = target.stored.clone();
         }
         Ok(target.presented.clone())
@@ -933,6 +954,7 @@ mod tests {
                 },
                 atk::RS7_KEY_COUNT,
                 0,
+                0,
             )
             .unwrap();
         assert_eq!(frames.len(), 9);
@@ -953,7 +975,7 @@ mod tests {
             active: 2,
         });
         let frames = MockCodec::LamzuAtlantis(AtlantisRateFamily::Wired)
-            .encode(&change, 0, 0)
+            .encode(&change, 0, 0, 0)
             .unwrap();
         assert_eq!(frames.len(), 1 + 4 * 2 + 1);
         let validator = atlantis::atlantis_validator();

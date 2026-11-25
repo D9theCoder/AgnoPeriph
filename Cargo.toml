@@ -34,6 +34,7 @@ sysinfo = { version = "0.33.1", default-features = false, features = ["system"] 
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.26.1"
 winreg = "0.55.0"
 
 [workspace.lints.rust]
