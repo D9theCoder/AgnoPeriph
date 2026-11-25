@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-// AGENTS.md requires importing GPUI through the Kit facade as `use gpui_kit::*;`.
+// The project guidelines require importing GPUI through the Kit facade as `use gpui_kit::*;`.
 #![allow(clippy::wildcard_imports)]
 
 use std::cell::RefCell;

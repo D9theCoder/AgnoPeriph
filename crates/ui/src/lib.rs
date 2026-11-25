@@ -6,7 +6,7 @@
 //! sign-in auto start) go through [`system::SystemIntegration`].
 
 #![forbid(unsafe_code)]
-// AGENTS.md requires importing GPUI through the Kit facade as `use gpui_kit::*;`.
+// The project guidelines require importing GPUI through the Kit facade as `use gpui_kit::*;`.
 #![allow(clippy::wildcard_imports)]
 // Views are declarative GPUI element trees; splitting them by line count hurts readability.
 #![allow(clippy::too_many_lines)]

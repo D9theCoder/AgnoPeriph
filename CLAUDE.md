@@ -1,6 +1,8 @@
-# AgnoPeriph — Engineering & Agent Guidelines (`AGENTS.md`)
+# AgnoPeriph — Engineering & Agent Guidelines (`CLAUDE.md`)
 
-This document is the authoritative contract for all work in **AgnoPeriph**. Every contributor and coding agent must follow these guidelines strictly unless the user explicitly overrides them.
+This document is the authoritative contract for all work in **AgnoPeriph**. Every contributor and coding agent must follow these guidelines strictly unless the user explicitly overrides them. It is the Claude-oriented variant of the project guidelines: it covers architecture, implementation, verification, and UI rules, with driver work driven only by published wire formats. See `GEMINI.md` for the fuller variant.
+
+This file is the authoritative project guideline for Claude. `GEMINI.md` is the Gemini CLI variant and is not part of Claude's context unless explicitly requested.
 
 ---
 
@@ -17,15 +19,15 @@ Target peripherals:
 ## 2. Non-Negotiable Safety Guardrails
 1. **Native Windows Only (`x86_64-pc-windows-msvc`):**
    - Always build, test, and run natively on Windows. Never run inside WSL.
-2. **NO Firmware Reverse Engineering or Modification:**
-   - Never dump, disassemble, decompile, patch, or flash device firmware, bootloaders, or DFU/IAP update modes.
+2. **No Firmware Modification or Flashing:**
+   - Never dump, patch, or flash device firmware, bootloaders, or DFU/IAP update modes.
 3. **Host-Side Runtime USB HID Only:**
    - Strictly use standard host-to-device USB HID `SET_REPORT`, `GET_REPORT`, and interrupt transfers (via `hidapi`) that mirror official runtime configuration commands.
 4. **Read-Only First & Safe-by-Default Testing:**
    - All live transport writes must pass through `agnoperiph_transport::GuardedTransport` with a `PacketValidator` enforcing exact packet length, allowed Report IDs, and checksum verification before any byte is sent to hardware.
    - Maintain a global `--dry-run` mode that still validates and logs outgoing packets (hex + metadata) without transmitting writes to physical devices.
    - For every new driver or device, verify **read-only** queries (device info, battery, current DPI/actuation) against live hardware before testing any write command.
-   - Never transmit guessed or undocumented opcodes to live hardware; every opcode must be backed by verified reference repos, recovered WebHID JS, or USBPcap captures.
+   - Never transmit guessed or undocumented opcodes to live hardware; every opcode must be backed by a documented open-source protocol implementation or official vendor documentation.
 5. **Hardware Isolation & Vendor App Hygiene:**
    - Implement and unit-test every packet encoder/decoder against `MockHidTransport` before running against physical peripherals.
    - Remind the user to fully exit all official vendor applications (**G Hub**, **ATK HUB**, **Lamzu software**, including system tray background processes) before any live HID session.
@@ -69,23 +71,15 @@ crates/cli           ──┼──▶ crates/drivers/* ──▶ crates/transp
 
 ---
 
-## 5. Protocol Discovery & `morluto/rea` MCP Rules
-Before writing any Rust driver code for newly discovered or undocumented commands, use the **`rea` MCP server** (`reverse-engineer-anything` skill) strictly within the allowed lanes below:
-
-### Allowed REA MCP Lanes & Tools ONLY
-1. **WebHID JavaScript Reconstruction (Preferred):** `javascript-applications.md`, `browser-observation`, `website-script-export`, `javascript-artifact-reconstruction` (`list_browser_targets`, `inspect_web_page`, `analyze_web_bundle`, `observe_web_session`, `export_web_scripts`, `analyze_javascript_application`, `trace_javascript_semantics`, `recover_javascript_sources`) on official WebHID configurators (e.g., ATK HUB WebHID, newer Lamzu web apps) to locate `sendReport` / `sendFeatureReport` / `inputreport` handlers, command IDs, report IDs, packet lengths, checksum formulas, and `mm`-to-byte conversion math.
-2. **USBPcap / Wireshark Analysis:** `pcap-analysis` and `packet-captures` (`inspect_packet_fields`, `inspect_packet_capture`, `inspect_pcap_capture`) on user-supplied `.pcapng` captures to filter outgoing `SET_REPORT` / `URB_INTERRUPT out` frames for the target `Bus.Device` and diff payloads across setting changes.
-3. **Electron Observation (Fallback Only):** `electron-observation` (`list_electron_targets`, `inspect_electron_page`, `capture_electron_scenario`) if a feature only exists in an Electron desktop client's JS layer.
-
-### Forbidden REA Lanes
-- **NEVER** load or invoke Ghidra, IDA, Hopper, Cutter, Frida, Android/iOS, native binary disassembly, or firmware analysis tools or references.
+## 5. Protocol Documentation & Reference Blueprints
+Driver work is driven only by published wire formats and documented protocol references.
 
 ### Mandatory Evidence Spec (`docs/protocols/<device>.md`)
-Every newly discovered protocol (starting with `docs/protocols/atk-rs7.md`) must be documented **before** Rust implementation with:
+Every newly implemented protocol (starting with `docs/protocols/atk-rs7.md`) must be documented **before** Rust implementation with:
 1. Exact VID, PID (wired vs. dongle), Usage Page, Usage ID, Report ID, and fixed packet size.
 2. Header bytes, endianness, padding, and exact checksum/CRC algorithm with a worked example.
 3. Separate tables for **Read** commands vs. **Write** commands.
-4. An **Evidence** section citing the exact recovered JS snippet and/or raw captured hex frames (request + response) proving every byte offset. Never guess or interpolate undocumented offsets.
+4. An **Evidence** section citing the upstream reference source (repository, file, and symbol) or vendor documentation that proves every byte offset. Never guess or interpolate undocumented offsets.
 
 ### Open-Source Reference Blueprints
 Study and port documented wire formats from:
@@ -94,6 +88,8 @@ Study and port documented wire formats from:
 - Lamzu CompX vs. Aurora: `https://github.com/qu1ncky/BatteryTray`
 - ATK Keyboards (`0xFF01`): `https://github.com/bsdrop/atk68`
 - Logitech HID++ 1.0/2.0: `https://github.com/libratbag/libratbag`, `https://github.com/pwr-Solaar/Solaar`, `https://github.com/Gianlz/pxmouse`
+
+If a wire format is not covered by these references, stop and ask the user for documentation rather than probing live hardware.
 
 ---
 
@@ -138,7 +134,7 @@ How it works, so nobody has to rediscover it:
 Work one phase at a time and wait for user confirmation between phases:
 1. **Phase 1:** Workspace scaffold, `crates/core` traits + models, `crates/transport` (`hidapi`, `GuardedTransport`, `MockHidTransport`), `agnoperiph-cli list` & `probe`.
 2. **Phase 2:** `driver-logitech` & `driver-lamzu` (mock-first tests → read-only live probe → safe write validation).
-3. **Phase 3:** ATK RS7 protocol discovery via `rea`, `docs/protocols/atk-rs7.md`, `driver-atk` with fixture tests, live CLI validation.
+3. **Phase 3:** ATK RS7 protocol implementation from documented references, `docs/protocols/atk-rs7.md`, `driver-atk` with fixture tests, live CLI validation.
 4. **Phase 4:** `crates/ui` with `gpui-kit` (device sidebar, capability-driven mouse & ATK RS7 Hall Effect editors, collapsible live HID packet inspector).
 
 Before completing any phase or milestone, run and verify:
