@@ -4,8 +4,11 @@
 //! render their physical keycaps; any other Hall Effect keyboard automatically falls back to a
 //! generic grid driven by `HallEffectCapabilities::key_count`.
 
+use std::sync::{Arc, LazyLock};
+
 use agnoperiph_core::{DeviceInfo, HallEffectCapabilities, KeyIndex};
 use agnoperiph_driver_atk::protocol::{ATK_RS7_PID, ATK_VID, RS7_KEY_COUNT};
+use gpui_kit::SharedString;
 
 /// Matrix columns per row for the RS7 layout and generic fallback grid.
 pub const MATRIX_COLS: u16 = 16;
@@ -34,7 +37,7 @@ impl KeyCap {
 #[non_exhaustive]
 pub struct LayoutKey {
     pub index: KeyIndex,
-    pub label: String,
+    pub label: SharedString,
     /// Keycap width in hundredths of a unit (`100` = 1u).
     pub width: u16,
     /// Empty space before the keycap in hundredths of a unit.
@@ -48,32 +51,36 @@ pub struct KeyLayout {
     pub rows: Vec<Vec<LayoutKey>>,
 }
 
+static CACHED_RS7_LAYOUT: LazyLock<Arc<KeyLayout>> = LazyLock::new(|| {
+    let rows = RS7_LAYOUT
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cap| LayoutKey {
+                    index: cap.index(),
+                    label: SharedString::new_static(cap.label),
+                    width: cap.width,
+                    gap: cap.gap,
+                })
+                .collect()
+        })
+        .collect();
+    Arc::new(KeyLayout { rows })
+});
+
 impl KeyLayout {
     /// Builds the best layout for `info` and `caps`, falling back to a generic capability-driven
     /// grid whenever the device has no dedicated physical layout.
-    pub fn for_device(info: &DeviceInfo, caps: &HallEffectCapabilities) -> Self {
+    pub fn for_device(info: &DeviceInfo, caps: &HallEffectCapabilities) -> Arc<Self> {
         if info.vid == ATK_VID && info.pid == ATK_RS7_PID && caps.key_count == RS7_KEY_COUNT {
-            return Self::rs7();
+            return Arc::clone(&CACHED_RS7_LAYOUT);
         }
-        Self::generic(caps.key_count)
+        Arc::new(Self::generic(caps.key_count))
     }
 
-    /// Physical ATK RS7 75% layout.
-    pub fn rs7() -> Self {
-        let rows = RS7_LAYOUT
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|cap| LayoutKey {
-                        index: cap.index(),
-                        label: cap.label.to_owned(),
-                        width: cap.width,
-                        gap: cap.gap,
-                    })
-                    .collect()
-            })
-            .collect();
-        Self { rows }
+    /// Physical ATK RS7 75% layout (cached across frames).
+    pub fn rs7() -> Arc<Self> {
+        Arc::clone(&CACHED_RS7_LAYOUT)
     }
 
     /// Generic grid layout covering `0..key_count` in rows of [`MATRIX_COLS`].
@@ -88,7 +95,7 @@ impl KeyLayout {
             }
             current.push(LayoutKey {
                 index: KeyIndex::new(ix),
-                label: format!("R{row}C{col}"),
+                label: format!("R{row}C{col}").into(),
                 width: 100,
                 gap: 0,
             });
@@ -100,7 +107,7 @@ impl KeyLayout {
     }
 
     /// Human-readable label for `key` within this layout, falling back to matrix coordinates.
-    pub fn label(&self, key: KeyIndex) -> String {
+    pub fn label(&self, key: KeyIndex) -> SharedString {
         for row in &self.rows {
             if let Some(cap) = row.iter().find(|cap| cap.index == key) {
                 return cap.label.clone();
@@ -111,6 +118,7 @@ impl KeyLayout {
             key.value() / MATRIX_COLS,
             key.value() % MATRIX_COLS
         )
+        .into()
     }
 }
 

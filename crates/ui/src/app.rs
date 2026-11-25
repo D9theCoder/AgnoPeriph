@@ -86,6 +86,8 @@ pub struct AgnoPeriphApp {
     is_inspector_open: bool,
     banner: Option<Banner>,
     packets: Vec<PacketTraceEntry>,
+    formatted_packets: Arc<Vec<inspector_drawer::FormattedPacket>>,
+    suppressed_packets: usize,
     /// Highest packet sequence number explicitly cleared by the user; any older frames
     /// arriving from an in-flight refresh or write are dropped.
     cleared_through_sequence: u64,
@@ -124,6 +126,8 @@ impl AgnoPeriphApp {
             is_inspector_open: true,
             banner: None,
             packets: Vec::new(),
+            formatted_packets: Arc::new(Vec::new()),
+            suppressed_packets: 0,
             cleared_through_sequence: 0,
             selected_key: KeyIndex::new(0),
             key_draft: KeyDraft::default(),
@@ -176,6 +180,14 @@ impl AgnoPeriphApp {
         &self.packets
     }
 
+    pub(crate) fn formatted_packets(&self) -> &Arc<Vec<inspector_drawer::FormattedPacket>> {
+        &self.formatted_packets
+    }
+
+    pub(crate) fn suppressed_packets(&self) -> usize {
+        self.suppressed_packets
+    }
+
     /// Re-enumerates devices. Previous data stays visible until the reply lands.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let service = self.service.clone();
@@ -221,6 +233,12 @@ impl AgnoPeriphApp {
             .into_iter()
             .filter(|entry| entry.sequence > self.cleared_through_sequence)
             .collect();
+        self.suppressed_packets = self
+            .packets
+            .iter()
+            .filter(|p| p.outcome == agnoperiph_transport::PacketOutcome::DryRunSuppressed)
+            .count();
+        self.formatted_packets = Arc::new(inspector_drawer::format_packets(&self.packets));
     }
 
     fn finish_refresh(
@@ -385,6 +403,8 @@ impl AgnoPeriphApp {
             self.cleared_through_sequence = self.cleared_through_sequence.max(last.sequence);
         }
         self.packets.clear();
+        self.suppressed_packets = 0;
+        self.formatted_packets = Arc::new(Vec::new());
         // Clearing only touches the sink's internal log buffer, never the HID state mutex.
         self.service.clear_packet_log();
         cx.notify();

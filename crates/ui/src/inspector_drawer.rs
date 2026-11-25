@@ -1,38 +1,82 @@
 //! Collapsible live HID packet inspector docked below the workspace.
+//!
+//! Packets are pre-formatted once when the trace log changes and rendered through a
+//! virtualized [`uniform_list`] so hundreds of frames stay within high-refresh frame budgets.
+
+use std::sync::Arc;
 
 use agnoperiph_transport::{PacketDirection, PacketOutcome, PacketTraceEntry};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable, Theme,
     button::{Button, ButtonVariants},
     h_flex,
-    scroll::ScrollableElement,
     tag::Tag,
     v_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::AgnoPeriphApp;
 
-/// Newest frames rendered; older ones stay in the bounded service log.
+/// Newest frames retained for display; older ones stay in the bounded service log.
 const VISIBLE_ROWS: usize = 200;
+
+/// Pre-formatted packet row cached on [`AgnoPeriphApp`] to avoid per-frame string allocations.
+#[derive(Debug, Clone)]
+pub(crate) struct FormattedPacket {
+    sequence: u64,
+    sequence_label: SharedString,
+    direction: &'static str,
+    kind: SharedString,
+    outcome: PacketOutcome,
+    outcome_label: SharedString,
+    payload: SharedString,
+    device_label: SharedString,
+    aria_label: SharedString,
+}
+
+/// Formats packets newest-first for virtualized rendering.
+pub(crate) fn format_packets(packets: &[PacketTraceEntry]) -> Vec<FormattedPacket> {
+    packets
+        .iter()
+        .rev()
+        .take(VISIBLE_ROWS)
+        .map(|entry| {
+            let direction = match entry.direction {
+                PacketDirection::HostToDevice => "TX",
+                PacketDirection::DeviceToHost => "RX",
+            };
+            let hex = entry.hex_spaced();
+            let payload: SharedString = match &entry.note {
+                Some(note) => format!("{hex}  ·  {note}").into(),
+                None => hex.into(),
+            };
+            FormattedPacket {
+                sequence: entry.sequence,
+                sequence_label: entry.sequence.to_string().into(),
+                direction,
+                kind: entry.kind.to_string().into(),
+                outcome: entry.outcome,
+                outcome_label: entry.outcome.to_string().into(),
+                payload,
+                device_label: entry.device_label.clone().into(),
+                aria_label: format!(
+                    "{direction} {} {} packet {}",
+                    entry.kind, entry.outcome, entry.sequence
+                )
+                .into(),
+            }
+        })
+        .collect()
+}
 
 pub(crate) fn render(
     app: &AgnoPeriphApp,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let packets = app.packets();
+    let total = app.packets().len();
+    let suppressed = app.suppressed_packets();
+    let rows = Arc::clone(app.formatted_packets());
     let theme = cx.theme();
-    let rows: Vec<AnyElement> = packets
-        .iter()
-        .rev()
-        .take(VISIBLE_ROWS)
-        .map(|entry| render_row(entry, theme).into_any_element())
-        .collect();
-    let suppressed = packets
-        .iter()
-        .filter(|p| p.outcome == PacketOutcome::DryRunSuppressed)
-        .count();
 
     let header = h_flex()
         .flex_shrink_0()
@@ -55,7 +99,7 @@ pub(crate) fn render(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(packet_summary(packets.len(), suppressed)),
+                        .child(packet_summary(total, suppressed)),
                 ),
         )
         .child(
@@ -67,7 +111,7 @@ pub(crate) fn render(
                         .xsmall()
                         .icon(IconName::Delete)
                         .label("Clear")
-                        .disabled(packets.is_empty())
+                        .disabled(total == 0)
                         .on_click(cx.listener(|this, _, _, cx| this.clear_packets(cx))),
                 )
                 .child(
@@ -88,14 +132,16 @@ pub(crate) fn render(
             .child("No packets yet. Frames appear here as devices are read and changed.")
             .into_any_element()
     } else {
-        v_flex()
-            .id("inspector-rows")
-            .flex_1()
-            .min_h_0()
-            .py_1()
-            .children(rows)
-            .overflow_y_scrollbar()
-            .into_any_element()
+        let count = rows.len();
+        uniform_list("inspector-rows", count, move |range, _, cx| {
+            let theme = cx.theme();
+            range.map(|ix| render_row(&rows[ix], theme)).collect()
+        })
+        .flex_1()
+        .min_h_0()
+        .size_full()
+        .py_1()
+        .into_any_element()
     };
 
     v_flex()
@@ -118,32 +164,25 @@ fn packet_summary(total: usize, suppressed: usize) -> String {
     }
 }
 
-fn outcome_tag(outcome: PacketOutcome) -> Tag {
+fn outcome_tag(outcome: PacketOutcome, label: SharedString) -> Tag {
     let tag = match outcome {
         PacketOutcome::Transmitted | PacketOutcome::Received => Tag::secondary(),
         PacketOutcome::DryRunSuppressed => Tag::info(),
         PacketOutcome::ValidationFailed => Tag::danger(),
     };
-    tag.xsmall().child(outcome.to_string())
+    tag.xsmall().child(label)
 }
 
-fn render_row(entry: &PacketTraceEntry, theme: &Theme) -> impl IntoElement + use<> {
-    let direction = match entry.direction {
-        PacketDirection::HostToDevice => "TX",
-        PacketDirection::DeviceToHost => "RX",
-    };
+fn render_row(entry: &FormattedPacket, theme: &Theme) -> impl IntoElement + use<> {
     let mono = theme.mono_font_family.clone();
 
     h_flex()
         .id(("packet", entry.sequence))
-        .aria_label(format!(
-            "{direction} {} {} packet {}",
-            entry.kind, entry.outcome, entry.sequence
-        ))
+        .aria_label(entry.aria_label.clone())
+        .h_6()
         .px_4()
-        .py_0p5()
         .gap_3()
-        .items_start()
+        .items_center()
         .text_xs()
         .child(
             div()
@@ -152,36 +191,35 @@ fn render_row(entry: &PacketTraceEntry, theme: &Theme) -> impl IntoElement + use
                 .text_right()
                 .font_family(mono.clone())
                 .text_color(theme.muted_foreground)
-                .child(entry.sequence.to_string()),
+                .child(entry.sequence_label.clone()),
         )
         .child(
             div()
                 .w_6()
                 .flex_shrink_0()
                 .font_family(mono.clone())
-                .child(direction),
+                .child(entry.direction),
         )
         .child(
             div()
                 .w_16()
                 .flex_shrink_0()
                 .text_color(theme.muted_foreground)
-                .child(entry.kind.to_string()),
+                .child(entry.kind.clone()),
         )
         .child(
             div()
                 .w_20()
                 .flex_shrink_0()
-                .child(outcome_tag(entry.outcome)),
+                .child(outcome_tag(entry.outcome, entry.outcome_label.clone())),
         )
         .child(
-            v_flex()
+            div()
                 .flex_1()
                 .min_w_0()
-                .child(div().font_family(mono).child(entry.hex_spaced()))
-                .when_some(entry.note.clone(), |this, note| {
-                    this.child(div().text_color(theme.muted_foreground).child(note))
-                }),
+                .truncate()
+                .font_family(mono)
+                .child(entry.payload.clone()),
         )
         .child(
             div()
