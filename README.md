@@ -4,6 +4,7 @@
 Replace half a dozen bloated, telemetry-heavy vendor suites with a single GPU-accelerated Rust desktop manager and headless CLI.
 
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x86__64-0078D4)](#quick-start)
+[![Latest Windows Release](https://img.shields.io/github/v/release/D9theCoder/AgnoPeriph?label=download%20.exe&color=2EA043)](https://github.com/D9theCoder/AgnoPeriph/releases/latest)
 [![Built with Rust](https://img.shields.io/badge/Rust-Edition%202024-orange)](#architecture)
 [![UI: gpui-kit](https://img.shields.io/badge/UI-gpui--kit%20%2F%20gpui--fast-6E56CF)](#why-agnoperiph)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
@@ -54,7 +55,13 @@ AgnoPeriph targets documented host-side runtime USB HID protocols only — **no 
 
 > **Important before connecting live hardware:** Fully exit all official vendor apps (**G Hub**, **Razer Synapse**, **ATK HUB**, **Lamzu**, **Pulsar**, **Wootility**, **Endgame Gear**, etc. — including background tray icons) so they do not contend for exclusive HID interfaces.
 
-### Requirements
+### Download Installer (Recommended)
+Grab the latest Windows x64 installer (`.exe`) directly from **[GitHub Releases](https://github.com/D9theCoder/AgnoPeriph/releases/latest)**:
+
+- **[Download AgnoPeriph-Setup-x64.exe](https://github.com/D9theCoder/AgnoPeriph/releases/latest/download/AgnoPeriph-Setup-x64.exe)** — installs both the desktop app (`agnoperiph.exe`) and headless CLI (`agnoperiph-cli.exe`).
+
+### Build from Source
+#### Requirements
 - **Windows 10 / 11 (`x86_64-pc-windows-msvc`)** — native build only (do not run inside WSL).
 - **Rust toolchain** (Edition 2024 / latest stable `rustup`).
 

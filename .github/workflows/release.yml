@@ -1,0 +1,92 @@
+name: Release Windows Installer
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-main
+  cancel-in-progress: false
+
+jobs:
+  release-windows:
+    name: Build & Publish Windows Installer (.exe)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (MSVC x64)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version and tag
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -Raw Cargo.toml
+          if ($cargoToml -match '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
+            $baseVersion = $Matches[1]
+          } else {
+            throw "Could not parse [workspace.package] version from Cargo.toml"
+          }
+          $runNumber = "${{ github.run_number }}"
+          $appVersion = "$baseVersion.$runNumber"
+          $releaseTag = "v$baseVersion-$runNumber"
+          "APP_VERSION=$appVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$releaseTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Resolved APP_VERSION=$appVersion RELEASE_TAG=$releaseTag"
+
+      - name: Build Windows release binaries
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p agnoperiph -p agnoperiph-cli
+
+      - name: Build Windows installer (.exe) with Inno Setup 6
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($cmd) {
+              $iscc = $cmd.Source
+            } else {
+              choco install innosetup -y --no-progress
+            }
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler (ISCC.exe) not found."
+          }
+
+          $repoRoot = (Get-Location).Path
+          & $iscc "/DAppVersion=$env:APP_VERSION" "/DRepoRoot=$repoRoot" "packaging\windows\agnoperiph.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC.exe failed with exit code $LASTEXITCODE"
+          }
+
+          $installer = Join-Path $repoRoot "dist\AgnoPeriph-Setup-x64.exe"
+          if (-not (Test-Path $installer)) {
+            throw "Expected installer not found at $installer"
+          }
+          Get-Item $installer | Format-List Name, Length
+
+      - name: Publish GitHub Release (.exe installer only)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$env:RELEASE_TAG" `
+            "dist\AgnoPeriph-Setup-x64.exe" `
+            --target "${{ github.sha }}" `
+            --title "AgnoPeriph $env:RELEASE_TAG" `
+            --generate-notes `
+            --latest
