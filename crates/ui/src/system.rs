@@ -59,6 +59,9 @@ pub trait SystemIntegration: Send + Sync {
 
     /// Displays a native desktop notification. Called from a background executor.
     fn send_notification(&self, title: &str, body: &str) -> Result<(), String>;
+
+    /// Opens `url` in the user's default browser.
+    fn open_url(&self, url: &str) -> Result<(), String>;
 }
 
 /// No-op integration for tests and previews: nothing leaves the process.
@@ -79,6 +82,10 @@ impl SystemIntegration for DetachedSystem {
     }
 
     fn send_notification(&self, _title: &str, _body: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn open_url(&self, _url: &str) -> Result<(), String> {
         Ok(())
     }
 }
@@ -247,6 +254,29 @@ impl SystemIntegration for WindowsSystem {
             Ok(())
         }
     }
+
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+
+            if !url.starts_with("https://") {
+                return Err("only https links can be opened".to_owned());
+            }
+            // `explorer.exe` hands the URL to the default browser without a shell to quote
+            // for, and it exits immediately instead of waiting for the browser.
+            Command::new("explorer.exe")
+                .arg(url)
+                .spawn()
+                .map(|_| ())
+                .map_err(|err| format!("open the download page: {err}"))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = url;
+            Err("opening links is only available on Windows".to_owned())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +303,22 @@ mod tests {
         assert!(!system.is_start_with_windows_enabled());
         assert!(system.save_config(&AppConfig::default()).is_ok());
         assert!(system.send_notification("Title", "Body").is_ok());
+        assert!(
+            system
+                .open_url("https://github.com/D9theCoder/AgnoPeriph")
+                .is_ok()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_only_opens_https_links() {
+        let system = WindowsSystem::new(None);
+        assert!(
+            system
+                .open_url("file:///C:/Windows/System32/calc.exe")
+                .is_err()
+        );
     }
 
     #[test]

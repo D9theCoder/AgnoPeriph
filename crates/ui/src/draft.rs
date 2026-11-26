@@ -546,19 +546,10 @@ impl DeviceDraft {
             for (key, point) in &self.actuation {
                 by_point.entry(*point).or_default().push(*key);
             }
-            // One value for every key, counting keys already there, is a global write.
-            let is_uniform = |point: TravelHundredthsMm| {
-                he.snapshot
-                    .keys
-                    .iter()
-                    .all(|k| self.actuation.get(&k.key).copied().unwrap_or(k.actuation) == point)
-            };
             for (point, keys) in by_point {
                 let change = match keys.as_slice() {
-                    _ if total > 1 && is_uniform(point) => SettingChange::Actuation {
-                        target: ActuationTarget::AllKeys,
-                        point,
-                    },
+                    // Scope follows the edited keys, never the resulting table: a single
+                    // key that happens to make the board uniform is still one key.
                     [key] if total > 1 => SettingChange::Actuation {
                         target: ActuationTarget::Key(*key),
                         point,
@@ -804,6 +795,30 @@ mod tests {
             everything.actuation.insert(*key, t(90));
         }
         assert!(rewrites_all_keys(&everything.setting_changes(&kb)));
+    }
+
+    #[test]
+    fn last_odd_key_edit_stays_scoped_to_that_key() {
+        let mut kb = device(MOCK_KEYBOARD_ID);
+        let he = kb.hall_effect.as_mut().unwrap();
+        for config in &mut he.snapshot.keys {
+            config.actuation = t(120);
+        }
+        he.snapshot.keys[0].actuation = t(80);
+        let key = he.snapshot.keys[0].key;
+
+        let mut draft = DeviceDraft::default();
+        draft.actuation.insert(key, t(120));
+        let changes = draft.setting_changes(&kb);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            changes[0].1,
+            SettingChange::Actuation {
+                target: ActuationTarget::Key(k),
+                point,
+            } if k == key && point == t(120)
+        ));
+        assert!(!rewrites_all_keys(&changes));
     }
 
     #[test]

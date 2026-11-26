@@ -1,8 +1,9 @@
 //! Persistent navigation: connected peripherals, the Game Profiles manager and app preferences.
 
 use agnoperiph_core::{BatteryStatus, ChargingState, DeviceId};
+
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Selectable, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     scroll::ScrollableElement,
@@ -15,6 +16,7 @@ use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, Route};
 use crate::backend::DeviceSnapshot;
+use crate::updates::CURRENT_VERSION;
 
 /// Stable element id for a device row, derived from its domain [`DeviceId`].
 pub fn device_element_id(device: &DeviceId) -> ElementId {
@@ -58,6 +60,7 @@ pub(crate) fn render(
     let close_to_tray = app.config().close_to_tray;
     let start_with_windows = app.config().start_with_windows;
     let low_battery_alerts = app.config().low_battery_alerts;
+    let checking_updates = app.is_checking_updates();
     let theme = cx.theme();
     let muted = theme.muted_foreground;
 
@@ -169,6 +172,29 @@ pub(crate) fn render(
                                 .on_change(cx.listener(|this, checked: &bool, _, cx| {
                                     this.set_low_battery_alerts(*checked, cx);
                                 })),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("v{CURRENT_VERSION}")),
+                                )
+                                .child(
+                                    Button::new("check-updates")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Check for updates")
+                                        .loading(checking_updates)
+                                        .disabled(checking_updates)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.check_for_updates(true, cx);
+                                        })),
+                                ),
                         ),
                 ),
         )

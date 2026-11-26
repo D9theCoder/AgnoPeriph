@@ -40,6 +40,7 @@ pub mod sidebar;
 mod smooth_scroll;
 pub mod system;
 pub mod tray_model;
+pub mod updates;
 
 pub use app::{AgnoPeriphApp, AppOptions, Banner, KeyboardTab, Route};
 pub use hall_effect_panel::snap_travel;

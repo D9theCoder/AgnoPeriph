@@ -31,6 +31,7 @@ use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
 use crate::key_tester::TesterUi;
 use crate::smooth_scroll::{ScrollIds, SmoothScroll};
 use crate::system::{DetachedSystem, SystemIntegration};
+use crate::updates::{GithubReleases, ReleaseSource, UpdateUi};
 use crate::{
     calibration, game_profiles_view, hall_effect_panel, inspector_drawer, keyboard_config_panel,
     keymap_panel, macro_panel, pointer_panel, profile_bar, rgb_panel, sidebar,
@@ -168,6 +169,8 @@ pub struct AppOptions {
     discover_games: GameDiscovery,
     watch_processes: bool,
     show_dev_tools: bool,
+    check_updates: bool,
+    releases: Arc<dyn ReleaseSource>,
 }
 
 impl std::fmt::Debug for AppOptions {
@@ -175,6 +178,7 @@ impl std::fmt::Debug for AppOptions {
         f.debug_struct("AppOptions")
             .field("watch_processes", &self.watch_processes)
             .field("show_dev_tools", &self.show_dev_tools)
+            .field("check_updates", &self.check_updates)
             .finish_non_exhaustive()
     }
 }
@@ -187,6 +191,8 @@ impl Default for AppOptions {
             discover_games: Arc::new(Vec::new),
             watch_processes: false,
             show_dev_tools: true,
+            check_updates: false,
+            releases: Arc::new(GithubReleases::default()),
         }
     }
 }
@@ -200,6 +206,8 @@ impl AppOptions {
             discover_games: Arc::new(crate::game_profiles::discover_installed_games),
             watch_processes: true,
             show_dev_tools: cfg!(debug_assertions),
+            check_updates: true,
+            releases: Arc::new(GithubReleases::default()),
         }
     }
 
@@ -230,6 +238,18 @@ impl AppOptions {
         self.watch_processes = enabled;
         self
     }
+
+    /// Whether the app checks for a newer release when it starts.
+    pub fn with_update_check(mut self, enabled: bool) -> Self {
+        self.check_updates = enabled;
+        self
+    }
+
+    /// Replaces the release source, for tests and previews.
+    pub fn with_release_source(mut self, source: Arc<dyn ReleaseSource>) -> Self {
+        self.releases = source;
+        self
+    }
 }
 
 /// The AgnoPeriph main window.
@@ -257,6 +277,8 @@ pub struct AgnoPeriphApp {
     is_inspector_open: bool,
     reconnect_attempts: u8,
     banner: Option<Banner>,
+    pub(crate) releases: Arc<dyn ReleaseSource>,
+    pub(crate) updates: UpdateUi,
     packets: Vec<PacketTraceEntry>,
     formatted_packets: Arc<Vec<inspector_drawer::FormattedPacket>>,
     suppressed_packets: usize,
@@ -331,6 +353,7 @@ impl AgnoPeriphApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let dry_run = service.is_dry_run();
+        let check_updates = options.check_updates;
         crate::shortcuts::bind_keys(cx);
         let theme_subscription = cx.observe_global::<Theme>(|_, cx| cx.notify());
         let mut app = Self {
@@ -350,6 +373,8 @@ impl AgnoPeriphApp {
             is_inspector_open: options.show_dev_tools,
             reconnect_attempts: 0,
             banner: None,
+            releases: options.releases,
+            updates: UpdateUi::default(),
             packets: Vec::new(),
             formatted_packets: Arc::new(Vec::new()),
             suppressed_packets: 0,
@@ -394,6 +419,9 @@ impl AgnoPeriphApp {
             app.watcher = Some(Self::spawn_process_watcher(cx));
         }
         app.refresh(cx);
+        if check_updates {
+            app.check_for_updates(false, cx);
+        }
         app
     }
 
@@ -1640,6 +1668,17 @@ impl AgnoPeriphApp {
         cx.notify();
     }
 
+    pub(crate) fn show_banner(
+        &mut self,
+        title: impl Into<SharedString>,
+        message: impl Into<SharedString>,
+    ) {
+        self.banner = Some(Banner {
+            title: title.into(),
+            message: message.into(),
+        });
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let shortcuts = crate::dirty_bar::shortcuts_button(self, cx);
         let theme = cx.theme();
@@ -1741,8 +1780,10 @@ impl AgnoPeriphApp {
     }
 
     fn render_notices(&self, cx: &mut Context<Self>) -> Div {
+        let update = crate::updates::render_notice(self, cx);
         v_flex()
             .gap_3()
+            .when_some(update, gpui_kit::ParentElement::child)
             .when_some(self.banner.clone(), |this, banner| {
                 this.child(
                     h_flex()
@@ -1788,7 +1829,10 @@ impl AgnoPeriphApp {
             .pt_4()
             .pb_6()
             .gap_4()
-            .when(self.banner.is_some(), |this| this.child(notices))
+            .when(
+                self.banner.is_some() || self.update_available().is_some(),
+                |this| this.child(notices),
+            )
             .child(body);
         self.smooth_scroll.wrap(
             ScrollIds {

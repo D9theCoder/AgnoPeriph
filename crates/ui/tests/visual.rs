@@ -22,7 +22,7 @@ use agnoperiph::backend::{
     MOCK_KEYBOARD_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID,
     MockPeripheralService, PeripheralService,
 };
-use agnoperiph::key_tester::{LIVE_POLL_INTERVAL, TesterSource};
+use agnoperiph::key_tester::LIVE_POLL_INTERVAL;
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, device_element_id};
 use agnoperiph_core::{DeviceId, KeyIndex, KeyTravelSample, TravelHundredthsMm};
 use gpui_kit::component::{Theme, ThemeMode};
@@ -198,18 +198,22 @@ fn open_with(
     service: MockPeripheralService,
     height: f32,
 ) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
+    open_with_options(cx, service, height, AppOptions::default())
+}
+
+fn open_with_options(
+    cx: &mut HeadlessAppContext,
+    service: MockPeripheralService,
+    height: f32,
+    options: AppOptions,
+) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
     cx.update(gpui_kit::init);
     let service: Arc<dyn PeripheralService> = Arc::new(service);
     // Mount `Root` as `gpui_kit::open_window` does, so dialogs and popovers have their layers.
     let mut built = None;
     let window = cx
         .open_window(size(px(WIDTH), px(height)), |window, cx| {
-            let view = AgnoPeriphApp::build(
-                service,
-                AppOptions::default().with_dev_tools(false),
-                window,
-                cx,
-            );
+            let view = AgnoPeriphApp::build(service, options.with_dev_tools(false), window, cx);
             built = Some(view.clone());
             cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
         })
@@ -475,7 +479,7 @@ fn capture_live_tester_screens() {
                 TravelHundredthsMm::from_hundredths(180),
             )],
         );
-        let (handle, app) = open_with(&mut cx, service, HEIGHT);
+        let (handle, _app) = open_with(&mut cx, service, HEIGHT);
         set_theme(&mut cx, handle, mode);
         click(&mut cx, handle, device_element_id(&keyboard));
         open_tab(&mut cx, handle, KeyboardTab::Triggers);
@@ -486,13 +490,36 @@ fn capture_live_tester_screens() {
             click(&mut cx, handle, "press-sensitivity-inc");
             click(&mut cx, handle, "release-sensitivity-inc");
         }
-        cx.update(|cx| {
-            app.update(cx, |app, cx| app.set_tester_source(TesterSource::Live, cx));
-        });
         for _ in 0..6 {
             cx.advance_clock(LIVE_POLL_INTERVAL);
             settle(&mut cx, handle);
         }
         save(&mut cx, handle, &format!("live-tester-{suffix}"));
+    }
+}
+
+struct FixedReleases(Option<agnoperiph::updates::UpdateInfo>);
+
+impl agnoperiph::updates::ReleaseSource for FixedReleases {
+    fn latest(&self) -> Result<Option<agnoperiph::updates::UpdateInfo>, String> {
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_update_screen() {
+    let mut cx = headless();
+    let releases = Arc::new(FixedReleases(Some(agnoperiph::updates::UpdateInfo::new(
+        "9.9.9",
+        "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9",
+    ))));
+    let options = AppOptions::default()
+        .with_update_check(true)
+        .with_release_source(releases);
+    let (handle, _) = open_with_options(&mut cx, MockPeripheralService::new(), HEIGHT, options);
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("update-{suffix}"));
     }
 }

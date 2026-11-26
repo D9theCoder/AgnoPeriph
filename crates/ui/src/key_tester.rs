@@ -1,23 +1,15 @@
 //! Hall Effect key tester: shows one key's travel against its actuation point, dead zones
-//! and Rapid Trigger band, using live readings when the keyboard reports them and a
-//! simulated press otherwise. It always reflects unsaved edits, because it reads the same
-//! draft-applied values as the editors.
+//! and Rapid Trigger band, using live readings from the keyboard. It always reflects
+//! unsaved edits, because it reads the same draft-applied values as the editors.
 //!
-//! Live readings are polled only while Live is on, the Triggers tab of a keyboard that
-//! advertises live travel is showing and the window is open, so an idle app sends no
-//! HID traffic.
+//! Live readings are polled only while the Triggers tab of a keyboard that advertises
+//! live travel is showing and the window is open, so an idle app sends no HID traffic.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use agnoperiph_core::{KeyIndex, KeyTravelSample, RapidTriggerConfig, TravelHundredthsMm};
-use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable,
-    button::{Button, ButtonGroup},
-    h_flex,
-    tag::Tag,
-    v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Sizable, h_flex, tag::Tag, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -29,16 +21,6 @@ use crate::keymap::KeyLayout;
 pub const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Samples kept for the travel trace.
 const TRACE_LEN: usize = 48;
-/// Depth change per simulated press step, in hundredths of a millimetre.
-const SIM_STEP: u16 = 20;
-
-/// What the tester reads its travel from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TesterSource {
-    #[default]
-    Simulated,
-    Live,
-}
 
 /// The values that decide when a key is pressed, all in hundredths of a millimetre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,8 +90,6 @@ pub fn is_pressed(trace: impl IntoIterator<Item = u16>, params: &TriggerParams) 
 /// Tester state owned by the app.
 #[derive(Default)]
 pub(crate) struct TesterUi {
-    pub(crate) source: TesterSource,
-    sim_depth: u16,
     trace: VecDeque<u16>,
     /// Key the live readings last moved; the tester follows it.
     live_key: Option<KeyIndex>,
@@ -125,7 +105,6 @@ pub(crate) struct TesterUi {
 impl std::fmt::Debug for TesterUi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TesterUi")
-            .field("source", &self.source)
             .field("is_polling", &self.poll.is_some())
             .finish_non_exhaustive()
     }
@@ -140,7 +119,6 @@ impl TesterUi {
     }
 
     pub(crate) fn reset(&mut self) {
-        self.sim_depth = 0;
         self.trace.clear();
         self.live_key = None;
         self.live_samples.clear();
@@ -165,29 +143,12 @@ impl AgnoPeriphApp {
         self.tester.live_polls
     }
 
-    pub fn tester_source(&self) -> TesterSource {
-        self.tester.source
-    }
-
     fn should_poll_live(&self) -> bool {
-        self.tester.source == TesterSource::Live
-            && self.route() == Route::Device
+        self.route() == Route::Device
             && self.keyboard_tab() == KeyboardTab::Triggers
             && self.has_live_travel()
             && self.has_window()
             && !self.is_calibrating()
-    }
-
-    pub fn set_tester_source(&mut self, source: TesterSource, cx: &mut Context<Self>) {
-        if source == TesterSource::Live && !self.has_live_travel() {
-            return;
-        }
-        if self.tester.source != source {
-            self.tester.source = source;
-            self.tester.reset();
-        }
-        self.update_live_polling(cx);
-        cx.notify();
     }
 
     /// Starts or stops the live poll so it runs exactly while [`Self::should_poll_live`].
@@ -271,11 +232,8 @@ impl AgnoPeriphApp {
                 self.tester.push_trace(depth);
             }
             Err(err) => {
-                // Fall back to the simulated tester instead of retrying a failing read.
-                self.tester.source = TesterSource::Simulated;
                 self.tester.reset();
-                self.tester.live_error =
-                    Some(format!("Live travel stopped: {err}. Showing the simulation.").into());
+                self.tester.live_error = Some(format!("Live travel stopped: {err}.").into());
                 self.tester.poll = None;
                 self.tester.run += 1;
             }
@@ -283,40 +241,17 @@ impl AgnoPeriphApp {
         cx.notify();
     }
 
-    fn step_simulated_depth(&mut self, direction: i32, cx: &mut Context<Self>) {
-        let Some(max) = self
-            .hall_effect_state()
-            .map(|he| he.capabilities.actuation_max.as_hundredths())
-        else {
-            return;
-        };
-        let next = (i32::from(self.tester.sim_depth) + direction * i32::from(SIM_STEP))
-            .clamp(0, i32::from(max));
-        self.tester.sim_depth = u16::try_from(next).unwrap_or(0);
-        let depth = self.tester.sim_depth;
-        self.tester.push_trace(depth);
-        cx.notify();
-    }
-
     pub fn tester_key(&self) -> KeyIndex {
-        match self.tester.source {
-            TesterSource::Live => self.tester.live_key.unwrap_or(self.selected_key),
-            TesterSource::Simulated => self.selected_key,
-        }
+        self.tester.live_key.unwrap_or(self.selected_key)
     }
 
     pub fn tester_depth(&self) -> u16 {
-        match self.tester.source {
-            TesterSource::Simulated => self.tester.sim_depth,
-            TesterSource::Live => {
-                let key = self.tester_key();
-                self.tester
-                    .live_samples
-                    .iter()
-                    .find(|s| s.key == key)
-                    .map_or(0, |s| s.travel.as_hundredths())
-            }
-        }
+        let key = self.tester_key();
+        self.tester
+            .live_samples
+            .iter()
+            .find(|s| s.key == key)
+            .map_or(0, |s| s.travel.as_hundredths())
     }
 }
 
@@ -349,9 +284,11 @@ pub(crate) fn render(
     he: &HallEffectState,
     layout: &KeyLayout,
     cx: &mut Context<AgnoPeriphApp>,
-) -> impl IntoElement + use<> {
-    let has_live = he.capabilities.has_live_travel();
-    let source = app.tester.source;
+) -> AnyElement {
+    // Boards without live travel have nothing to show: drop the column entirely.
+    if !he.capabilities.has_live_travel() {
+        return div().into_any_element();
+    }
     let key = app.tester_key();
     let depth = app.tester_depth();
     let params = params_for(he, key);
@@ -369,33 +306,6 @@ pub(crate) fn render(
     });
     let live_error = app.tester.live_error.clone();
     let theme = cx.theme();
-
-    let source_toggle = ButtonGroup::new("tester-source")
-        .outline()
-        .xsmall()
-        .child(
-            Button::new("tester-sim")
-                .label("Simulated")
-                .selected(source == TesterSource::Simulated)
-                .tooltip("Step through the values shown. Nothing is sent")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_tester_source(TesterSource::Simulated, cx);
-                })),
-        )
-        .child(
-            Button::new("tester-live")
-                .label("Live")
-                .selected(source == TesterSource::Live)
-                .disabled(!has_live)
-                .tooltip(if has_live {
-                    "Read key travel from the keyboard while this tab is open"
-                } else {
-                    "This keyboard doesn’t report live key travel"
-                })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_tester_source(TesterSource::Live, cx);
-                })),
-        );
 
     let bar = div()
         .id("tester-meter")
@@ -477,34 +387,7 @@ pub(crate) fn render(
             Tag::primary().xsmall().child("Pressed")
         } else {
             Tag::secondary().xsmall().child("Released")
-        }))
-        .when(source == TesterSource::Simulated, |this| {
-            this.child(
-                h_flex()
-                    .mt_auto()
-                    .gap_1()
-                    .child(
-                        Button::new("tester-lift")
-                            .outline()
-                            .xsmall()
-                            .label("Lift")
-                            .disabled(depth == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step_simulated_depth(-1, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("tester-press")
-                            .outline()
-                            .xsmall()
-                            .label("Press")
-                            .disabled(depth >= params.max_travel)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.step_simulated_depth(1, cx);
-                            })),
-                    ),
-            )
-        });
+        }));
 
     let trace_view = h_flex()
         .id("tester-trace")
@@ -545,10 +428,10 @@ pub(crate) fn render(
         format!("Actuates at {} mm · RT off", hundredths(params.actuation))
     };
     // One note line: a read error wins, then the live prompt, then the trigger summary.
-    let note: SharedString = match (&live_error, source, app.tester.live_key) {
-        (Some(err), _, _) => err.clone(),
-        (None, TesterSource::Live, None) => "Press any key on the keyboard.".into(),
-        _ => legend.into(),
+    let note: SharedString = match (&live_error, app.tester.live_key) {
+        (Some(err), _) => err.clone(),
+        (None, None) => "Press any key on the keyboard.".into(),
+        (None, Some(_)) => legend.into(),
     };
 
     v_flex()
@@ -556,6 +439,7 @@ pub(crate) fn render(
         .w_40()
         .flex_shrink_0()
         .gap_2()
+        .test_support()
         .child(
             h_flex()
                 .min_h_6()
@@ -567,7 +451,7 @@ pub(crate) fn render(
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Key tester"),
                 )
-                .child(source_toggle),
+                .child(Tag::secondary().xsmall().child("Live")),
         )
         .child(
             h_flex()
@@ -587,12 +471,8 @@ pub(crate) fn render(
                 .child(readout),
         )
         .child(trace_view)
-        .child(
-            muted_note(note, theme)
-                .id("tester-note")
-                .whitespace_nowrap()
-                .truncate(),
-        )
+        .child(muted_note(note, theme).id("tester-note"))
+        .into_any_element()
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use agnoperiph::backend::{
 };
 use agnoperiph::draft::ChangeId;
 use agnoperiph::game_profiles::{DetectedGame, GameSource};
-use agnoperiph::key_tester::{LIVE_POLL_INTERVAL, TesterSource};
+use agnoperiph::key_tester::LIVE_POLL_INTERVAL;
 use agnoperiph::quick_presets::QuickPreset;
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, Route, device_element_id};
 use agnoperiph_core::{
@@ -1200,7 +1200,7 @@ fn release_build_options_hide_developer_tools(cx: &mut TestAppContext) {
 fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let service: Arc<dyn PeripheralService> = Arc::new(MockPeripheralService::new());
-    let (handle, _app) = cx.update(|cx| {
+    let (handle, app) = cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -1223,6 +1223,11 @@ fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
     });
     settle(cx, handle);
     click(cx, handle, device_element_id(&keyboard()));
+    settle(cx, handle);
+    assert!(
+        cx.update(|cx| app.read(cx).has_live_travel()),
+        "mock keyboard must report live travel"
+    );
     // `visible()` is true for a partly clipped element, so check whole bounds too.
     let on_screen = |cx: &mut TestAppContext, id: ElementId| {
         let found = cx
@@ -1247,7 +1252,7 @@ fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
         "deadzone-bottom-inc".into(),
         "release-sensitivity-inc".into(),
         "actuation-all-keys".into(),
-        "tester-press".into(),
+        "key-tester".into(),
     ] {
         on_screen(cx, id);
     }
@@ -1328,17 +1333,23 @@ fn configured_socd_entry_keeps_remove_clear_of_its_modes(cx: &mut TestAppContext
 
 struct RecordingSystem {
     notifications: std::sync::Mutex<Vec<(String, String)>>,
+    opened: std::sync::Mutex<Vec<String>>,
 }
 
 impl RecordingSystem {
     fn new() -> Self {
         Self {
             notifications: std::sync::Mutex::new(Vec::new()),
+            opened: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn take(&self) -> Vec<(String, String)> {
         std::mem::take(&mut *self.notifications.lock().unwrap())
+    }
+
+    fn take_opened(&self) -> Vec<String> {
+        std::mem::take(&mut *self.opened.lock().unwrap())
     }
 }
 
@@ -1361,6 +1372,20 @@ impl agnoperiph::system::SystemIntegration for RecordingSystem {
             .unwrap()
             .push((title.to_owned(), body.to_owned()));
         Ok(())
+    }
+
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        self.opened.lock().unwrap().push(url.to_owned());
+        Ok(())
+    }
+}
+
+/// A release source that never touches the network.
+struct FixedReleases(Option<agnoperiph::updates::UpdateInfo>);
+
+impl agnoperiph::updates::ReleaseSource for FixedReleases {
+    fn latest(&self) -> Result<Option<agnoperiph::updates::UpdateInfo>, String> {
+        Ok(self.0.clone())
     }
 }
 
@@ -1409,6 +1434,54 @@ fn game_profile_switch_sends_batched_windows_notification(cx: &mut TestAppContex
     app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
     settle(cx, handle);
     assert_eq!(system.take(), Vec::<(String, String)>::new());
+}
+
+#[gpui_kit::test]
+fn auto_update_check_offers_download_and_dismiss(cx: &mut TestAppContext) {
+    let system = Arc::new(RecordingSystem::new());
+    let release_url = "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9";
+    let releases = Arc::new(FixedReleases(Some(agnoperiph::updates::UpdateInfo::new(
+        "9.9.9",
+        release_url,
+    ))));
+    let options = AppOptions::default()
+        .with_system(system.clone())
+        .with_update_check(true)
+        .with_release_source(releases);
+    let (handle, app) = open_app_with(cx, MockPeripheralService::new(), options);
+    settle(cx, handle);
+
+    cx.update(|cx| {
+        let update = app
+            .read(cx)
+            .update_available()
+            .expect("the startup check must offer 9.9.9");
+        assert_eq!(update.version(), "9.9.9");
+    });
+
+    click(cx, handle, "update-download");
+    assert_eq!(system.take_opened(), [release_url.to_owned()]);
+
+    click(cx, handle, "update-dismiss");
+    assert!(cx.update(|cx| app.read(cx).update_available().is_none()));
+}
+
+#[gpui_kit::test]
+fn manual_update_check_stays_quiet_when_the_build_is_current(cx: &mut TestAppContext) {
+    let system = Arc::new(RecordingSystem::new());
+    let releases = Arc::new(FixedReleases(None));
+    let options = AppOptions::default()
+        .with_system(system.clone())
+        .with_release_source(releases);
+    let (handle, app) = open_app_with(cx, MockPeripheralService::new(), options);
+
+    click(cx, handle, "check-updates");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(!app.is_checking_updates());
+        assert!(app.update_available().is_none());
+    });
+    assert_eq!(system.take_opened(), Vec::<String>::new());
 }
 
 fn device_snapshot(
@@ -1858,9 +1931,7 @@ fn live_key_tester_polls_only_while_visible(cx: &mut TestAppContext) {
     let polls = |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).live_travel_polls());
     let polling = |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).is_live_polling());
     assert!(cx.update(|cx| app.read(cx).has_live_travel()));
-    assert_eq!(polls(cx), 0);
 
-    click(cx, handle, "tester-live");
     for _ in 0..3 {
         cx.executor().advance_clock(LIVE_POLL_INTERVAL);
         settle(cx, handle);
@@ -1881,41 +1952,13 @@ fn live_key_tester_polls_only_while_visible(cx: &mut TestAppContext) {
     assert!(!polling(cx));
     assert_eq!(polls(cx), stopped);
 
-    // Back on Triggers it resumes; the simulated source stops it again.
+    // Back on Triggers it resumes.
     open_tab(cx, handle, KeyboardTab::Triggers);
     assert!(polling(cx));
-    click(cx, handle, "tester-sim");
-    assert!(!polling(cx));
-    assert_eq!(
-        cx.update(|cx| app.read(cx).tester_source()),
-        TesterSource::Simulated
-    );
 
     // Leaving the device stops it too.
-    click(cx, handle, "tester-live");
-    assert!(polling(cx));
     click(cx, handle, device_element_id(&DeviceId::new(MOCK_MOUSE_ID)));
     assert!(!polling(cx));
-}
-
-#[gpui_kit::test]
-fn simulated_tester_steps_the_selected_key(cx: &mut TestAppContext) {
-    let (handle, app) = open_app(cx, MockPeripheralService::new());
-    click(cx, handle, device_element_id(&keyboard()));
-    click(cx, handle, key_id(KEY_E));
-    assert!(is_disabled(cx, handle, "tester-lift"));
-    click(cx, handle, "tester-press");
-    click(cx, handle, "tester-press");
-    cx.update(|cx| {
-        let app = app.read(cx);
-        assert_eq!(app.tester_key(), KeyIndex::new(KEY_E));
-        assert!(app.tester_depth() > 0);
-    });
-    let depth = cx.update(|cx| app.read(cx).tester_depth());
-    click(cx, handle, "tester-lift");
-    assert!(cx.update(|cx| app.read(cx).tester_depth()) < depth);
-    // Simulation never touches the device.
-    assert!(!is_dirty(cx, &app));
 }
 
 #[gpui_kit::test]
@@ -2147,7 +2190,7 @@ fn rewriting_every_key_asks_first_from_the_bar_and_the_guard(cx: &mut TestAppCon
     click(cx, handle, "ok");
     cx.update(|cx| {
         app.update(cx, |app, cx| {
-            app.load_quick_preset(QuickPreset::FpsLowActuation, cx);
+            app.load_quick_preset(QuickPreset::Typing, cx);
         });
     });
     settle(cx, handle);
@@ -2178,7 +2221,9 @@ fn rewriting_every_key_asks_first_from_the_bar_and_the_guard(cx: &mut TestAppCon
 
     // Confirmed through the guard, it writes and then switches.
     cx.update(|cx| {
-        app.update(cx, |app, cx| app.load_quick_preset(QuickPreset::Typing, cx));
+        app.update(cx, |app, cx| {
+            app.load_quick_preset(QuickPreset::FpsLowActuation, cx);
+        });
     });
     settle(cx, handle);
     click(cx, handle, device_element_id(&mouse));
