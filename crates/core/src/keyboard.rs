@@ -141,6 +141,17 @@ pub struct MacroSlot {
     pub index: u8,
     pub name: String,
     pub steps: Vec<MacroStep>,
+    /// How many times the macro replays when triggered; `1` plays it once.
+    #[serde(default = "default_macro_repeat")]
+    pub repeat: u8,
+    /// The device stores events this driver cannot re-encode (mouse buttons, media keys),
+    /// so the slot is listed by name with no steps and must be saved back unchanged.
+    #[serde(default)]
+    pub is_readonly: bool,
+}
+
+const fn default_macro_repeat() -> u8 {
+    1
 }
 
 impl MacroSlot {
@@ -149,7 +160,19 @@ impl MacroSlot {
             index,
             name: name.into(),
             steps,
+            repeat: 1,
+            is_readonly: false,
         }
+    }
+
+    pub const fn with_repeat(mut self, repeat: u8) -> Self {
+        self.repeat = repeat;
+        self
+    }
+
+    pub const fn with_readonly(mut self, is_readonly: bool) -> Self {
+        self.is_readonly = is_readonly;
+        self
     }
 }
 
@@ -159,6 +182,9 @@ impl MacroSlot {
 pub struct MacroCapabilities {
     pub max_slots: u8,
     pub max_buffer_bytes: u16,
+    /// Whether each slot stores a replay count (`MacroSlot::repeat`) on the device.
+    #[serde(default)]
+    pub supports_repeat: bool,
 }
 
 impl MacroCapabilities {
@@ -166,7 +192,13 @@ impl MacroCapabilities {
         Self {
             max_slots,
             max_buffer_bytes,
+            supports_repeat: false,
         }
+    }
+
+    pub const fn with_repeat_support(mut self, supports_repeat: bool) -> Self {
+        self.supports_repeat = supports_repeat;
+        self
     }
 }
 

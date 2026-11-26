@@ -2125,7 +2125,7 @@ impl Render for AgnoPeriphApp {
 pub(crate) fn section(
     id: &'static str,
     title: &'static str,
-    description: &'static str,
+    description: impl Into<SharedString>,
     theme: &Theme,
 ) -> Stateful<Div> {
     v_flex().id(id).gap_4().child(
@@ -2141,7 +2141,7 @@ pub(crate) fn section(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(description),
+                    .child(description.into()),
             ),
     )
 }

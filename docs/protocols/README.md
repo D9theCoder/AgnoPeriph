@@ -14,6 +14,7 @@ Before implementing Rust driver code for any newly discovered protocol or comman
 ## Specifications
 - `logitech-hidpp.md` — Logitech HID++ 1.0 / 2.0 mice & keyboards
 - `lamzu-compx.md` — Lamzu Atlantis CompX / Aurora mice
+- `lamzu-crystall.md` — Lamzu Crystal Wireless profile image & onboard macros (Mouse Drive 2.1.0.43)
 - `atk-rs7.md` — ATK RS7 / DuckBread (`0xFF60`) Hall Effect keyboards
 - `atk-mice.md` — ATK / VGN / VXE (`0x08` EEPROM) gaming mice
 - `atk-ff01.md` — ATK68 / ATK75 (`0xFF01` GTech) Hall Effect keyboards

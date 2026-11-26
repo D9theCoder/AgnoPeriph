@@ -631,6 +631,7 @@ fn heaviest_screens_render_within_the_main_thread_stack() {
         return;
     }
     let screens = [
+        "mouse_macro_cycle_times_stage_discard_and_save",
         "macros_edit_steps_and_save",
         "keyboard_tabs_switch_workspaces",
         "via_keyboard_without_hall_effect_lands_on_its_own_tabs",
@@ -656,6 +657,97 @@ fn heaviest_screens_render_within_the_main_thread_stack() {
         stdout.contains(&format!("{} passed", screens.len())),
         "not every screen ran:\n{stdout}"
     );
+}
+
+#[gpui_kit::test]
+fn mouse_macro_cycle_times_stage_discard_and_save(cx: &mut TestAppContext) {
+    use agnoperiph_driver_lamzu::atlantis::{self, Command as LamzuCommand};
+    use agnoperiph_driver_lamzu::crystall;
+
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    // The mouse offers only the Macros tab under its pointer settings.
+    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tabs(), [KeyboardTab::Macros]));
+    assert!(exists(cx, handle, "save-macros"));
+
+    let repeat = |cx: &mut TestAppContext| {
+        device_snapshot(cx, &app, &mouse()).macros.unwrap().slots[3].repeat
+    };
+    let draft_repeat =
+        |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).macro_slots()[3].repeat);
+    click(cx, handle, ("macro-slot", 3u64));
+    assert!(exists(cx, handle, ("macro-repeat-inc", 3u64)));
+    assert_eq!(repeat(cx), 3);
+
+    click(cx, handle, ("macro-repeat-inc", 3u64));
+    assert_eq!(draft_repeat(cx), 4);
+    // The device keeps its value until Save.
+    assert_eq!(repeat(cx), 3);
+    click(cx, handle, "discard-macros");
+    assert_eq!(draft_repeat(cx), 3);
+
+    click(cx, handle, ("macro-repeat-inc", 3u64));
+    cx.update(|cx| app.update(cx, AgnoPeriphApp::clear_packets));
+    click(cx, handle, "save-macros");
+    assert_eq!(repeat(cx), 4);
+    let binding = atlantis::encode_request(
+        LamzuCommand::WriteFlash,
+        crystall::key_slot_address(3).unwrap(),
+        &atlantis::seal_field(&crystall::macro_binding(3, 4)),
+    )
+    .unwrap()
+    .to_vec();
+    cx.update(|cx| {
+        let app = app.read(cx);
+        let writes: Vec<_> = app.packets().iter().map(|p| p.bytes.clone()).collect();
+        assert_eq!(writes, [binding]);
+    });
+
+    // An empty slot cannot store a cycle count, so its stepper waits for a step.
+    click(cx, handle, ("macro-slot", 6u64));
+    click(cx, handle, ("macro-repeat-inc", 6u64));
+    cx.update(|cx| assert_eq!(app.read(cx).macro_slots()[6].repeat, 1));
+}
+
+#[gpui_kit::test]
+fn mouse_button_macro_stays_readonly_and_survives_saves(cx: &mut TestAppContext) {
+    use agnoperiph_driver_lamzu::crystall;
+
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    let stored = |cx: &mut TestAppContext| device_snapshot(cx, &app, &mouse()).macros.unwrap();
+    assert!(stored(cx).slots[5].is_readonly);
+
+    click(cx, handle, ("macro-slot", 5u64));
+    assert!(is_disabled(cx, handle, "add-macro-step"));
+    assert!(is_disabled(cx, handle, "rename-macro"));
+    assert!(!exists(cx, handle, ("macro-repeat-inc", 5u64)));
+
+    // Saving an edit to another slot leaves slot 5's record and trigger alone.
+    click(cx, handle, ("macro-slot", 3u64));
+    click(cx, handle, ("macro-repeat-inc", 3u64));
+    cx.update(|cx| app.update(cx, AgnoPeriphApp::clear_packets));
+    click(cx, handle, "save-macros");
+    let slot5 = crystall::macro_slot_address(5).unwrap();
+    let slot5_end = slot5 + crystall::layout::MACRO_SLOT_STRIDE;
+    let key5 = crystall::key_slot_address(5).unwrap();
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(!app.packets().is_empty(), "slot 3 is saved");
+        assert!(app.packets().iter().all(|p| {
+            let address = u16::from_be_bytes([p.bytes[3], p.bytes[4]]);
+            !(slot5..slot5_end).contains(&address) && address != key5
+        }));
+    });
+    let after = stored(cx).slots[5].clone();
+    assert!(after.is_readonly && after.name == "spam click" && after.steps.is_empty());
+}
+
+#[gpui_kit::test]
+fn keyboard_macros_hide_cycle_times(cx: &mut TestAppContext) {
+    let (handle, _) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+    open_tab(cx, handle, KeyboardTab::Macros);
+    assert!(exists(cx, handle, ("macro-slot", 0u64)));
+    assert!(!exists(cx, handle, ("macro-repeat-inc", 0u64)));
 }
 
 #[gpui_kit::test]

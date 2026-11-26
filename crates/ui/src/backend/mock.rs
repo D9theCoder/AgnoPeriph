@@ -19,6 +19,7 @@ use agnoperiph_core::{
 };
 use agnoperiph_driver_atk::protocol as atk;
 use agnoperiph_driver_lamzu::atlantis::{self, AtlantisRateFamily, Command as LamzuCommand};
+use agnoperiph_driver_lamzu::crystall;
 use agnoperiph_transport::{
     FixedReportValidator, GuardedTransport, HidDeviceDescriptor, HidTransport, MockHidTransport,
     PacketSink, PacketTraceEntry, ReportKind,
@@ -70,7 +71,7 @@ impl MockCodec {
     /// Encodes the exact frame sequence the matching driver sends for `change`.
     fn encode(self, change: &SettingChange, current: &DeviceSnapshot) -> CoreResult<Vec<Vec<u8>>> {
         match self {
-            Self::LamzuAtlantis(family) => encode_lamzu(family, change),
+            Self::LamzuAtlantis(family) => encode_lamzu(family, change, current),
             Self::AtkRs7 => {
                 let (key_count, previous_socd_len, previous_rs_len) =
                     current.hall_effect.as_ref().map_or((0, 0, 0), |he| {
@@ -98,7 +99,84 @@ fn lamzu_flash_u8(address: u16, value: u8) -> CoreResult<Vec<u8>> {
     lamzu_write(address, &atlantis::seal_field(&[value]))
 }
 
-fn encode_lamzu(family: AtlantisRateFamily, change: &SettingChange) -> CoreResult<Vec<Vec<u8>>> {
+/// Splits one flash field into the ≤10-byte `WriteFlash` transfers the driver sends.
+fn lamzu_write_field(address: u16, data: &[u8]) -> CoreResult<Vec<Vec<u8>>> {
+    data.chunks(atlantis::ATLANTIS_MAX_PAYLOAD)
+        .enumerate()
+        .map(|(ix, chunk)| {
+            let offset = u16::try_from(ix * atlantis::ATLANTIS_MAX_PAYLOAD).unwrap_or(0);
+            lamzu_write(address.saturating_add(offset), chunk)
+        })
+        .collect()
+}
+
+/// Mirrors `write_macros`: per slot, contexts → name → trigger, skipping unchanged fields.
+fn encode_lamzu_macros(slots: &[MacroSlot], current: &DeviceSnapshot) -> CoreResult<Vec<Vec<u8>>> {
+    let previous = current
+        .macros
+        .as_ref()
+        .map_or(&[][..], |m| m.slots.as_slice());
+    let mut frames = Vec::new();
+    for slot in slots {
+        let index = slot.index;
+        let address = crystall::macro_slot_address(index)?;
+        let count_address = address + crystall::layout::CONTEXT_COUNT_OFFSET;
+        let before = previous.iter().find(|s| s.index == index);
+        // Validation only lets an unchanged read-only slot through, and the driver skips it.
+        if before.is_some_and(|s| s.is_readonly) {
+            continue;
+        }
+        let before_steps = before.map_or(&[][..], |s| s.steps.as_slice());
+        let before_name = before.filter(|s| !s.steps.is_empty()).map_or_else(
+            || crystall::encode_name(""),
+            |s| crystall::encode_name(&s.name),
+        );
+
+        if slot.steps.is_empty() {
+            if !before_steps.is_empty() {
+                frames.extend(lamzu_write_field(
+                    count_address,
+                    &atlantis::seal_field(&[0]),
+                )?);
+            }
+            if before_name.len() > 1 {
+                frames.extend(lamzu_write_field(address, &[0])?);
+            }
+            continue;
+        }
+
+        let contexts = crystall::encode_contexts(&slot.steps)?;
+        if contexts != crystall::encode_contexts(before_steps)? {
+            frames.extend(lamzu_write_field(
+                count_address,
+                &atlantis::seal_field(&contexts),
+            )?);
+        }
+        let name = crystall::encode_name(&slot.name);
+        if name != before_name {
+            frames.extend(lamzu_write_field(address, &name)?);
+        }
+        // The driver only refreshes a trigger that already carries a macro; a slot
+        // without one keeps its current button action.
+        let binding = crystall::macro_binding(index, slot.repeat);
+        let before_binding = before
+            .filter(|s| !s.steps.is_empty())
+            .map(|s| crystall::macro_binding(index, s.repeat));
+        if before_binding.is_some_and(|previous| previous != binding) {
+            frames.extend(lamzu_write_field(
+                crystall::key_slot_address(index)?,
+                &atlantis::seal_field(&binding),
+            )?);
+        }
+    }
+    Ok(frames)
+}
+
+fn encode_lamzu(
+    family: AtlantisRateFamily,
+    change: &SettingChange,
+    current: &DeviceSnapshot,
+) -> CoreResult<Vec<Vec<u8>>> {
     use atlantis::flash;
     let frames = match change {
         SettingChange::Pointer(PointerChange::ActiveDpiStage(stage_ix)) => {
@@ -144,6 +222,7 @@ fn encode_lamzu(family: AtlantisRateFamily, change: &SettingChange) -> CoreResul
                 atlantis::encode_request(LamzuCommand::WriteActiveProfile, 0, &[slot.index()])?;
             vec![frame.to_vec()]
         }
+        SettingChange::Macros(slots) => encode_lamzu_macros(slots, current)?,
         _ => return Err(CoreError::UnsupportedCapability("lamzu_setting")),
     };
     Ok(frames)
@@ -644,7 +723,7 @@ fn lamzu_atlantis_snapshot() -> DeviceSnapshot {
         atlantis::LAMZU_ATLANTIS_VID,
         0xF50D,
     )
-    .with_firmware_version("v1.24");
+    .with_firmware_version("v2.17");
 
     let capabilities = PointerCapabilities::new(
         flash::MIN_DPI,
@@ -699,7 +778,8 @@ fn lamzu_atlantis_snapshot() -> DeviceSnapshot {
         capabilities: Capabilities::empty()
             .with_pointer(true)
             .with_battery(true)
-            .with_profiles(true),
+            .with_profiles(true)
+            .with_macros(true),
         pointer: Some(PointerState {
             capabilities,
             snapshot: pointer,
@@ -717,10 +797,46 @@ fn lamzu_atlantis_snapshot() -> DeviceSnapshot {
             snapshot: profiles,
         }),
         keymap: None,
-        macros: None,
+        macros: Some(lamzu_macros()),
         keyboard_config: None,
         warnings: Vec::new(),
         is_preview: false,
+    }
+}
+
+/// Macros on the side buttons' key slots (3 = back, 4 = forward); the main buttons stay
+/// unbound. Slot 5 mirrors the captured `spam click` mouse-button macro, which is read-only.
+fn lamzu_macros() -> MacroState {
+    let mut slots: Vec<MacroSlot> = (0..crystall::layout::MACRO_SLOT_COUNT)
+        .map(|ix| MacroSlot::new(ix, "", Vec::new()))
+        .collect();
+    slots[3] = MacroSlot::new(
+        3,
+        "Burst",
+        vec![
+            MacroStep::new(MacroActionKind::KeyDown, 0x04, 20),
+            MacroStep::new(MacroActionKind::KeyUp, 0x04, 20),
+        ],
+    )
+    .with_repeat(3);
+    slots[4] = MacroSlot::new(
+        4,
+        "Jump crouch",
+        vec![
+            MacroStep::new(MacroActionKind::KeyDown, 0x2C, 10),
+            MacroStep::new(MacroActionKind::KeyDown, 0xE0, 30),
+            MacroStep::new(MacroActionKind::KeyUp, 0xE0, 0),
+            MacroStep::new(MacroActionKind::KeyUp, 0x2C, 0),
+        ],
+    );
+    slots[5] = MacroSlot::new(5, "spam click", Vec::new()).with_readonly(true);
+    MacroState {
+        capabilities: MacroCapabilities::new(
+            crystall::layout::MACRO_SLOT_COUNT,
+            u16::from(crystall::layout::MACRO_SLOT_COUNT) * crystall::layout::MACRO_SLOT_STRIDE,
+        )
+        .with_repeat_support(true),
+        slots,
     }
 }
 

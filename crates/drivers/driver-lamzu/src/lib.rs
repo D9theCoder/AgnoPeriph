@@ -4,6 +4,7 @@
 
 pub mod atlantis;
 pub mod aurora;
+pub mod crystall;
 
 use std::fmt;
 use std::sync::Arc;
@@ -11,9 +12,10 @@ use std::time::Duration;
 
 use agnoperiph_core::{
     BatteryMonitor, BatteryStatus, Capabilities, CoreError, CoreResult, DebounceMs, DeviceId,
-    DeviceInfo, DeviceMatchRule, DpiStage, DriverDescriptor, LiftOffDistance, Peripheral,
-    PointerCapabilities, PointerDevice, PointerSnapshot, PollingRateHz, ProfileCapabilities,
-    ProfileInfo, ProfileManager, ProfileMode, ProfileSlot, ProfileSnapshot, VendorKind,
+    DeviceInfo, DeviceMatchRule, DpiStage, DriverDescriptor, LiftOffDistance, MacroCapabilities,
+    MacroController, MacroSlot, Peripheral, PointerCapabilities, PointerDevice, PointerSnapshot,
+    PollingRateHz, ProfileCapabilities, ProfileInfo, ProfileManager, ProfileMode, ProfileSlot,
+    ProfileSnapshot, VendorKind,
 };
 use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
 
@@ -27,6 +29,16 @@ use crate::atlantis::{
 
 const READ_TIMEOUT: Duration = Duration::from_millis(600);
 const MAX_READ_ATTEMPTS: usize = 6;
+
+/// Returns true for firmware images that store the packed macro slots (`v2.x` and later).
+fn firmware_supports_macros(version: &str) -> bool {
+    version
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u16>().ok())
+        .is_some_and(|major| major >= 2)
+}
 
 /// Returns the declarative `DriverDescriptor` for registering Lamzu Atlantis wired and dongle PIDs.
 pub fn driver_descriptor() -> DriverDescriptor {
@@ -157,6 +169,16 @@ impl<T: HidTransport> LamzuAtlantisDevice<T> {
         // Read-only firmware query during open (non-fatal if dongle reports sleeping mouse).
         if let Ok(reply) = dev.send_command(Command::ReadFirmwareVersion, 0, &[], true) {
             dev.info.firmware_version = Some(decode_firmware(&reply.payload));
+        }
+        // The packed macro slots only exist from the v2 profile image onward; older
+        // firmwares use the compact map and must not receive these writes.
+        if dev
+            .info
+            .firmware_version
+            .as_deref()
+            .is_some_and(firmware_supports_macros)
+        {
+            dev.capabilities = dev.capabilities.with_macros(true);
         }
 
         Ok(dev)
@@ -310,6 +332,176 @@ impl<T: HidTransport> Peripheral for LamzuAtlantisDevice<T> {
     fn as_profiles_mut(&mut self) -> Option<&mut dyn ProfileManager> {
         Some(self)
     }
+
+    fn as_macros(&self) -> Option<&dyn MacroController> {
+        if self.capabilities.has_macros() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    fn as_macros_mut(&mut self) -> Option<&mut dyn MacroController> {
+        if self.capabilities.has_macros() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+/// A macro record as stored on the device, with erased header bytes read as empty.
+struct StoredMacro {
+    address: u16,
+    name: Vec<u8>,
+    /// Count byte followed by the contexts, without the checksum.
+    contexts: Vec<u8>,
+}
+
+impl StoredMacro {
+    fn count_address(&self) -> u16 {
+        self.address + crystall::layout::CONTEXT_COUNT_OFFSET
+    }
+
+    fn name_text(&self) -> String {
+        String::from_utf8_lossy(&self.name).into_owned()
+    }
+}
+
+impl<T: HidTransport> LamzuAtlantisDevice<T> {
+    fn read_stored_macro(&mut self, index: u8) -> CoreResult<StoredMacro> {
+        let address = crystall::macro_slot_address(index)?;
+        let name_len = crystall::header_len(
+            self.read_flash_raw(address, 1)?[0],
+            crystall::layout::NAME_MAX,
+        );
+        let name = if name_len == 0 {
+            Vec::new()
+        } else {
+            self.read_flash_raw(address + crystall::layout::NAME_OFFSET, name_len)?
+        };
+        let count_address = address + crystall::layout::CONTEXT_COUNT_OFFSET;
+        let count = crystall::header_len(
+            self.read_flash_raw(count_address, 1)?[0],
+            crystall::layout::CONTEXT_MAX,
+        );
+        let contexts = if count == 0 {
+            vec![0u8]
+        } else {
+            self.read_flash_checked(count_address, 1 + count * crystall::layout::CONTEXT_LEN)?
+        };
+        Ok(StoredMacro {
+            address,
+            name,
+            contexts,
+        })
+    }
+
+    fn read_key_binding(&mut self, index: u8) -> CoreResult<[u8; 3]> {
+        let raw = self.read_flash_checked(crystall::key_slot_address(index)?, 3)?;
+        Ok([raw[0], raw[1], raw[2]])
+    }
+}
+
+impl<T: HidTransport> MacroController for LamzuAtlantisDevice<T> {
+    fn macro_capabilities(&self) -> MacroCapabilities {
+        MacroCapabilities::new(
+            crystall::layout::MACRO_SLOT_COUNT,
+            u16::from(crystall::layout::MACRO_SLOT_COUNT) * crystall::layout::MACRO_SLOT_STRIDE,
+        )
+        .with_repeat_support(true)
+    }
+
+    fn read_macros(&mut self) -> CoreResult<Vec<MacroSlot>> {
+        let mut slots = Vec::with_capacity(usize::from(crystall::layout::MACRO_SLOT_COUNT));
+        for index in 0..crystall::layout::MACRO_SLOT_COUNT {
+            let binding = self.read_key_binding(index)?;
+            let repeat = crystall::binding_repeat(index, &binding).unwrap_or(1);
+            // Macro records exist independently of their trigger, so every slot is read.
+            let stored = self.read_stored_macro(index)?;
+            let mut name_block = vec![u8::try_from(stored.name.len()).unwrap_or(0)];
+            name_block.extend_from_slice(&stored.name);
+            match crystall::decode_slot(index, &name_block, &stored.contexts, repeat) {
+                Ok(slot) => slots.push(slot),
+                // Keep the slot visible by name; an event this driver cannot re-encode
+                // (mouse buttons, media keys) must not hide every other macro.
+                Err(CoreError::UnsupportedCapability(_)) => slots.push(
+                    MacroSlot::new(index, stored.name_text(), Vec::new())
+                        .with_repeat(repeat)
+                        .with_readonly(true),
+                ),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(slots)
+    }
+
+    fn write_macros(&mut self, macros: &[MacroSlot]) -> CoreResult<()> {
+        // Every slot is checked before the first write, so a refused slot never leaves
+        // the slots before it saved and the ones after it unsaved.
+        let mut planned = Vec::with_capacity(macros.len());
+        for slot in macros {
+            let stored = self.read_stored_macro(slot.index)?;
+            if crystall::has_unsupported_context(&stored.contexts) {
+                let is_unchanged = slot.steps.is_empty() && slot.name == stored.name_text();
+                if is_unchanged {
+                    continue;
+                }
+                return Err(CoreError::UnsupportedCapability(
+                    "lamzu_macro_advanced_events",
+                ));
+            }
+            let contexts = if slot.steps.is_empty() {
+                vec![0u8]
+            } else {
+                crystall::encode_contexts(&slot.steps)?
+            };
+            planned.push((slot, stored, contexts));
+        }
+
+        for (slot, stored, contexts) in planned {
+            let index = slot.index;
+            let count_address = stored.count_address();
+            if slot.steps.is_empty() {
+                if stored.contexts != contexts {
+                    self.write_flash_checked(count_address, &contexts)?;
+                }
+                if !stored.name.is_empty() {
+                    self.write_flash_raw(stored.address, &[0])?;
+                }
+                continue;
+            }
+
+            if contexts != stored.contexts {
+                self.write_flash_checked(count_address, &contexts)?;
+            }
+            let name = crystall::encode_name(&slot.name);
+            if name[1..] != stored.name[..] {
+                self.write_flash_raw(stored.address, &name)?;
+            }
+
+            let binding = crystall::macro_binding(index, slot.repeat);
+            let current_binding = self.read_key_binding(index)?;
+            // Never take over a button that already does something else (left click,
+            // back, DPI, ...). Only refresh an existing macro binding or claim a slot
+            // whose key function is disabled.
+            let is_macro_trigger = crystall::binding_repeat(index, &current_binding).is_some();
+            let is_disabled = current_binding == [0, 0, 0];
+            if current_binding != binding && (is_macro_trigger || is_disabled) {
+                self.write_flash_checked(crystall::key_slot_address(index)?, &binding)?;
+            }
+
+            if !self.transport.is_dry_run() {
+                let readback = self.read_flash_checked(count_address, contexts.len())?;
+                if readback != contexts {
+                    return Err(CoreError::Protocol(format!(
+                        "Lamzu macro slot {index} read-back mismatch"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T: HidTransport> BatteryMonitor for LamzuAtlantisDevice<T> {
@@ -448,7 +640,7 @@ impl<T: HidTransport> ProfileManager for LamzuAtlantisDevice<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agnoperiph_core::{ChargingState, DpiValue, RgbColor};
+    use agnoperiph_core::{ChargingState, DpiValue, MacroActionKind, MacroStep, RgbColor};
     use agnoperiph_transport::{
         HidDeviceDescriptor, MemoryPacketSink, MockHidTransport, PacketOutcome,
     };
@@ -639,6 +831,326 @@ mod tests {
             .filter(|e| e.outcome == PacketOutcome::DryRunSuppressed)
             .count();
         assert!(suppressed >= 5);
+    }
+
+    #[test]
+    fn reads_unbound_macro_slots_as_empty_entries() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        for _ in 0..crystall::layout::MACRO_SLOT_COUNT {
+            mock.push_input_response(reply_frame(
+                Command::ReadFlash,
+                0,
+                4,
+                &[0x01, 0x01, 0x00, 0x53],
+            ));
+            mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0xFF]));
+            mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0xFF]));
+        }
+        let mut dev = LamzuAtlantisDevice::open(mock, false, None).unwrap();
+
+        let slots = dev.read_macros().unwrap();
+        assert_eq!(slots.len(), 16);
+        assert!(slots.iter().all(|slot| slot.steps.is_empty()));
+        assert!(slots.iter().all(|slot| slot.repeat == 1));
+        assert!(dev.capabilities().has_macros());
+    }
+
+    #[test]
+    fn reads_the_captured_crystal_wire_slot_without_hiding_other_slots() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        for index in 0..crystall::layout::MACRO_SLOT_COUNT {
+            let (binding, checksum) = if index == 5 {
+                // Stock DPI binding, not a macro trigger: the record below is unbound.
+                ([0x02, 0x01, 0x00], 0x52)
+            } else {
+                ([0x00, 0x00, 0x00], 0x55)
+            };
+            mock.push_input_response(reply_frame(
+                Command::ReadFlash,
+                0,
+                4,
+                &[binding[0], binding[1], binding[2], checksum],
+            ));
+            if index == 5 {
+                mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x0A]));
+                mock.push_input_response(reply_frame(Command::ReadFlash, 0, 10, b"spam click"));
+                mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x02]));
+                mock.push_input_response(reply_frame(
+                    Command::ReadFlash,
+                    0,
+                    10,
+                    &[0x02, 0x84, 0x01, 0x00, 0x00, 0x0A, 0x44, 0x01, 0x00, 0x00],
+                ));
+                mock.push_input_response(reply_frame(Command::ReadFlash, 0, 2, &[0x0A, 0x75]));
+            } else {
+                mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0xFF]));
+                mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0xFF]));
+            }
+        }
+        let mut dev = LamzuAtlantisDevice::open(mock, false, None).unwrap();
+
+        let slots = dev.read_macros().unwrap();
+        assert_eq!(slots[5].name, "spam click");
+        assert!(
+            slots[5].steps.is_empty() && slots[5].is_readonly,
+            "mouse-button events stay visible but read-only"
+        );
+        assert_eq!(slots.iter().filter(|slot| slot.is_readonly).count(), 1);
+        assert!(
+            slots
+                .iter()
+                .enumerate()
+                .all(|(ix, slot)| ix == 5 || slot.steps.is_empty())
+        );
+    }
+
+    #[test]
+    fn unchanged_advanced_macro_is_left_untouched_on_save() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        push_spam_click_record(&mut mock);
+        let sink = Arc::new(MemoryPacketSink::unbounded());
+        let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
+
+        dev.write_macros(&[MacroSlot::new(5, "spam click", Vec::new())])
+            .unwrap();
+
+        assert!(
+            sink.snapshot()
+                .iter()
+                .all(|event| event.bytes[1] != Command::WriteFlash as u8),
+            "a mouse-button macro must survive a save that did not edit it"
+        );
+    }
+
+    #[test]
+    fn erased_slots_are_not_mistaken_for_full_macros() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0xFF]));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0xFF]));
+        let sink = Arc::new(MemoryPacketSink::unbounded());
+        let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
+
+        dev.write_macros(&[MacroSlot::new(0, "", Vec::new())])
+            .unwrap();
+
+        assert!(
+            sink.snapshot()
+                .iter()
+                .all(|event| event.bytes[1] != Command::WriteFlash as u8),
+            "erased 0xFF header bytes must not read as 70 contexts"
+        );
+    }
+
+    #[test]
+    fn macro_capability_requires_the_v2_profile_image() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x01, 0x24],
+        ));
+        let dev = LamzuAtlantisDevice::open(mock, false, None).unwrap();
+        assert!(!dev.capabilities().has_macros());
+        assert!(dev.as_macros().is_none());
+
+        for (payload, expected) in [
+            ([0x02, 0x00], true),
+            ([0x02, 0x17], true),
+            ([0x03, 0x01], true),
+            ([0x01, 0x24], false),
+            ([0x00, 0xFF], false),
+        ] {
+            let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+            mock.push_input_response(reply_frame(Command::ReadFirmwareVersion, 0, 2, &payload));
+            let dev = LamzuAtlantisDevice::open(mock, false, None).unwrap();
+            assert_eq!(dev.capabilities().has_macros(), expected, "{payload:?}");
+        }
+    }
+
+    /// Read replies for the captured `spam click` record in slot 5: name, then contexts.
+    fn push_spam_click_record(mock: &mut MockHidTransport) {
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x0A]));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 10, b"spam click"));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x02]));
+        mock.push_input_response(reply_frame(
+            Command::ReadFlash,
+            0,
+            10,
+            &[0x02, 0x84, 0x01, 0x00, 0x00, 0x0A, 0x44, 0x01, 0x00, 0x00],
+        ));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 2, &[0x0A, 0x75]));
+    }
+
+    fn flash_writes(sink: &MemoryPacketSink) -> Vec<FlashWrite> {
+        sink.snapshot()
+            .into_iter()
+            .filter(|event| event.bytes[1] == Command::WriteFlash as u8)
+            .map(|event| FlashWrite {
+                address: u16::from_be_bytes([event.bytes[3], event.bytes[4]]),
+                len: event.bytes[5],
+                payload: event.bytes[6..].to_vec(),
+            })
+            .collect()
+    }
+
+    fn burst_steps() -> Vec<MacroStep> {
+        vec![
+            MacroStep::new(MacroActionKind::KeyDown, 0x04, 10),
+            MacroStep::new(MacroActionKind::KeyUp, 0x04, 10),
+        ]
+    }
+
+    #[test]
+    fn editing_another_slot_never_writes_the_mouse_button_macro() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        // Slot 0 is empty, slot 5 holds the capture; the trigger read follows the plan.
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
+        push_spam_click_record(&mut mock);
+        mock.push_input_response(reply_frame(
+            Command::ReadFlash,
+            0,
+            4,
+            &[0x01, 0x01, 0x00, 0x53],
+        ));
+        let sink = Arc::new(MemoryPacketSink::unbounded());
+        let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
+
+        dev.write_macros(&[
+            MacroSlot::new(0, "burst", burst_steps()),
+            MacroSlot::new(5, "spam click", Vec::new()).with_readonly(true),
+        ])
+        .unwrap();
+
+        let slot5 = crystall::macro_slot_address(5).unwrap();
+        let slot5_end = slot5 + crystall::layout::MACRO_SLOT_STRIDE;
+        let key5 = crystall::key_slot_address(5).unwrap();
+        let writes = flash_writes(&sink);
+        assert!(!writes.is_empty(), "slot 0 is saved");
+        assert!(
+            writes
+                .iter()
+                .all(|w| !(slot5..slot5_end).contains(&w.address) && w.address != key5),
+            "slot 5 record and trigger stay untouched"
+        );
+    }
+
+    #[test]
+    fn editing_the_mouse_button_macro_is_refused_before_any_write() {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
+        push_spam_click_record(&mut mock);
+        let sink = Arc::new(MemoryPacketSink::unbounded());
+        let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
+
+        let err = dev
+            .write_macros(&[
+                MacroSlot::new(0, "burst", burst_steps()),
+                MacroSlot::new(5, "spam click", burst_steps()),
+            ])
+            .unwrap_err();
+
+        assert!(matches!(err, CoreError::UnsupportedCapability(_)));
+        assert!(
+            flash_writes(&sink).is_empty(),
+            "slot 0 must not be saved when slot 5 is refused"
+        );
+    }
+
+    struct FlashWrite {
+        address: u16,
+        len: u8,
+        payload: Vec<u8>,
+    }
+
+    fn macro_write_frames(binding: [u8; 3], checksum: u8) -> Vec<FlashWrite> {
+        let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
+        mock.push_input_response(reply_frame(
+            Command::ReadFirmwareVersion,
+            0,
+            2,
+            &[0x02, 0x17],
+        ));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
+        mock.push_input_response(reply_frame(
+            Command::ReadFlash,
+            0,
+            4,
+            &[binding[0], binding[1], binding[2], checksum],
+        ));
+        let sink = Arc::new(MemoryPacketSink::unbounded());
+        let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
+
+        dev.write_macros(&[MacroSlot::new(0, "burst", burst_steps()).with_repeat(3)])
+            .unwrap();
+
+        sink.snapshot()
+            .into_iter()
+            .filter(|event| event.outcome == PacketOutcome::DryRunSuppressed)
+            .filter(|event| event.bytes[1] == Command::WriteFlash as u8)
+            .map(|event| FlashWrite {
+                address: u16::from_be_bytes([event.bytes[3], event.bytes[4]]),
+                len: event.bytes[5],
+                payload: event.bytes[6..].to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn macro_writes_content_without_taking_over_a_normal_button() {
+        // Stock left click; saving a macro must not rebind it.
+        let writes = macro_write_frames([0x01, 0x01, 0x00], 0x53);
+        let addresses: Vec<_> = writes.iter().map(|w| (w.address, w.len)).collect();
+        assert_eq!(addresses, vec![(799, 10), (809, 2), (768, 6)]);
+        assert_eq!(&writes[2].payload[..6], b"\x05burst");
+    }
+
+    #[test]
+    fn macro_writes_refresh_an_existing_macro_binding() {
+        // Already bound to macro 0 with repeat 2 (0x06 + 0x00 + 0x02 sums below 0x55).
+        let writes = macro_write_frames([0x06, 0x00, 0x02], 0x4D);
+        let addresses: Vec<_> = writes.iter().map(|w| (w.address, w.len)).collect();
+        assert_eq!(addresses, vec![(799, 10), (809, 2), (768, 6), (96, 4)]);
+        assert_eq!(&writes[3].payload[..3], &[0x06, 0x00, 0x03]);
     }
 
     #[test]

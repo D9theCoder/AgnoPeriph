@@ -498,6 +498,36 @@ fn capture_live_tester_screens() {
     }
 }
 
+/// Mouse window tall enough to show the Macros tab below the pointer settings.
+const MOUSE_MACRO_HEIGHT: f32 = 1900.;
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_macro_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let (handle, _) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        open_tab(&mut cx, handle, KeyboardTab::Macros);
+        save(&mut cx, handle, &format!("macros-keyboard-{suffix}"));
+
+        let (handle, _) = open_with(&mut cx, MockPeripheralService::new(), MOUSE_MACRO_HEIGHT);
+        set_theme(&mut cx, handle, mode);
+        click(&mut cx, handle, ("macro-slot", 3u64));
+        click(&mut cx, handle, ("macro-repeat-inc", 3u64));
+        save(&mut cx, handle, &format!("macros-mouse-{suffix}"));
+        click(&mut cx, handle, ("macro-slot", 5u64));
+        save(&mut cx, handle, &format!("macros-mouse-readonly-{suffix}"));
+        click(&mut cx, handle, ("macro-slot", 6u64));
+        save(&mut cx, handle, &format!("macros-mouse-empty-{suffix}"));
+    }
+}
+
 struct FixedReleases(Option<agnoperiph::updates::UpdateInfo>);
 
 impl agnoperiph::updates::ReleaseSource for FixedReleases {

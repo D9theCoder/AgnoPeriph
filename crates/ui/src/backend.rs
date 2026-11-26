@@ -656,6 +656,29 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
                     expected: format!("0..={}", mac.capabilities.max_slots),
                 });
             }
+            let expected_repeat = if mac.capabilities.supports_repeat {
+                "1..=255"
+            } else {
+                "1"
+            };
+            if let Some(slot) = slots.iter().find(|slot| {
+                slot.repeat == 0 || (!mac.capabilities.supports_repeat && slot.repeat != 1)
+            }) {
+                return Err(CoreError::OutOfRange {
+                    field: "macro_repeat",
+                    actual: slot.repeat.to_string(),
+                    expected: expected_repeat.to_owned(),
+                });
+            }
+            let edits_readonly_slot = slots.iter().any(|slot| {
+                mac.slots
+                    .iter()
+                    .find(|stored| stored.index == slot.index)
+                    .is_some_and(|stored| stored.is_readonly && stored != slot)
+            });
+            if edits_readonly_slot {
+                return Err(CoreError::UnsupportedCapability("macro_readonly_slot"));
+            }
             Ok(())
         }
         SettingChange::KeyboardConfig(cfg) => {
@@ -1740,5 +1763,28 @@ mod tests {
             refreshed.hall_effect.as_ref().unwrap().snapshot.keys[0].actuation,
             TravelHundredthsMm::from_hundredths(160)
         );
+    }
+
+    #[test]
+    fn readonly_macro_slots_only_pass_unchanged() {
+        let devices = MockPeripheralService::new().refresh().unwrap();
+        let mouse = devices
+            .iter()
+            .find(|d| {
+                d.macros
+                    .as_ref()
+                    .is_some_and(|m| m.slots.iter().any(|s| s.is_readonly))
+            })
+            .unwrap();
+        let slots = mouse.macros.as_ref().unwrap().slots.clone();
+        assert!(validate_change(mouse, &SettingChange::Macros(slots.clone())).is_ok());
+
+        let mut edited = slots;
+        let readonly = edited.iter_mut().find(|s| s.is_readonly).unwrap();
+        readonly.name = "renamed".to_owned();
+        assert!(matches!(
+            validate_change(mouse, &SettingChange::Macros(edited)),
+            Err(CoreError::UnsupportedCapability("macro_readonly_slot"))
+        ));
     }
 }
