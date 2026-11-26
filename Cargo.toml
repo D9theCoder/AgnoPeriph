@@ -68,5 +68,12 @@ must_use_candidate = "allow"
 return_self_not_must_use = "allow"
 struct_excessive_bools = "allow"
 
+# Unoptimized GPUI builder chains keep every temporary element in its own stack slot, so
+# a debug UI frame overflowed the 1 MiB Windows main thread. opt-level 1 reuses those slots;
+# `heaviest_screens_render_within_the_main_thread_stack` in crates/ui/tests/ui.rs guards it.
 [profile.dev.package."*"]
 debug = "line-tables-only"
+opt-level = 1
+
+[profile.dev.package.agnoperiph]
+opt-level = 1

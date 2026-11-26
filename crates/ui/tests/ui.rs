@@ -619,6 +619,45 @@ fn macros_edit_steps_and_save(cx: &mut TestAppContext) {
     assert_eq!(saved[1].delay_ms, 30);
 }
 
+/// Stack the heaviest screens must fit in, half of the 1 MiB Windows main thread that
+/// renders the window. Unoptimized debug builds once needed more than 1 MiB for the macro
+/// editor, so the app overflowed its stack at launch on a mouse with a stored macro.
+const RENDER_STACK_BUDGET: usize = 512 * 1024;
+const STACK_PROBE_ENV: &str = "AGNO_STACK_PROBE";
+
+#[test]
+fn heaviest_screens_render_within_the_main_thread_stack() {
+    if std::env::var_os(STACK_PROBE_ENV).is_some() {
+        return;
+    }
+    let screens = [
+        "macros_edit_steps_and_save",
+        "keyboard_tabs_switch_workspaces",
+        "via_keyboard_without_hall_effect_lands_on_its_own_tabs",
+        "triggers_and_lighting_fit_the_default_window",
+        "loads_devices_and_switches_capability_editors",
+    ];
+    // libtest threads honour RUST_MIN_STACK, so the same tests rerun in a child process
+    // with the smaller stack; an overflow aborts that process instead of this one.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(screens)
+        .args(["--exact", "--test-threads=1"])
+        .env("RUST_MIN_STACK", RENDER_STACK_BUDGET.to_string())
+        .env(STACK_PROBE_ENV, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "screens overflowed a {RENDER_STACK_BUDGET}-byte stack or failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("{} passed", screens.len())),
+        "not every screen ran:\n{stdout}"
+    );
+}
+
 #[gpui_kit::test]
 fn advanced_settings_write_keyboard_config(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());

@@ -134,7 +134,7 @@ Behavior tests (`tests/ui.rs`) cannot show what the UI looks like. Any change wi
 How it works, so nobody has to rediscover it:
 - **Renderer:** gpui supplies no headless renderer on Windows (`current_headless_renderer()` returns `None`). `tests/visual.rs` therefore builds a `HeadlessAppContext` with `gpui_wgpu::WgpuHeadlessRenderer` from the dev-dependency `gpui-fast-wgpu` (lib name `gpui_wgpu`), pinned to the exact `gpui-fast` version `gpui-kit` uses (`=0.1.19`). The context loads `agnoperiph::icons::AppAssets`, the same asset source as the app, so custom and extra icons render. This dev-dependency (plus `image` and `anyhow`) is the one allowed exception to "single UI dependency". It is test-only and must never move into `[dependencies]`. When upgrading `gpui-kit`, bump the pin to match, or the build fails with "multiple versions of crate `gpui`".
 - **Text:** `gpui_kit::platform::current_platform(true)` returns a **no-op** text system on Windows. Text lays out at the right size but every glyph is empty, so screenshots show boxes with no text. Use `current_platform(false).text_system()` (real DirectWrite), wrapped to force grayscale glyphs as the test does.
-- **Cost:** the first build compiles `wgpu`, which takes several minutes at the workspace's dependency `opt-level = 3`. Later builds reuse the cache. The test is `#[ignore]`d so `cargo test --workspace` stays GPU-free and fast.
+- **Cost:** the first build compiles `wgpu`, which takes several minutes at the workspace's dependency `opt-level = 1`. Later builds reuse the cache. The test is `#[ignore]`d so `cargo test --workspace` stays GPU-free and fast.
 
 ---
 
@@ -160,6 +160,7 @@ cargo test -p agnoperiph --test visual -- --ignored --nocapture
 
 ### 7.1 Target Directory & Build Cache Hygiene
 - `Cargo.toml` sets `[profile.dev.package."*"] debug = "line-tables-only"` to keep Windows `.pdb`/`.rlib` sizes manageable while preserving dependency backtraces and full debug info for workspace crates.
+- The dev profile builds dependencies and the `agnoperiph` UI crate at `opt-level = 1`. At `opt-level = 0`, GPUI render functions need more than the 1 MiB Windows main-thread stack, and debug builds crash at launch with `thread 'main' has overflowed its stack`. Do not lower it. `heaviest_screens_render_within_the_main_thread_stack` (`crates/ui/tests/ui.rs`) reruns the heaviest screens on a 512 KiB stack to guard it.
 - **Never touch or delete `target/release/`** (avoid bare `cargo clean`, which wipes release builds).
 - To reclaim disk space from dev/test caches, clean only the dev profile or prune stale artifacts with `cargo-sweep`:
   ```powershell
