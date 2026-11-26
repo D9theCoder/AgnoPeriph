@@ -155,12 +155,15 @@ cargo test -p agnoperiph --test visual -- --ignored --nocapture
 ```
 
 ### 7.1 Target Directory & Build Cache Hygiene
-- `Cargo.toml` sets `[profile.dev.package."*"] debug = "line-tables-only"` to keep Windows `.pdb`/`.rlib` sizes manageable while preserving dependency backtraces and full debug info for workspace crates.
+- `Cargo.toml` sets `[profile.dev] debug = "line-tables-only"` for dependencies, workspace crates and test binaries. It keeps Windows `.pdb`/`.rlib` sizes manageable while panics and backtraces keep file and line numbers.
+- Keep incremental compilation on (the dev default). The GPUI edit/test loop depends on it.
 - The dev profile builds dependencies and the `agnoperiph` UI crate at `opt-level = 1`. At `opt-level = 0`, GPUI render functions need more than the 1 MiB Windows main-thread stack, and debug builds crash at launch with `thread 'main' has overflowed its stack`. Do not lower it. `heaviest_screens_render_within_the_main_thread_stack` (`crates/ui/tests/ui.rs`) reruns the heaviest screens on a 512 KiB stack to guard it.
-- **Never touch or delete `target/release/`** (avoid bare `cargo clean`, which wipes release builds).
-- To reclaim disk space from dev/test caches, clean only the dev profile or prune stale artifacts with `cargo-sweep`:
+- **Never touch or delete `target/release/`**, and never run a bare `cargo clean` (it wipes release builds).
+- Keep local release builds rare. CI publishes the installer.
+- To reclaim disk space:
   ```powershell
-  cargo clean --profile dev
-  # or, with cargo-sweep installed:
-  cargo sweep --time 7
+  .\scripts\dev.ps1 prune       # deletes only target\debug\incremental and prints the space freed
+  .\scripts\dev.ps1 sweep 14    # weekly: removes artifacts older than 14 days (needs cargo-sweep)
+  .\scripts\dev.ps1 clean-dev   # bigger hammer: cargo clean --profile dev
   ```
+  `sweep` does not install `cargo-sweep`. Install it yourself with `cargo install cargo-sweep`.

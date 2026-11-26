@@ -68,11 +68,15 @@ must_use_candidate = "allow"
 return_self_not_must_use = "allow"
 struct_excessive_bools = "allow"
 
+[profile.dev]
+# Line tables keep panics and backtraces readable without full PDBs per test binary.
+# Incremental compilation stays on (the default) for the GPUI edit/test loop.
+debug = "line-tables-only"
+
 # Unoptimized GPUI builder chains keep every temporary element in its own stack slot, so
 # a debug UI frame overflowed the 1 MiB Windows main thread. opt-level 1 reuses those slots;
 # `heaviest_screens_render_within_the_main_thread_stack` in crates/ui/tests/ui.rs guards it.
 [profile.dev.package."*"]
-debug = "line-tables-only"
 opt-level = 1
 
 [profile.dev.package.agnoperiph]
