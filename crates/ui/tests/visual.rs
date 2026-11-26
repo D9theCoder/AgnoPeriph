@@ -522,6 +522,10 @@ fn capture_macro_screens() {
         click(&mut cx, handle, ("macro-repeat-inc", 3u64));
         save(&mut cx, handle, &format!("macros-mouse-{suffix}"));
         click(&mut cx, handle, ("macro-slot", 5u64));
+        click(&mut cx, handle, "add-macro-media-step");
+        click(&mut cx, handle, "add-macro-move-step");
+        save(&mut cx, handle, &format!("macros-mouse-clicks-{suffix}"));
+        click(&mut cx, handle, ("macro-slot", 7u64));
         save(&mut cx, handle, &format!("macros-mouse-readonly-{suffix}"));
         click(&mut cx, handle, ("macro-slot", 6u64));
         save(&mut cx, handle, &format!("macros-mouse-empty-{suffix}"));

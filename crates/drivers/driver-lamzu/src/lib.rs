@@ -199,6 +199,10 @@ impl<T: HidTransport> LamzuAtlantisDevice<T> {
         let req = encode_request(cmd, address, payload)?;
         let is_mutating = matches!(cmd, Command::WriteFlash | Command::WriteActiveProfile);
 
+        if !is_mutating || !self.transport.is_dry_run() {
+            let _ = self.transport.drain_input_reports();
+        }
+
         if is_mutating {
             self.transport.send_output_report(&req)?;
             if self.transport.is_dry_run() {
@@ -410,6 +414,9 @@ impl<T: HidTransport> MacroController for LamzuAtlantisDevice<T> {
             u16::from(crystall::layout::MACRO_SLOT_COUNT) * crystall::layout::MACRO_SLOT_STRIDE,
         )
         .with_repeat_support(true)
+        .with_mouse_buttons(true)
+        .with_media_keys(true)
+        .with_pointer_move(true)
     }
 
     fn read_macros(&mut self) -> CoreResult<Vec<MacroSlot>> {
@@ -904,10 +911,25 @@ mod tests {
         let slots = dev.read_macros().unwrap();
         assert_eq!(slots[5].name, "spam click");
         assert!(
-            slots[5].steps.is_empty() && slots[5].is_readonly,
-            "mouse-button events stay visible but read-only"
+            !slots[5].is_readonly,
+            "captured mouse-button macro loads as editable steps"
         );
-        assert_eq!(slots.iter().filter(|slot| slot.is_readonly).count(), 1);
+        assert_eq!(
+            slots[5].steps,
+            vec![
+                MacroStep::mouse(
+                    MacroActionKind::MouseDown,
+                    agnoperiph_core::MouseButton::Left,
+                    10
+                ),
+                MacroStep::mouse(
+                    MacroActionKind::MouseUp,
+                    agnoperiph_core::MouseButton::Left,
+                    10
+                ),
+            ]
+        );
+        assert_eq!(slots.iter().filter(|slot| slot.is_readonly).count(), 0);
         assert!(
             slots
                 .iter()
@@ -917,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_advanced_macro_is_left_untouched_on_save() {
+    fn unchanged_unsupported_macro_is_left_untouched_on_save() {
         let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
         mock.push_input_response(reply_frame(
             Command::ReadFirmwareVersion,
@@ -925,18 +947,18 @@ mod tests {
             2,
             &[0x02, 0x17],
         ));
-        push_spam_click_record(&mut mock);
+        push_unsupported_power_record(&mut mock);
         let sink = Arc::new(MemoryPacketSink::unbounded());
         let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
 
-        dev.write_macros(&[MacroSlot::new(5, "spam click", Vec::new())])
+        dev.write_macros(&[MacroSlot::new(5, "power key", Vec::new())])
             .unwrap();
 
         assert!(
             sink.snapshot()
                 .iter()
                 .all(|event| event.bytes[1] != Command::WriteFlash as u8),
-            "a mouse-button macro must survive a save that did not edit it"
+            "an unsupported ACPI power macro must survive a save that did not edit it"
         );
     }
 
@@ -992,18 +1014,19 @@ mod tests {
         }
     }
 
-    /// Read replies for the captured `spam click` record in slot 5: name, then contexts.
-    fn push_spam_click_record(mock: &mut MockHidTransport) {
-        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x0A]));
-        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 10, b"spam click"));
-        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x02]));
+    /// Read replies for an unsupported ACPI Power (`type = 3`) record in slot 5.
+    fn push_unsupported_power_record(mock: &mut MockHidTransport) {
+        let contexts = [0x01, 0x83, 0x81, 0x00, 0x00, 0x0A];
+        let sealed = seal_field(&contexts);
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x09]));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 9, b"power key"));
+        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x01]));
         mock.push_input_response(reply_frame(
             Command::ReadFlash,
             0,
-            10,
-            &[0x02, 0x84, 0x01, 0x00, 0x00, 0x0A, 0x44, 0x01, 0x00, 0x00],
+            u8::try_from(sealed.len()).unwrap_or(0),
+            &sealed,
         ));
-        mock.push_input_response(reply_frame(Command::ReadFlash, 0, 2, &[0x0A, 0x75]));
     }
 
     fn flash_writes(sink: &MemoryPacketSink) -> Vec<FlashWrite> {
@@ -1026,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_another_slot_never_writes_the_mouse_button_macro() {
+    fn editing_another_slot_never_writes_an_unsupported_macro() {
         let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
         mock.push_input_response(reply_frame(
             Command::ReadFirmwareVersion,
@@ -1034,10 +1057,10 @@ mod tests {
             2,
             &[0x02, 0x17],
         ));
-        // Slot 0 is empty, slot 5 holds the capture; the trigger read follows the plan.
+        // Slot 0 is empty, slot 5 holds an unsupported ACPI Power event; trigger read follows plan.
         mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
         mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
-        push_spam_click_record(&mut mock);
+        push_unsupported_power_record(&mut mock);
         mock.push_input_response(reply_frame(
             Command::ReadFlash,
             0,
@@ -1049,7 +1072,7 @@ mod tests {
 
         dev.write_macros(&[
             MacroSlot::new(0, "burst", burst_steps()),
-            MacroSlot::new(5, "spam click", Vec::new()).with_readonly(true),
+            MacroSlot::new(5, "power key", Vec::new()).with_readonly(true),
         ])
         .unwrap();
 
@@ -1067,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn editing_the_mouse_button_macro_is_refused_before_any_write() {
+    fn editing_an_unsupported_macro_is_refused_before_any_write() {
         let mut mock = MockHidTransport::new(atlantis_4k_descriptor());
         mock.push_input_response(reply_frame(
             Command::ReadFirmwareVersion,
@@ -1077,14 +1100,14 @@ mod tests {
         ));
         mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
         mock.push_input_response(reply_frame(Command::ReadFlash, 0, 1, &[0x00]));
-        push_spam_click_record(&mut mock);
+        push_unsupported_power_record(&mut mock);
         let sink = Arc::new(MemoryPacketSink::unbounded());
         let mut dev = LamzuAtlantisDevice::open(mock, true, Some(sink.clone())).unwrap();
 
         let err = dev
             .write_macros(&[
                 MacroSlot::new(0, "burst", burst_steps()),
-                MacroSlot::new(5, "spam click", burst_steps()),
+                MacroSlot::new(5, "power key", burst_steps()),
             ])
             .unwrap_err();
 

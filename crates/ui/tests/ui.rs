@@ -709,36 +709,72 @@ fn mouse_macro_cycle_times_stage_discard_and_save(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn mouse_button_macro_stays_readonly_and_survives_saves(cx: &mut TestAppContext) {
+fn mouse_macro_edits_clicks_media_and_pointer_move(cx: &mut TestAppContext) {
+    use agnoperiph_core::MouseButton;
+
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    let stored = |cx: &mut TestAppContext| device_snapshot(cx, &app, &mouse()).macros.unwrap();
+
+    // Captured `spam click` in slot 5 loads as editable mouse-button steps.
+    let slot5 = stored(cx).slots[5].clone();
+    assert!(!slot5.is_readonly);
+    assert_eq!(slot5.name, "spam click");
+    assert_eq!(slot5.steps.len(), 2);
+    assert_eq!(slot5.steps[0].kind, MacroActionKind::MouseDown);
+    assert_eq!(slot5.steps[0].mouse_button, Some(MouseButton::Left));
+
+    click(cx, handle, ("macro-slot", 5u64));
+    assert!(!is_disabled(cx, handle, "add-macro-mouse-step"));
+    click(cx, handle, "add-macro-mouse-step");
+    click(cx, handle, "add-macro-media-step");
+    click(cx, handle, "add-macro-move-step");
+    // Step 4 (index 4, id 4) is the MoveXY step; bump X by +1 and Y by -1.
+    click(cx, handle, ("macro-move-x-inc", 4u64));
+    click(cx, handle, ("macro-move-y-dec", 4u64));
+    click(cx, handle, "save-macros");
+
+    let saved = stored(cx).slots[5].steps.clone();
+    assert_eq!(saved.len(), 5);
+    assert_eq!(saved[2].kind, MacroActionKind::MouseClick);
+    assert_eq!(saved[2].mouse_button, Some(MouseButton::Left));
+    assert_eq!(saved[3].kind, MacroActionKind::MediaTap);
+    assert_eq!(saved[3].consumer_usage, 0x00CD);
+    assert_eq!(saved[4].kind, MacroActionKind::PointerMove);
+    assert_eq!((saved[4].move_x, saved[4].move_y), (1, -1));
+}
+
+#[gpui_kit::test]
+fn unsupported_macro_stays_readonly_and_survives_saves(cx: &mut TestAppContext) {
     use agnoperiph_driver_lamzu::crystall;
 
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     let stored = |cx: &mut TestAppContext| device_snapshot(cx, &app, &mouse()).macros.unwrap();
-    assert!(stored(cx).slots[5].is_readonly);
+    assert!(stored(cx).slots[7].is_readonly);
 
-    click(cx, handle, ("macro-slot", 5u64));
+    click(cx, handle, ("macro-slot", 7u64));
     assert!(is_disabled(cx, handle, "add-macro-step"));
+    assert!(is_disabled(cx, handle, "add-macro-mouse-step"));
     assert!(is_disabled(cx, handle, "rename-macro"));
-    assert!(!exists(cx, handle, ("macro-repeat-inc", 5u64)));
+    assert!(!exists(cx, handle, ("macro-repeat-inc", 7u64)));
 
-    // Saving an edit to another slot leaves slot 5's record and trigger alone.
+    // Saving an edit to another slot leaves slot 7's record and trigger alone.
     click(cx, handle, ("macro-slot", 3u64));
     click(cx, handle, ("macro-repeat-inc", 3u64));
     cx.update(|cx| app.update(cx, AgnoPeriphApp::clear_packets));
     click(cx, handle, "save-macros");
-    let slot5 = crystall::macro_slot_address(5).unwrap();
-    let slot5_end = slot5 + crystall::layout::MACRO_SLOT_STRIDE;
-    let key5 = crystall::key_slot_address(5).unwrap();
+    let slot7 = crystall::macro_slot_address(7).unwrap();
+    let slot7_end = slot7 + crystall::layout::MACRO_SLOT_STRIDE;
+    let key7 = crystall::key_slot_address(7).unwrap();
     cx.update(|cx| {
         let app = app.read(cx);
         assert!(!app.packets().is_empty(), "slot 3 is saved");
         assert!(app.packets().iter().all(|p| {
             let address = u16::from_be_bytes([p.bytes[3], p.bytes[4]]);
-            !(slot5..slot5_end).contains(&address) && address != key5
+            !(slot7..slot7_end).contains(&address) && address != key7
         }));
     });
-    let after = stored(cx).slots[5].clone();
-    assert!(after.is_readonly && after.name == "spam click" && after.steps.is_empty());
+    let after = stored(cx).slots[7].clone();
+    assert!(after.is_readonly && after.name == "Power event" && after.steps.is_empty());
 }
 
 #[gpui_kit::test]
@@ -2612,4 +2648,234 @@ fn profile_tools_menus_open_from_the_preset_bar(cx: &mut TestAppContext) {
     click(cx, handle, "profile-file-menu");
     assert!(has_label(cx, "Export to JSON…"));
     assert!(!is_dirty(cx, &app));
+}
+
+#[gpui_kit::test]
+fn auto_switch_retries_once_after_transient_game_exit_failure(cx: &mut TestAppContext) {
+    use agnoperiph::game_profiles::{AppConfig, GameProfile};
+
+    struct FlakyRevertService {
+        inner: MockPeripheralService,
+        fail_remaining: Arc<Mutex<usize>>,
+    }
+
+    impl PeripheralService for FlakyRevertService {
+        fn is_dry_run(&self) -> bool {
+            self.inner.is_dry_run()
+        }
+
+        fn set_dry_run(&self, dry_run: bool) {
+            self.inner.set_dry_run(dry_run);
+        }
+
+        fn refresh(&self) -> CoreResult<Vec<DeviceSnapshot>> {
+            self.inner.refresh()
+        }
+
+        fn apply(
+            &self,
+            device: &DeviceId,
+            change: SettingChange,
+        ) -> Result<DeviceSnapshot, ApplyError> {
+            let mut rem = self.fail_remaining.lock().unwrap();
+            if *rem > 0 {
+                *rem -= 1;
+                drop(rem);
+                let current = self
+                    .inner
+                    .refresh()
+                    .ok()
+                    .and_then(|list| list.into_iter().find(|d| d.id() == device));
+                return Err(ApplyError::failed_after_send(
+                    CoreError::Protocol("no matching ATK RS7 reply for cmd 0x03".to_owned()),
+                    current,
+                ));
+            }
+            drop(rem);
+            self.inner.apply(device, change)
+        }
+
+        fn packet_log(&self) -> Vec<PacketTraceEntry> {
+            self.inner.packet_log()
+        }
+
+        fn clear_packet_log(&self) {
+            self.inner.clear_packet_log();
+        }
+    }
+
+    let fail_remaining = Arc::new(Mutex::new(0usize));
+    let service = FlakyRevertService {
+        inner: MockPeripheralService::new(),
+        fail_remaining: fail_remaining.clone(),
+    };
+    service.set_dry_run(false);
+    let mut config = AppConfig::default();
+    let mut game = GameProfile::new("cs2", "CS2", "cs2.exe", r"C:\Games\cs2.exe");
+    game.device_targets
+        .insert(keyboard().as_str().to_owned(), 1);
+    config.upsert_game_profile(game);
+    config
+        .default_targets
+        .insert(keyboard().as_str().to_owned(), 0);
+    let options = AppOptions::default().with_config(config);
+    let (handle, app) = open_app_with(cx, service, options);
+
+    // Edit slot 0 and slot 1 so switching between them emits real HID writes.
+    click(cx, handle, device_element_id(&keyboard()));
+    click(cx, handle, key_id(KEY_E));
+    click(cx, handle, "actuation-inc");
+    apply(cx, handle);
+    let desktop_actuation = key_actuation(cx, &app, KEY_E);
+
+    // Launch game: switches cleanly to slot 1.
+    let running = HashSet::from(["cs2.exe".to_owned()]);
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(1));
+    // Make slot 1 distinct from slot 0 so reverting emits a write (KEY_E is still selected).
+    click(cx, handle, "actuation-inc");
+    apply(cx, handle);
+    assert_ne!(key_actuation(cx, &app, KEY_E), desktop_actuation);
+
+    // Close game with a single transient protocol failure on the first attempt.
+    *fail_remaining.lock().unwrap() = 1;
+    app.update(cx, |app, cx| app.handle_running_exes(&HashSet::new(), cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(1));
+    assert!(cx.update(|cx| app.read(cx).banner().is_some()));
+
+    // Next process poll automatically retries and reverts to Desktop without manual Refresh!
+    app.update(cx, |app, cx| app.handle_running_exes(&HashSet::new(), cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(0));
+    assert_eq!(key_actuation(cx, &app, KEY_E), desktop_actuation);
+    assert!(cx.update(|cx| app.read(cx).banner().is_none()));
+}
+
+#[gpui_kit::test]
+fn hardware_sync_detects_direct_keyboard_rgb_and_auto_saves_to_active_preset(
+    cx: &mut TestAppContext,
+) {
+    use agnoperiph::app::HARDWARE_SYNC_INTERVAL;
+    use agnoperiph::game_profiles::{AppConfig, GameProfile};
+    use agnoperiph_core::Brightness;
+
+    struct SharedMock(Arc<MockPeripheralService>);
+
+    impl PeripheralService for SharedMock {
+        fn is_dry_run(&self) -> bool {
+            self.0.is_dry_run()
+        }
+
+        fn set_dry_run(&self, dry_run: bool) {
+            self.0.set_dry_run(dry_run);
+        }
+
+        fn refresh(&self) -> CoreResult<Vec<DeviceSnapshot>> {
+            self.0.refresh()
+        }
+
+        fn apply(
+            &self,
+            device: &DeviceId,
+            change: SettingChange,
+        ) -> Result<DeviceSnapshot, ApplyError> {
+            self.0.apply(device, change)
+        }
+
+        fn packet_log(&self) -> Vec<PacketTraceEntry> {
+            self.0.packet_log()
+        }
+
+        fn clear_packet_log(&self) {
+            self.0.clear_packet_log();
+        }
+
+        fn sync_hardware_state(&self, device: &DeviceId) -> CoreResult<Option<DeviceSnapshot>> {
+            self.0.sync_hardware_state(device)
+        }
+    }
+
+    let service = Arc::new(MockPeripheralService::new());
+    service.set_dry_run(false);
+    let mut config = AppConfig::default();
+    let mut game = GameProfile::new("cs2", "CS2", "cs2.exe", r"C:\Games\cs2.exe");
+    game.device_targets
+        .insert(keyboard().as_str().to_owned(), 1);
+    config.upsert_game_profile(game);
+    config
+        .default_targets
+        .insert(keyboard().as_str().to_owned(), 0);
+    let options = AppOptions::default()
+        .with_config(config)
+        .with_hardware_watcher(true);
+    let (handle, app) = open_app_with(cx, SharedMock(service.clone()), options);
+
+    click(cx, handle, device_element_id(&keyboard()));
+    open_tab(cx, handle, KeyboardTab::Lighting);
+
+    // Simulate the user pressing Fn + RGB directly on the keyboard (preset 13 @ 55%).
+    let onboard_effect = RgbEffect::Preset {
+        id: 13,
+        color: RgbColor::new(0xFF, 0x20, 0x40),
+        speed: 140,
+        colorful: false,
+    };
+    let onboard_brightness = Brightness::new(55).unwrap();
+    service.simulate_hardware_change(&keyboard(), |snap| {
+        let zone0 = &mut snap.rgb.as_mut().unwrap().snapshot.zones[0];
+        zone0.effect = onboard_effect;
+        zone0.brightness = onboard_brightness;
+    });
+
+    // Advance the background hardware watcher clock — no manual Refresh clicked.
+    cx.executor().advance_clock(HARDWARE_SYNC_INTERVAL);
+    settle(cx, handle);
+
+    // 1. Live UI snapshot updated automatically.
+    let live_zone0 = keyboard_snapshot(cx, &app).rgb.unwrap().snapshot.zones[0];
+    assert_eq!(live_zone0.effect, onboard_effect);
+    assert_eq!(live_zone0.brightness, onboard_brightness);
+
+    // 2. Active Desktop software preset (slot 0) auto-saved the keyboard's new RGB.
+    cx.update(|cx| {
+        let saved_zone0 = &app.read(cx).config().software_profiles[keyboard().as_str()].slots[0]
+            .saved
+            .rgb_zones[0];
+        assert_eq!(saved_zone0.effect, onboard_effect);
+        assert_eq!(saved_zone0.brightness, onboard_brightness);
+    });
+
+    // 3. Launching a game and closing it restores the auto-saved onboard RGB on Desktop.
+    let running = HashSet::from(["cs2.exe".to_owned()]);
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(1));
+    // Give the game preset a different RGB so reverting actively writes RGB back.
+    click(cx, handle, "rgb-0-preset-2");
+    apply(cx, handle);
+    assert_ne!(zone_effect(&keyboard_snapshot(cx, &app), 0), onboard_effect);
+
+    app.update(cx, |app, cx| app.handle_running_exes(&HashSet::new(), cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(0));
+    assert_eq!(zone_effect(&keyboard_snapshot(cx, &app), 0), onboard_effect);
+
+    // 4. While the user has unsaved edits in the draft bar, auto-sync defers.
+    click(cx, handle, "rgb-0-preset-5");
+    assert!(is_dirty(cx, &app));
+    let other_effect = RgbEffect::Preset {
+        id: 8,
+        color: RgbColor::new(0x10, 0xFF, 0x20),
+        speed: 90,
+        colorful: false,
+    };
+    service.simulate_hardware_change(&keyboard(), |snap| {
+        snap.rgb.as_mut().unwrap().snapshot.zones[0].effect = other_effect;
+    });
+    cx.executor().advance_clock(HARDWARE_SYNC_INTERVAL);
+    settle(cx, handle);
+    // Raw snapshot was NOT overwritten while the draft is dirty.
+    assert_eq!(zone_effect(&keyboard_snapshot(cx, &app), 0), onboard_effect);
 }

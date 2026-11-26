@@ -29,7 +29,7 @@ pub use hall_effect::{
 pub use keyboard::{
     KeyCode, KeyboardConfigCapabilities, KeyboardConfigController, KeyboardConfigSnapshot,
     KeymapCapabilities, KeymapController, KeymapSnapshot, MacroActionKind, MacroCapabilities,
-    MacroController, MacroSlot, MacroStep,
+    MacroController, MacroSlot, MacroStep, MouseButton,
 };
 pub use pointer::{
     DebounceMs, DpiStage, DpiValue, LiftOffDistance, PointerCapabilities, PointerDevice,

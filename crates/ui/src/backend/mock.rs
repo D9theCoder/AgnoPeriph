@@ -12,10 +12,11 @@ use agnoperiph_core::{
     DksTriggerDirection, DpiStage, DpiValue, HallEffectCapabilities, HallEffectSnapshot, KeyCode,
     KeyHallEffectConfig, KeyIndex, KeyTravelSample, KeyboardConfigCapabilities,
     KeyboardConfigSnapshot, KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroActionKind,
-    MacroCapabilities, MacroSlot, MacroStep, PointerCapabilities, PointerSnapshot, PollingRateHz,
-    ProfileCapabilities, ProfileInfo, ProfileMode, ProfileSlot, ProfileSnapshot, RapidSwitchPair,
-    RapidTriggerConfig, RgbCapabilities, RgbColor, RgbEffect, RgbEffectKind, RgbSnapshot,
-    RgbZoneId, RgbZoneInfo, RgbZoneState, SocdMode, SocdPair, TravelHundredthsMm, VendorKind,
+    MacroCapabilities, MacroSlot, MacroStep, MouseButton, PointerCapabilities, PointerSnapshot,
+    PollingRateHz, ProfileCapabilities, ProfileInfo, ProfileMode, ProfileSlot, ProfileSnapshot,
+    RapidSwitchPair, RapidTriggerConfig, RgbCapabilities, RgbColor, RgbEffect, RgbEffectKind,
+    RgbSnapshot, RgbZoneId, RgbZoneInfo, RgbZoneState, SocdMode, SocdPair, TravelHundredthsMm,
+    VendorKind,
 };
 use agnoperiph_driver_atk::protocol as atk;
 use agnoperiph_driver_lamzu::atlantis::{self, AtlantisRateFamily, Command as LamzuCommand};
@@ -587,6 +588,23 @@ impl MockPeripheralService {
             target.live_travel = samples;
         }
     }
+
+    /// Mutates a mock device's stored onboard state as if changed directly via hardware
+    /// shortcuts (e.g. `Fn + RGB` on a keyboard), without updating `presented` until synced.
+    pub fn simulate_hardware_change(
+        &self,
+        device: &DeviceId,
+        edit: impl FnOnce(&mut DeviceSnapshot),
+    ) {
+        let mut state = lock(&self.state);
+        if let Some(target) = state
+            .devices
+            .iter_mut()
+            .find(|d| d.stored.info.id == *device)
+        {
+            edit(&mut target.stored);
+        }
+    }
 }
 
 impl PeripheralService for MockPeripheralService {
@@ -680,6 +698,40 @@ impl PeripheralService for MockPeripheralService {
             return Err(CoreError::UnsupportedCapability("live_key_travel"));
         }
         Ok(target.live_travel.clone())
+    }
+
+    fn sync_hardware_state(&self, device: &DeviceId) -> CoreResult<Option<DeviceSnapshot>> {
+        let mut state = lock(&self.state);
+        let target = state
+            .devices
+            .iter_mut()
+            .find(|d| d.presented.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+        if target.presented.is_preview {
+            return Ok(None);
+        }
+        let mut next = target.presented.clone();
+        let mut changed = false;
+        if next.rgb != target.stored.rgb {
+            next.rgb.clone_from(&target.stored.rgb);
+            changed = true;
+        }
+        if next.keyboard_config != target.stored.keyboard_config {
+            next.keyboard_config
+                .clone_from(&target.stored.keyboard_config);
+            changed = true;
+        }
+        if next.profiles != target.stored.profiles {
+            next.profiles.clone_from(&target.stored.profiles);
+            next.pointer.clone_from(&target.stored.pointer);
+            changed = true;
+        }
+        if changed {
+            target.presented = next.clone();
+            Ok(Some(next))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -805,7 +857,8 @@ fn lamzu_atlantis_snapshot() -> DeviceSnapshot {
 }
 
 /// Macros on the side buttons' key slots (3 = back, 4 = forward); the main buttons stay
-/// unbound. Slot 5 mirrors the captured `spam click` mouse-button macro, which is read-only.
+/// unbound. Slot 5 mirrors the captured `spam click` mouse-button macro (now editable);
+/// slot 7 simulates an unsupported ACPI Power event that remains read-only.
 fn lamzu_macros() -> MacroState {
     let mut slots: Vec<MacroSlot> = (0..crystall::layout::MACRO_SLOT_COUNT)
         .map(|ix| MacroSlot::new(ix, "", Vec::new()))
@@ -829,13 +882,24 @@ fn lamzu_macros() -> MacroState {
             MacroStep::new(MacroActionKind::KeyUp, 0x2C, 0),
         ],
     );
-    slots[5] = MacroSlot::new(5, "spam click", Vec::new()).with_readonly(true);
+    slots[5] = MacroSlot::new(
+        5,
+        "spam click",
+        vec![
+            MacroStep::mouse(MacroActionKind::MouseDown, MouseButton::Left, 10),
+            MacroStep::mouse(MacroActionKind::MouseUp, MouseButton::Left, 10),
+        ],
+    );
+    slots[7] = MacroSlot::new(7, "Power event", Vec::new()).with_readonly(true);
     MacroState {
         capabilities: MacroCapabilities::new(
             crystall::layout::MACRO_SLOT_COUNT,
             u16::from(crystall::layout::MACRO_SLOT_COUNT) * crystall::layout::MACRO_SLOT_STRIDE,
         )
-        .with_repeat_support(true),
+        .with_repeat_support(true)
+        .with_mouse_buttons(true)
+        .with_media_keys(true)
+        .with_pointer_move(true),
         slots,
     }
 }

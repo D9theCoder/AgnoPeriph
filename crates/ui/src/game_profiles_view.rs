@@ -142,6 +142,7 @@ impl AgnoPeriphApp {
         }
         self.config.auto_switch_enabled = enabled;
         self.applied_targets.clear();
+        self.auto_switch_retries.clear();
         self.auto_switch_note = None;
         self.pending_switch_notice = None;
         if !enabled {

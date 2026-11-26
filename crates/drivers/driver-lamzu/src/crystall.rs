@@ -9,7 +9,7 @@
 //!
 //! See `docs/protocols/lamzu-crystall.md` for the evidence behind every offset.
 
-use agnoperiph_core::{CoreError, CoreResult, MacroActionKind, MacroSlot, MacroStep};
+use agnoperiph_core::{CoreError, CoreResult, MacroActionKind, MacroSlot, MacroStep, MouseButton};
 
 /// Offsets inside the 6912-byte packed flash window.
 pub mod layout {
@@ -98,8 +98,9 @@ pub fn encode_name(name: &str) -> Vec<u8> {
     out
 }
 
-/// Encodes steps into the `[count][flags, value_le16, delay_be16]...` block. A tap takes
-/// two contexts, and a macro over `CONTEXT_MAX` contexts is refused rather than cut short.
+/// Encodes steps into the `[count][flags, value_le16, delay_be16]...` block. A tap or
+/// click takes two contexts, and a macro over `CONTEXT_MAX` contexts is refused rather than
+/// cut short.
 pub fn encode_contexts(steps: &[MacroStep]) -> CoreResult<Vec<u8>> {
     let mut contexts: Vec<[u8; layout::CONTEXT_LEN]> = Vec::new();
     for step in steps {
@@ -109,6 +110,52 @@ pub fn encode_contexts(steps: &[MacroStep]) -> CoreResult<Vec<u8>> {
             MacroActionKind::KeyTap => {
                 push_key(&mut contexts, key_state::DOWN, *step);
                 push_key(&mut contexts, key_state::UP, *step);
+            }
+            MacroActionKind::MouseDown => {
+                let button = require_mouse_button(*step)?;
+                push_mouse(&mut contexts, key_state::DOWN, button, step.delay_ms);
+            }
+            MacroActionKind::MouseUp => {
+                let button = require_mouse_button(*step)?;
+                push_mouse(&mut contexts, key_state::UP, button, step.delay_ms);
+            }
+            MacroActionKind::MouseClick => {
+                let button = require_mouse_button(*step)?;
+                push_mouse(&mut contexts, key_state::DOWN, button, step.delay_ms);
+                push_mouse(&mut contexts, key_state::UP, button, step.delay_ms);
+            }
+            MacroActionKind::MediaDown => {
+                push_media(
+                    &mut contexts,
+                    key_state::DOWN,
+                    step.consumer_usage,
+                    step.delay_ms,
+                );
+            }
+            MacroActionKind::MediaUp => {
+                push_media(
+                    &mut contexts,
+                    key_state::UP,
+                    step.consumer_usage,
+                    step.delay_ms,
+                );
+            }
+            MacroActionKind::MediaTap => {
+                push_media(
+                    &mut contexts,
+                    key_state::DOWN,
+                    step.consumer_usage,
+                    step.delay_ms,
+                );
+                push_media(
+                    &mut contexts,
+                    key_state::UP,
+                    step.consumer_usage,
+                    step.delay_ms,
+                );
+            }
+            MacroActionKind::PointerMove => {
+                push_move_xy(&mut contexts, step.move_x, step.move_y, step.delay_ms);
             }
         }
     }
@@ -134,14 +181,75 @@ pub fn header_len(raw: u8, max: usize) -> usize {
     if len > max { 0 } else { len }
 }
 
+fn require_mouse_button(step: MacroStep) -> CoreResult<MouseButton> {
+    step.mouse_button.ok_or_else(|| {
+        CoreError::Validation("mouse macro step is missing a target mouse button".to_owned())
+    })
+}
+
 fn push_key(contexts: &mut Vec<[u8; layout::CONTEXT_LEN]>, state: u8, step: MacroStep) {
-    let code = u16::from(step.hid_keycode).to_le_bytes();
     // The packed record stores the delay big-endian, unlike every other multi-byte field.
     let delay = step.delay_ms.to_be_bytes();
+    if (0xE0..=0xE7).contains(&step.hid_keycode) {
+        let mask = 1u8 << (step.hid_keycode - 0xE0);
+        contexts.push([
+            state_flag(state) | hid_code_type::MODIFIER,
+            mask,
+            0,
+            delay[0],
+            delay[1],
+        ]);
+    } else {
+        let code = u16::from(step.hid_keycode).to_le_bytes();
+        contexts.push([
+            state_flag(state) | hid_code_type::KEYBOARD,
+            code[0],
+            code[1],
+            delay[0],
+            delay[1],
+        ]);
+    }
+}
+
+fn push_mouse(
+    contexts: &mut Vec<[u8; layout::CONTEXT_LEN]>,
+    state: u8,
+    button: MouseButton,
+    delay_ms: u16,
+) {
+    let delay = delay_ms.to_be_bytes();
     contexts.push([
-        state_flag(state) | hid_code_type::KEYBOARD,
+        state_flag(state) | hid_code_type::MOUSE_BUTTON,
+        button.bitmask(),
+        0,
+        delay[0],
+        delay[1],
+    ]);
+}
+
+fn push_media(
+    contexts: &mut Vec<[u8; layout::CONTEXT_LEN]>,
+    state: u8,
+    consumer_usage: u16,
+    delay_ms: u16,
+) {
+    let code = consumer_usage.to_le_bytes();
+    let delay = delay_ms.to_be_bytes();
+    contexts.push([
+        state_flag(state) | hid_code_type::MEDIA,
         code[0],
         code[1],
+        delay[0],
+        delay[1],
+    ]);
+}
+
+fn push_move_xy(contexts: &mut Vec<[u8; layout::CONTEXT_LEN]>, dx: i8, dy: i8, delay_ms: u16) {
+    let delay = delay_ms.to_be_bytes();
+    contexts.push([
+        hid_code_type::MOVE_XY,
+        dx.to_ne_bytes()[0],
+        dy.to_ne_bytes()[0],
         delay[0],
         delay[1],
     ]);
@@ -152,6 +260,102 @@ const fn state_flag(state: u8) -> u8 {
         key_state::DOWN => key_state::DOWN_FLAG,
         key_state::UP => key_state::UP_FLAG,
         _ => 0,
+    }
+}
+
+fn decode_context(index: u8, event: [u8; layout::CONTEXT_LEN]) -> CoreResult<MacroStep> {
+    let flags = event[0];
+    let kind = flags & 0x0F;
+    let state = match flags & 0xC0 {
+        key_state::DOWN_FLAG => key_state::DOWN,
+        key_state::UP_FLAG => key_state::UP,
+        _ => key_state::NONE,
+    };
+    let delay_ms = u16::from_be_bytes([event[3], event[4]]);
+
+    match kind {
+        hid_code_type::MODIFIER => {
+            if event[2] != 0 || !event[1].is_power_of_two() {
+                return Err(CoreError::UnsupportedCapability(
+                    "lamzu_macro_unsupported_event",
+                ));
+            }
+            let action = match state {
+                key_state::DOWN => MacroActionKind::KeyDown,
+                key_state::UP => MacroActionKind::KeyUp,
+                _ => {
+                    return Err(CoreError::UnsupportedCapability(
+                        "lamzu_macro_unsupported_event",
+                    ));
+                }
+            };
+            let usage = 0xE0 + u8::try_from(event[1].trailing_zeros()).unwrap_or(0);
+            Ok(MacroStep::new(action, usage, delay_ms))
+        }
+        hid_code_type::KEYBOARD => {
+            let code = u16::from_le_bytes([event[1], event[2]]);
+            let keycode = u8::try_from(code).map_err(|_| {
+                CoreError::Protocol(format!(
+                    "Lamzu macro slot {index} uses keyboard code 0x{code:04X}"
+                ))
+            })?;
+            let action = match state {
+                key_state::DOWN => MacroActionKind::KeyDown,
+                key_state::UP => MacroActionKind::KeyUp,
+                other => {
+                    return Err(CoreError::Protocol(format!(
+                        "Lamzu macro slot {index} has unknown key state {other}"
+                    )));
+                }
+            };
+            Ok(MacroStep::new(action, keycode, delay_ms))
+        }
+        hid_code_type::MEDIA => {
+            let usage = u16::from_le_bytes([event[1], event[2]]);
+            let action = match state {
+                key_state::DOWN => MacroActionKind::MediaDown,
+                key_state::UP => MacroActionKind::MediaUp,
+                _ => {
+                    return Err(CoreError::UnsupportedCapability(
+                        "lamzu_macro_unsupported_event",
+                    ));
+                }
+            };
+            Ok(MacroStep::media(action, usage, delay_ms))
+        }
+        hid_code_type::MOUSE_BUTTON => {
+            let Some(button) = (event[2] == 0)
+                .then(|| MouseButton::from_bitmask(event[1]))
+                .flatten()
+            else {
+                return Err(CoreError::UnsupportedCapability(
+                    "lamzu_macro_unsupported_event",
+                ));
+            };
+            let action = match state {
+                key_state::DOWN => MacroActionKind::MouseDown,
+                key_state::UP => MacroActionKind::MouseUp,
+                _ => {
+                    return Err(CoreError::UnsupportedCapability(
+                        "lamzu_macro_unsupported_event",
+                    ));
+                }
+            };
+            Ok(MacroStep::mouse(action, button, delay_ms))
+        }
+        hid_code_type::MOVE_XY => {
+            if state != key_state::NONE {
+                return Err(CoreError::UnsupportedCapability(
+                    "lamzu_macro_unsupported_event",
+                ));
+            }
+            let dx = i8::from_ne_bytes([event[1]]);
+            let dy = i8::from_ne_bytes([event[2]]);
+            Ok(MacroStep::pointer_move(dx, dy, delay_ms))
+        }
+        _ => Err(CoreError::UnsupportedCapability(
+            "lamzu_macro_unsupported_event",
+        )),
     }
 }
 
@@ -178,38 +382,8 @@ pub fn decode_slot(
                 "Lamzu macro slot {index} context block is truncated"
             ))
         })?;
-        for event in raw[1..].as_chunks::<{ layout::CONTEXT_LEN }>().0 {
-            let flags = event[0];
-            let kind = flags & 0x0F;
-            let state = match flags & 0xC0 {
-                key_state::DOWN_FLAG => key_state::DOWN,
-                key_state::UP_FLAG => key_state::UP,
-                _ => key_state::NONE,
-            };
-            // MoveXY pairs and every other non-keyboard event cannot be re-encoded, so
-            // the whole slot is reported instead of loading with those events missing.
-            if kind != hid_code_type::KEYBOARD {
-                return Err(CoreError::UnsupportedCapability(
-                    "lamzu_macro_non_keyboard_event",
-                ));
-            }
-            let code = u16::from_le_bytes([event[1], event[2]]);
-            let keycode = u8::try_from(code).map_err(|_| {
-                CoreError::Protocol(format!(
-                    "Lamzu macro slot {index} uses keyboard code 0x{code:04X}"
-                ))
-            })?;
-            let delay_ms = u16::from_be_bytes([event[3], event[4]]);
-            let action = match state {
-                key_state::DOWN => MacroActionKind::KeyDown,
-                key_state::UP => MacroActionKind::KeyUp,
-                other => {
-                    return Err(CoreError::Protocol(format!(
-                        "Lamzu macro slot {index} has unknown key state {other}"
-                    )));
-                }
-            };
-            steps.push(MacroStep::new(action, keycode, delay_ms));
+        for &event in raw[1..].as_chunks::<{ layout::CONTEXT_LEN }>().0 {
+            steps.push(decode_context(index, event)?);
         }
     }
 
@@ -234,7 +408,8 @@ pub fn binding_repeat(index: u8, triplet: &[u8; 3]) -> Option<u8> {
     }
 }
 
-/// True when the context block holds an event this driver cannot re-encode losslessly.
+/// True when the context block holds an event this driver cannot re-encode losslessly
+/// (e.g. ACPI Power events, multi-button masks, or unknown wire types).
 pub fn has_unsupported_context(block: &[u8]) -> bool {
     let count = header_len(*block.first().unwrap_or(&0), layout::CONTEXT_MAX);
     if count == 0 {
@@ -247,12 +422,7 @@ pub fn has_unsupported_context(block: &[u8]) -> bool {
         .as_chunks::<{ layout::CONTEXT_LEN }>()
         .0
         .iter()
-        .any(|event| {
-            let kind = event[0] & 0x0F;
-            let state = event[0] & 0xC0;
-            kind != hid_code_type::KEYBOARD
-                || !matches!(state, key_state::DOWN_FLAG | key_state::UP_FLAG)
-        })
+        .any(|&event| decode_context(0, event).is_err())
 }
 
 #[cfg(test)]
@@ -307,8 +477,15 @@ mod tests {
     }
 
     #[test]
-    fn non_keyboard_events_are_reported_instead_of_dropped() {
-        let mut block = vec![1, hid_code_type::MEDIA, 0x01, 0x00, 0, 0];
+    fn power_and_unknown_events_remain_unsupported_instead_of_dropped() {
+        let mut block = vec![
+            1,
+            key_state::DOWN_FLAG | hid_code_type::POWER,
+            0x81,
+            0x00,
+            0,
+            0,
+        ];
         assert!(has_unsupported_context(&block));
         assert!(decode_slot(0, &[0], &block, 1).is_err());
         block[1] = key_state::DOWN_FLAG | hid_code_type::KEYBOARD;
@@ -317,46 +494,54 @@ mod tests {
     }
 
     #[test]
-    fn captured_mouse_button_macro_and_move_xy_are_unsupported() {
+    fn captured_mouse_button_media_modifier_and_move_xy_round_trip() {
         // `spam click` from the live 6912-byte dump: left button down, then up, 10 ms each.
         let spam_click = [
             0x02, 0x84, 0x01, 0x00, 0x00, 0x0A, 0x44, 0x01, 0x00, 0x00, 0x0A,
         ];
         let sum = spam_click.iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
         assert_eq!(0x55u8.wrapping_sub(sum), 0x75, "checksum from the capture");
-        assert!(has_unsupported_context(&spam_click));
-        assert!(matches!(
-            decode_slot(
-                5,
-                b"
-spam click",
-                &spam_click,
-                1
-            ),
-            Err(CoreError::UnsupportedCapability(_))
-        ));
+        assert!(!has_unsupported_context(&spam_click));
+        let decoded = decode_slot(5, b"\x0Aspam click", &spam_click, 1).unwrap();
+        assert_eq!(decoded.name, "spam click");
+        assert_eq!(
+            decoded.steps,
+            vec![
+                MacroStep::mouse(MacroActionKind::MouseDown, MouseButton::Left, 10),
+                MacroStep::mouse(MacroActionKind::MouseUp, MouseButton::Left, 10),
+            ]
+        );
+        assert_eq!(encode_contexts(&decoded.steps).unwrap(), spam_click);
 
-        // A MoveXY pair beside keyboard events must not load as the keyboard part alone.
-        let mixed = [
-            3,
-            key_state::DOWN_FLAG | hid_code_type::KEYBOARD,
-            0x04,
-            0,
-            0,
+        // MouseClick expands into down + up identical to the capture.
+        let click_encoded = encode_contexts(&[MacroStep::mouse(
+            MacroActionKind::MouseClick,
+            MouseButton::Left,
             10,
-            hid_code_type::MOVE_XY,
-            0x05,
-            0xFB,
-            0,
-            10,
-            key_state::UP_FLAG | hid_code_type::KEYBOARD,
-            0x04,
-            0,
-            0,
-            10,
+        )])
+        .unwrap();
+        assert_eq!(click_encoded, spam_click);
+
+        // Mixed sequence: modifier (Left Ctrl 0xE0 -> mask 0x01), keyboard, media (Play/Pause 0x00CD),
+        // mouse Back button, and MoveXY (+5, -5).
+        let mixed = vec![
+            MacroStep::new(MacroActionKind::KeyDown, 0xE0, 10),
+            MacroStep::new(MacroActionKind::KeyDown, 0x04, 15),
+            MacroStep::media(MacroActionKind::MediaDown, 0x00CD, 20),
+            MacroStep::media(MacroActionKind::MediaUp, 0x00CD, 25),
+            MacroStep::mouse(MacroActionKind::MouseDown, MouseButton::Back, 30),
+            MacroStep::mouse(MacroActionKind::MouseUp, MouseButton::Back, 35),
+            MacroStep::pointer_move(5, -5, 40),
+            MacroStep::new(MacroActionKind::KeyUp, 0x04, 45),
+            MacroStep::new(MacroActionKind::KeyUp, 0xE0, 50),
         ];
-        assert!(has_unsupported_context(&mixed));
-        assert!(decode_slot(0, &[0], &mixed, 1).is_err());
+        let encoded = encode_contexts(&mixed).unwrap();
+        assert!(!has_unsupported_context(&encoded));
+        // Verify exact MoveXY bytes (+5 = 0x05, -5 = 0xFB, state NONE = 0x00, type = 5).
+        assert_eq!(&encoded[31..36], &[0x05, 0x05, 0xFB, 0x00, 0x28]);
+        let round_tripped = decode_slot(2, b"\x05combo", &encoded, 2).unwrap();
+        assert_eq!(round_tripped.steps, mixed);
+        assert_eq!(round_tripped.repeat, 2);
     }
 
     #[test]

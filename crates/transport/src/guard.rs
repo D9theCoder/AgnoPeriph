@@ -211,6 +211,10 @@ impl<T: HidTransport> HidTransport for GuardedTransport<T> {
         Ok(read_len)
     }
 
+    fn drain_input_reports(&mut self) -> TransportResult<usize> {
+        self.inner.drain_input_reports()
+    }
+
     fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()> {
         if let Err(err) = self
             .validator

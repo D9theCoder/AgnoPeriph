@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use agnoperiph_core::{CoreError, CoreResult, DeviceId, KeyIndex, ProfileSlot, TravelHundredthsMm};
+use agnoperiph_core::{
+    ConnectionKind, CoreError, CoreResult, DeviceId, KeyIndex, ProfileSlot, TravelHundredthsMm,
+};
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode, WindowExt,
@@ -39,6 +41,8 @@ use crate::{
 
 /// How often the process watcher looks for configured games.
 pub const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// How often wired peripherals are checked for direct onboard edits (e.g. `Fn + RGB`, Win Lock).
+pub const HARDWARE_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Notice shown above the workspace after a failed operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +172,7 @@ pub struct AppOptions {
     config: AppConfig,
     discover_games: GameDiscovery,
     watch_processes: bool,
+    watch_hardware: bool,
     show_dev_tools: bool,
     check_updates: bool,
     releases: Arc<dyn ReleaseSource>,
@@ -177,6 +182,7 @@ impl std::fmt::Debug for AppOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppOptions")
             .field("watch_processes", &self.watch_processes)
+            .field("watch_hardware", &self.watch_hardware)
             .field("show_dev_tools", &self.show_dev_tools)
             .field("check_updates", &self.check_updates)
             .finish_non_exhaustive()
@@ -190,6 +196,7 @@ impl Default for AppOptions {
             config: AppConfig::default(),
             discover_games: Arc::new(Vec::new),
             watch_processes: false,
+            watch_hardware: false,
             show_dev_tools: true,
             check_updates: false,
             releases: Arc::new(GithubReleases::default()),
@@ -205,6 +212,7 @@ impl AppOptions {
             config,
             discover_games: Arc::new(crate::game_profiles::discover_installed_games),
             watch_processes: true,
+            watch_hardware: true,
             show_dev_tools: cfg!(debug_assertions),
             check_updates: true,
             releases: Arc::new(GithubReleases::default()),
@@ -236,6 +244,11 @@ impl AppOptions {
 
     pub fn with_process_watcher(mut self, enabled: bool) -> Self {
         self.watch_processes = enabled;
+        self
+    }
+
+    pub fn with_hardware_watcher(mut self, enabled: bool) -> Self {
+        self.watch_hardware = enabled;
         self
     }
 
@@ -313,6 +326,8 @@ pub struct AgnoPeriphApp {
     pub(crate) active_game: Option<String>,
     /// Profile slot last confirmed active per device by the Game Profile switcher.
     pub(crate) applied_targets: BTreeMap<String, u8>,
+    /// Transient retry count per `(device_id, target_slot)` for the active automatic switch.
+    pub(crate) auto_switch_retries: BTreeMap<(String, u8), u8>,
     /// Devices with an automatic switch queued or in flight.
     pending_targets: BTreeSet<String>,
     /// Coalesced Windows notification waiting for all queued switches of one game change to settle.
@@ -324,7 +339,9 @@ pub struct AgnoPeriphApp {
     pub(crate) smooth_scroll: SmoothScroll,
     pending_save: Arc<Mutex<Option<AppConfig>>>,
     save_lock: Arc<Mutex<()>>,
+    syncing_hardware: bool,
     watcher: Option<Task<()>>,
+    hardware_watcher: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     control_subscriptions: Vec<Subscription>,
 }
@@ -402,6 +419,7 @@ impl AgnoPeriphApp {
             config: options.config,
             active_game: None,
             applied_targets: BTreeMap::new(),
+            auto_switch_retries: BTreeMap::new(),
             pending_targets: BTreeSet::new(),
             pending_switch_notice: None,
             auto_switch_note: None,
@@ -411,12 +429,17 @@ impl AgnoPeriphApp {
             smooth_scroll: SmoothScroll::default(),
             pending_save: Arc::new(Mutex::new(None)),
             save_lock: Arc::new(Mutex::new(())),
+            syncing_hardware: false,
             watcher: None,
+            hardware_watcher: None,
             _subscriptions: vec![theme_subscription],
             control_subscriptions: Vec::new(),
         };
         if options.watch_processes {
             app.watcher = Some(Self::spawn_process_watcher(cx));
+        }
+        if options.watch_hardware {
+            app.hardware_watcher = Some(Self::spawn_hardware_watcher(cx));
         }
         app.refresh(cx);
         if check_updates {
@@ -726,6 +749,7 @@ impl AgnoPeriphApp {
         self.after_apply = None;
         // Fresh handles hold whatever the device stores; the switcher re-checks every target.
         self.applied_targets.clear();
+        self.auto_switch_retries.clear();
         match devices {
             Ok(devices) => {
                 let previous = self.selected.clone();
@@ -848,18 +872,7 @@ impl AgnoPeriphApp {
             let device_for_reply = device.clone();
             let reply = cx
                 .background_spawn(async move {
-                    let total = changes.len();
-                    let mut last = None;
-                    let mut failure = None;
-                    for (ix, change) in changes.into_iter().enumerate() {
-                        match service.apply(&device, change) {
-                            Ok(snapshot) => last = Some(snapshot),
-                            Err(err) => {
-                                failure = Some((ix, total, err));
-                                break;
-                            }
-                        }
-                    }
+                    let (last, failure) = service.apply_batch(&device, changes);
                     (last, failure, service.packet_log())
                 })
                 .await;
@@ -985,6 +998,8 @@ impl AgnoPeriphApp {
                 if *is_automatic {
                     self.applied_targets
                         .insert(device.as_str().to_owned(), *slot);
+                    self.auto_switch_retries
+                        .remove(&(device.as_str().to_owned(), *slot));
                     self.record_auto_switch(device, *slot);
                 }
             }
@@ -1076,9 +1091,18 @@ impl AgnoPeriphApp {
             ..
         } = origin
         {
-            // Remember the failed target so the switcher doesn't retry it every poll.
-            self.applied_targets
-                .insert(device.as_str().to_owned(), *slot);
+            let retry_key = (device.as_str().to_owned(), *slot);
+            let can_retry = !failure.rejected_before_send && !self.dry_run;
+            let retries = self.auto_switch_retries.entry(retry_key).or_insert(0);
+            if can_retry && *retries == 0 {
+                // Allow one automatic retry on the next process poll for transient HID hiccups
+                // so closing a game still reverts to the desktop profile without manual refresh.
+                *retries = 1;
+            } else {
+                // Remember the failed target so the switcher doesn't retry it every poll.
+                self.applied_targets
+                    .insert(device.as_str().to_owned(), *slot);
+            }
         }
         self.banner = Some(Banner {
             title: title.into(),
@@ -1386,6 +1410,118 @@ impl AgnoPeriphApp {
         })
     }
 
+    fn spawn_hardware_watcher(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(HARDWARE_SYNC_INTERVAL).await;
+                if this.update(cx, Self::sync_hardware_now).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Runs one lightweight read-only check for direct onboard hardware edits (such as
+    /// `Fn + RGB` lighting or Win Lock toggles on wired keyboards) and auto-saves any
+    /// detected change into the active software preset.
+    pub fn sync_hardware_now(&mut self, cx: &mut Context<Self>) {
+        if self.syncing_hardware
+            || self.is_loading
+            || self.has_pending_writes()
+            || self.is_calibrating()
+            || !self.has_loaded
+        {
+            return;
+        }
+        let targets: Vec<DeviceId> = self
+            .devices
+            .iter()
+            .filter(|d| {
+                d.info.connection == ConnectionKind::WiredUsb
+                    && (d.capabilities.has_rgb()
+                        || d.capabilities.has_keyboard_config()
+                        || d.capabilities.has_profiles())
+                    && !d.is_preview
+                    && !(self.is_dirty() && self.draft_device.as_ref() == Some(d.id()))
+                    && !self.pending_targets.contains(d.id().as_str())
+                    && !(self.selected.as_ref() == Some(d.id()) && self.lighting.drag.is_some())
+            })
+            .map(|d| d.id().clone())
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+
+        self.syncing_hardware = true;
+        let revision = self.revision;
+        let service = self.service.clone();
+        cx.spawn(async move |this, cx| {
+            let updates = cx
+                .background_spawn(async move {
+                    let mut changed = Vec::new();
+                    for id in targets {
+                        if let Ok(Some(snapshot)) = service.sync_hardware_state(&id) {
+                            changed.push(snapshot);
+                        }
+                    }
+                    changed
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_hardware_sync(revision, updates, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_hardware_sync(
+        &mut self,
+        revision: u64,
+        updates: Vec<DeviceSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        self.syncing_hardware = false;
+        if revision != self.revision || updates.is_empty() {
+            return;
+        }
+        let mut any_applied = false;
+        let mut selected_updated = false;
+        for snapshot in updates {
+            let id = snapshot.id().clone();
+            if self.is_loading
+                || self.has_pending_writes()
+                || self.is_calibrating()
+                || self.pending_targets.contains(id.as_str())
+                || (self.is_dirty() && self.draft_device.as_ref() == Some(&id))
+                || (self.selected.as_ref() == Some(&id) && self.lighting.drag.is_some())
+                || self.device(&id).is_some_and(|d| d.is_preview)
+            {
+                continue;
+            }
+            let preset_changed = self.device(&id).is_some_and(|prev| {
+                prev.rgb != snapshot.rgb || prev.keyboard_config != snapshot.keyboard_config
+            });
+            self.store_snapshot(snapshot);
+            if preset_changed {
+                // Persist direct onboard keyboard edits (e.g. Fn + RGB) into the active
+                // software preset so later game-profile switches restore them cleanly.
+                self.snapshot_active_software_preset(&id);
+            }
+            if self.selected.as_ref() == Some(&id) {
+                self.lighting.clear_draft();
+                selected_updated = true;
+            }
+            any_applied = true;
+        }
+        if any_applied {
+            self.observe_batteries(cx);
+            if selected_updated {
+                self.request_sync(cx);
+            }
+            cx.notify();
+        }
+    }
+
     /// Matches running executables against Game Profiles and queues profile switches.
     ///
     /// The process watcher calls this every [`PROCESS_POLL_INTERVAL`]; tests call it directly.
@@ -1399,6 +1535,7 @@ impl AgnoPeriphApp {
         if matched != previous_game {
             self.active_game = matched;
             self.applied_targets.clear();
+            self.auto_switch_retries.clear();
             self.auto_switch_note = None;
             self.pending_switch_notice = if self.config.auto_switch_enabled
                 && self.config.notify_on_game_switch

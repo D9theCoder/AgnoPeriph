@@ -129,6 +129,26 @@ impl HidTransport for HidapiTransport {
         Ok(bytes_read)
     }
 
+    fn drain_input_reports(&mut self) -> TransportResult<usize> {
+        const MAX_DRAIN_REPORTS: usize = 512;
+        let device = self
+            .device
+            .lock()
+            .map_err(|_| TransportError::Io("HID device mutex poisoned".to_owned()))?;
+        let mut discard = [0u8; 512];
+        let mut drained = 0usize;
+        for _ in 0..MAX_DRAIN_REPORTS {
+            let bytes_read = device
+                .read_timeout(&mut discard, 0)
+                .map_err(|err| TransportError::Io(err.to_string()))?;
+            if bytes_read == 0 {
+                break;
+            }
+            drained += 1;
+        }
+        Ok(drained)
+    }
+
     fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()> {
         let device = self
             .device

@@ -12,7 +12,7 @@ pub mod protocol;
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agnoperiph_core::{
     BatteryMonitor, Brightness, CalibrationStatus, Capabilities, ConnectionKind, CoreError,
@@ -52,7 +52,8 @@ use crate::protocol::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(800);
-const MAX_READ_ATTEMPTS: usize = 8;
+/// Maximum unrelated/unsolicited input reports skipped while waiting for one ATK RS7 reply.
+pub const RS7_MAX_READ_ATTEMPTS: usize = 64;
 
 struct PairedSlotScan {
     socd_pairs: Vec<SocdPair>,
@@ -456,6 +457,13 @@ impl<T: HidTransport> AtkRs7Device<T> {
         let tx = wrap_tx(payload);
         let expected_cmd = payload[0];
 
+        // Flush any stale or unsolicited input reports accumulated in the OS HID ring
+        // buffer while the handle sat idle (e.g. onboard Fn+RGB/WinLock notifications),
+        // so the real reply is never buried behind older frames.
+        if !mutating || !self.transport.is_dry_run() {
+            let _ = self.transport.drain_input_reports();
+        }
+
         if mutating {
             self.transport.send_output_report(&tx)?;
             if self.transport.is_dry_run() {
@@ -465,9 +473,16 @@ impl<T: HidTransport> AtkRs7Device<T> {
             self.transport.send_query_output_report(&tx)?;
         }
 
+        let deadline = Instant::now() + READ_TIMEOUT;
         let mut rx = [0u8; RS7_TX_REPORT_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let n = match self.transport.read_input_report(&mut rx, READ_TIMEOUT) {
+        for _ in 0..RS7_MAX_READ_ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(CoreError::NotConnected(format!(
+                    "timed out waiting for ATK RS7 reply to cmd 0x{expected_cmd:02X}"
+                )));
+            }
+            let n = match self.transport.read_input_report(&mut rx, remaining) {
                 Ok(len) => len,
                 Err(TransportError::Timeout { .. }) => {
                     return Err(CoreError::NotConnected(format!(
@@ -476,7 +491,9 @@ impl<T: HidTransport> AtkRs7Device<T> {
                 }
                 Err(err) => return Err(err.into()),
             };
-            if let Some(decoded) = unwrap_rx(&rx[..n], expected_cmd) {
+            if let Some(decoded) = unwrap_rx(&rx[..n], expected_cmd)
+                && matches_expected_subcmd(&payload, &decoded)
+            {
                 return Ok(decoded);
             }
         }
@@ -539,6 +556,25 @@ impl<T: HidTransport> AtkRs7Device<T> {
             }
         }
         Ok(flags)
+    }
+}
+
+const fn matches_expected_subcmd(
+    request: &[u8; RS7_PAYLOAD_LEN],
+    reply: &[u8; RS7_PAYLOAD_LEN],
+) -> bool {
+    match request[0] {
+        protocol::cmd::GET_KEYBOARD_VALUE | protocol::cmd::SET_KEYBOARD_VALUE
+            if request[1] == protocol::sub::CUSTOM_ID =>
+        {
+            reply[1] != protocol::sub::CUSTOM_ID || reply[2] == request[2]
+        }
+        protocol::cmd::LIGHTING_GET_VALUE | protocol::cmd::LIGHTING_SET_VALUE
+            if request[1] == protocol::sub::LIGHT_INFO =>
+        {
+            reply[1] == 0 || reply[1] == protocol::sub::LIGHT_INFO
+        }
+        _ => true,
     }
 }
 
@@ -1794,5 +1830,47 @@ mod tests {
                 .iter()
                 .any(|r| r.usage_page == Some(ATK_MOUSE_USAGE_PAGE))
         );
+    }
+
+    #[test]
+    fn exchange_drains_stale_unsolicited_reports_and_matches_subcmd() {
+        // 1. Stale unsolicited reports sitting in the OS HID ring buffer (> old limit of 8)
+        //    must be drained before sending a request so the real reply is received.
+        let mut stale_mock = MockHidTransport::new(rs7_descriptor());
+        push_open_replies(&mut stale_mock, false);
+        for _ in 0..20 {
+            let mut unsolicited = vec![0u8; RS7_PAYLOAD_LEN];
+            unsolicited[0] = protocol::cmd::LIGHTING_GET_VALUE;
+            unsolicited[1] = protocol::sub::LIGHT_INFO;
+            stale_mock.push_stale_input_report(unsolicited);
+        }
+
+        // Open cleanly first (drains the 20 stale reports before firmware version query).
+        let dev = AtkRs7Device::open(stale_mock, false, None).unwrap();
+        assert_eq!(dev.info().firmware_version.as_deref(), Some("v1.12"));
+
+        // 2. In-flight unsolicited reports (> 8) plus a mismatched 0x96 subcmd are skipped.
+        let mut mock2 = MockHidTransport::new(rs7_descriptor());
+        push_open_replies(&mut mock2, false);
+        for _ in 0..12 {
+            let mut noise = vec![0u8; RS7_PAYLOAD_LEN];
+            noise[0] = protocol::cmd::LIGHTING_GET_VALUE;
+            mock2.push_input_response(noise);
+        }
+        let mut wrong_subcmd = vec![0u8; RS7_PAYLOAD_LEN];
+        wrong_subcmd[0] = protocol::cmd::SET_KEYBOARD_VALUE;
+        wrong_subcmd[1] = protocol::sub::CUSTOM_ID;
+        wrong_subcmd[2] = protocol::sub::BOX_LIGHT;
+        mock2.push_input_response(wrong_subcmd);
+
+        let mut real_ack = vec![0u8; RS7_PAYLOAD_LEN];
+        real_ack[0] = protocol::cmd::SET_KEYBOARD_VALUE;
+        real_ack[1] = protocol::sub::CUSTOM_ID;
+        real_ack[2] = protocol::sub::ONE_TOG_TH;
+        mock2.push_input_response(real_ack);
+
+        let mut dev2 = AtkRs7Device::open(mock2, false, None).unwrap();
+        dev2.set_key_actuation(KeyIndex::new(33), TravelHundredthsMm::from_hundredths(40))
+            .unwrap();
     }
 }

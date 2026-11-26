@@ -101,11 +101,15 @@ while recording.
 ## 4. Writer contract (this repository)
 
 `crates/drivers/driver-lamzu/src/crystall.rs` implements the packed layout and
-codec. The driver only authors `type = 1` keyboard events.
+codec for modifier (`type = 0`, single-bit HID modifier mapped to `0xE0..=0xE7`),
+keyboard (`type = 1`), media/consumer (`type = 2`), mouse button (`type = 4`,
+Left/Right/Middle/Back/Forward), and relative pointer movement (`type = 5`,
+`MoveXY`) events.
 
 - Reading: every macro record is read, including slots with no macro trigger (the
   vendor editor lists all 16 records regardless of bindings). A slot whose contexts
-  contain any other type (MoveXY included) stays visible by name with no steps and
+  contain genuinely unsupported events (such as `type = 3` ACPI Power, multi-bit
+  masks, or unknown types) stays visible by name with no steps and
   `MacroSlot::is_readonly` set; the rest of the slots still load. Header bytes above
   the valid range (`0xFF` on erased flash) are treated as empty, not clamped to the
   maximum.

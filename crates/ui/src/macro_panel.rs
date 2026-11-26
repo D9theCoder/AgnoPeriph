@@ -4,11 +4,14 @@
 
 use std::collections::BTreeMap;
 
-use agnoperiph_core::{MacroActionKind, MacroSlot, MacroStep};
+use agnoperiph_core::{MacroActionKind, MacroCapabilities, MacroSlot, MacroStep, MouseButton};
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Selectable, Sizable,
     button::{Button, ButtonGroup, ButtonVariants},
-    h_flex, v_flex,
+    h_flex,
+    menu::{DropdownMenu, PopupMenuItem},
+    tag::Tag,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -21,10 +24,42 @@ use crate::hall_effect_panel::key_chooser;
 const DELAY_STEP_MS: u16 = 10;
 const MAX_DELAY_MS: u16 = 9_990;
 const DEFAULT_DELAY_MS: u16 = 20;
-/// Steps a new macro starts with use the Space key.
+/// Steps a new keyboard macro starts with use the Space key.
 const DEFAULT_STEP_USAGE: u8 = 0x2C;
+/// Default USB HID Consumer usage (`Play / Pause`) for newly added media steps.
+const DEFAULT_MEDIA_USAGE: u16 = 0x00CD;
 const MIN_REPEAT: u8 = 1;
 const MAX_REPEAT: u8 = u8::MAX;
+
+/// Standard USB HID Consumer Page (`0x0C`) usages offered by the media macro chooser.
+const CONSUMER_MEDIA_USAGES: &[(u16, &str)] = &[
+    (0x00CD, "Play / Pause"),
+    (0x00B5, "Next Track"),
+    (0x00B6, "Previous Track"),
+    (0x00B7, "Stop"),
+    (0x00E9, "Volume Up"),
+    (0x00EA, "Volume Down"),
+    (0x00E2, "Mute"),
+    (0x0183, "Media Player"),
+    (0x018A, "Mail"),
+    (0x0192, "Calculator"),
+    (0x0194, "My Computer"),
+    (0x0221, "Search"),
+    (0x0223, "Browser Home"),
+    (0x0224, "Browser Back"),
+    (0x0225, "Browser Forward"),
+    (0x0227, "Browser Refresh"),
+];
+
+fn media_label(usage: u16) -> String {
+    CONSUMER_MEDIA_USAGES
+        .iter()
+        .find(|(code, _)| *code == usage)
+        .map_or_else(
+            || format!("Media 0x{usage:04X}"),
+            |(_, name)| (*name).to_owned(),
+        )
+}
 
 /// Macro view state: the selected slot and the unsaved copy of every slot.
 #[derive(Debug, Clone, Default)]
@@ -69,9 +104,13 @@ pub(crate) fn slot_name(slot: &MacroSlot) -> String {
 
 fn kind_label(kind: MacroActionKind) -> &'static str {
     match kind {
-        MacroActionKind::KeyDown => "Down",
-        MacroActionKind::KeyUp => "Up",
-        MacroActionKind::KeyTap => "Tap",
+        MacroActionKind::KeyDown | MacroActionKind::MouseDown | MacroActionKind::MediaDown => {
+            "Down"
+        }
+        MacroActionKind::KeyUp | MacroActionKind::MouseUp | MacroActionKind::MediaUp => "Up",
+        MacroActionKind::KeyTap | MacroActionKind::MediaTap => "Tap",
+        MacroActionKind::MouseClick => "Click",
+        MacroActionKind::PointerMove => "Move",
     }
 }
 
@@ -129,13 +168,60 @@ impl AgnoPeriphApp {
             *next += 1;
             let usage = slot
                 .steps
-                .last()
+                .iter()
+                .rev()
+                .find(|s| s.kind.is_keyboard())
                 .map_or(DEFAULT_STEP_USAGE, |s| s.hid_keycode);
             slot.steps.push(MacroStep::new(
                 MacroActionKind::KeyTap,
                 usage,
                 DEFAULT_DELAY_MS,
             ));
+        });
+    }
+
+    fn add_macro_mouse_step(&mut self, cx: &mut Context<Self>) {
+        self.edit_macro(cx, |slot, ids, next| {
+            ids.push(*next);
+            *next += 1;
+            let button = slot
+                .steps
+                .iter()
+                .rev()
+                .find_map(|s| s.mouse_button)
+                .unwrap_or(MouseButton::Left);
+            slot.steps.push(MacroStep::mouse(
+                MacroActionKind::MouseClick,
+                button,
+                DEFAULT_DELAY_MS,
+            ));
+        });
+    }
+
+    fn add_macro_media_step(&mut self, cx: &mut Context<Self>) {
+        self.edit_macro(cx, |slot, ids, next| {
+            ids.push(*next);
+            *next += 1;
+            let usage = slot
+                .steps
+                .iter()
+                .rev()
+                .find(|s| s.kind.is_media())
+                .map_or(DEFAULT_MEDIA_USAGE, |s| s.consumer_usage);
+            slot.steps.push(MacroStep::media(
+                MacroActionKind::MediaTap,
+                usage,
+                DEFAULT_DELAY_MS,
+            ));
+        });
+    }
+
+    fn add_macro_move_step(&mut self, cx: &mut Context<Self>) {
+        self.edit_macro(cx, |slot, ids, next| {
+            ids.push(*next);
+            *next += 1;
+            slot.steps
+                .push(MacroStep::pointer_move(0, 0, DEFAULT_DELAY_MS));
         });
     }
 
@@ -180,6 +266,34 @@ impl AgnoPeriphApp {
         self.edit_macro(cx, |slot, _, _| {
             if let Some(s) = slot.steps.get_mut(step) {
                 s.hid_keycode = usage;
+            }
+        });
+    }
+
+    fn set_step_mouse_button(&mut self, step: usize, button: MouseButton, cx: &mut Context<Self>) {
+        self.edit_macro(cx, |slot, _, _| {
+            if let Some(s) = slot.steps.get_mut(step) {
+                s.mouse_button = Some(button);
+            }
+        });
+    }
+
+    fn set_step_media(&mut self, step: usize, usage: u16, cx: &mut Context<Self>) {
+        self.edit_macro(cx, |slot, _, _| {
+            if let Some(s) = slot.steps.get_mut(step) {
+                s.consumer_usage = usage;
+            }
+        });
+    }
+
+    fn step_move_delta(&mut self, step: usize, axis_x: bool, delta: i8, cx: &mut Context<Self>) {
+        self.edit_macro(cx, |slot, _, _| {
+            if let Some(s) = slot.steps.get_mut(step) {
+                if axis_x {
+                    s.move_x = s.move_x.saturating_add(delta);
+                } else {
+                    s.move_y = s.move_y.saturating_add(delta);
+                }
             }
         });
     }
@@ -267,19 +381,26 @@ pub(crate) fn render(
         )
         .child(muted_note("Macros couldn’t be read.", cx.theme()));
     };
+    let caps = state.capabilities;
+    let has_advanced =
+        caps.supports_mouse_buttons || caps.supports_media_keys || caps.supports_pointer_move;
     let description = if device.capabilities.has_keymap() {
         format!(
             "Record key sequences into the device’s {} macro slots, then bind them on the Keybinds tab.",
-            state.capabilities.max_slots
+            caps.max_slots
+        )
+    } else if has_advanced {
+        format!(
+            "Record key, mouse-button, media, and pointer-move sequences into the device’s {} macro slots. Saving doesn’t reassign buttons.",
+            caps.max_slots
         )
     } else {
         format!(
             "Record key sequences into the device’s {} macro slots. Saving doesn’t reassign buttons.",
-            state.capabilities.max_slots
+            caps.max_slots
         )
     };
     let base = section("macro-panel", "Macros", description, cx.theme());
-    let supports_repeat = state.capabilities.supports_repeat;
     let busy = app.is_busy() || app.is_loading();
     let slots = app.macro_slots();
     let selected = app.macros_ui.selected;
@@ -324,7 +445,7 @@ pub(crate) fn render(
         }));
 
     let editor = match current {
-        Some(slot) => render_editor(app, &slot, supports_repeat, busy, cx).into_any_element(),
+        Some(slot) => render_editor(app, &slot, caps, busy, cx).into_any_element(),
         None => muted_note("Select a macro slot.", cx.theme()).into_any_element(),
     };
 
@@ -373,13 +494,15 @@ pub(crate) fn render(
 fn render_editor(
     app: &AgnoPeriphApp,
     slot: &MacroSlot,
-    supports_repeat: bool,
+    caps: MacroCapabilities,
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
     let index = slot.index;
     let count = slot.steps.len();
     let is_readonly = slot.is_readonly;
+    let has_advanced =
+        caps.supports_mouse_buttons || caps.supports_media_keys || caps.supports_pointer_move;
     let header = h_flex()
         .gap_2()
         .child(
@@ -417,14 +540,14 @@ fn render_editor(
         .enumerate()
         .map(|(ix, (step, id))| render_step(ix, id, *step, count, busy, cx))
         .collect();
-    let repeat = (supports_repeat && !is_readonly).then(|| render_repeat(slot, busy, cx));
+    let repeat = (caps.supports_repeat && !is_readonly).then(|| render_repeat(slot, busy, cx));
     let theme = cx.theme();
     group("macro-steps", "Steps", theme)
         .child(header)
         .children(repeat)
         .when(is_readonly, |this| {
             this.child(muted_note(
-                "This macro uses mouse-button or media events, which AgnoPeriph can’t edit yet. Saving keeps it unchanged on the device.",
+                "This macro uses events AgnoPeriph can’t edit yet. Saving keeps it unchanged on the device.",
                 theme,
             ))
         })
@@ -436,15 +559,51 @@ fn render_editor(
         })
         .child(v_flex().gap_1().children(rows))
         .child(
-            h_flex().child(
-                Button::new("add-macro-step")
-                    .outline()
-                    .small()
-                    .icon(IconName::Plus)
-                    .label("Add step")
-                    .disabled(busy || is_readonly)
-                    .on_click(cx.listener(|this, _, _, cx| this.add_macro_step(cx))),
-            ),
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Button::new("add-macro-step")
+                        .outline()
+                        .small()
+                        .icon(IconName::Plus)
+                        .label(if has_advanced { "Add key" } else { "Add step" })
+                        .disabled(busy || is_readonly)
+                        .on_click(cx.listener(|this, _, _, cx| this.add_macro_step(cx))),
+                )
+                .when(caps.supports_mouse_buttons, |this| {
+                    this.child(
+                        Button::new("add-macro-mouse-step")
+                            .outline()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("Add click")
+                            .disabled(busy || is_readonly)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_macro_mouse_step(cx))),
+                    )
+                })
+                .when(caps.supports_media_keys, |this| {
+                    this.child(
+                        Button::new("add-macro-media-step")
+                            .outline()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("Add media")
+                            .disabled(busy || is_readonly)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_macro_media_step(cx))),
+                    )
+                })
+                .when(caps.supports_pointer_move, |this| {
+                    this.child(
+                        Button::new("add-macro-move-step")
+                            .outline()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("Add move")
+                            .disabled(busy || is_readonly)
+                            .on_click(cx.listener(|this, _, _, cx| this.add_macro_move_step(cx))),
+                    )
+                }),
         )
 }
 
@@ -498,6 +657,140 @@ fn render_repeat(
         })
 }
 
+fn mouse_button_chooser(
+    id: impl Into<ElementId>,
+    current: MouseButton,
+    disabled: bool,
+    on_pick: impl Fn(&mut AgnoPeriphApp, MouseButton, &mut Context<AgnoPeriphApp>) + 'static,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> AnyElement {
+    let app = cx.entity().downgrade();
+    let on_pick = std::rc::Rc::new(on_pick);
+    Button::new(id)
+        .outline()
+        .small()
+        .label(current.label())
+        .dropdown_caret(true)
+        .disabled(disabled)
+        .dropdown_menu(move |mut menu, _, _| {
+            for button in MouseButton::ALL {
+                let app = app.clone();
+                let on_pick = on_pick.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(button.label())
+                        .checked(button == current)
+                        .on_click(move |_, _, cx| {
+                            let _ = app.update(cx, |this, cx| on_pick(this, button, cx));
+                        }),
+                );
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+fn media_chooser(
+    id: impl Into<ElementId>,
+    current: u16,
+    disabled: bool,
+    on_pick: impl Fn(&mut AgnoPeriphApp, u16, &mut Context<AgnoPeriphApp>) + 'static,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> AnyElement {
+    let app = cx.entity().downgrade();
+    let on_pick = std::rc::Rc::new(on_pick);
+    Button::new(id)
+        .outline()
+        .small()
+        .label(media_label(current))
+        .dropdown_caret(true)
+        .disabled(disabled)
+        .dropdown_menu(move |mut menu, _, _| {
+            menu = menu.scrollable(true).max_h(px(320.));
+            for &(usage, name) in CONSUMER_MEDIA_USAGES {
+                let app = app.clone();
+                let on_pick = on_pick.clone();
+                menu = menu.item(PopupMenuItem::new(name).checked(usage == current).on_click(
+                    move |_, _, cx| {
+                        let _ = app.update(cx, |this, cx| on_pick(this, usage, cx));
+                    },
+                ));
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+fn render_move_axis(
+    ix: usize,
+    id: u64,
+    axis_x: bool,
+    value: i8,
+    busy: bool,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> AnyElement {
+    let (label, dec_id, inc_id, dec_label, inc_label) = if axis_x {
+        (
+            "X",
+            ("macro-move-x-dec", id),
+            ("macro-move-x-inc", id),
+            "Decrease X delta",
+            "Increase X delta",
+        )
+    } else {
+        (
+            "Y",
+            ("macro-move-y-dec", id),
+            ("macro-move-y-inc", id),
+            "Decrease Y delta",
+            "Increase Y delta",
+        )
+    };
+    let theme = cx.theme();
+    h_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(
+            Button::new(dec_id)
+                .ghost()
+                .xsmall()
+                .icon(IconName::Minus)
+                .accessibility_label(dec_label)
+                .tooltip("Hold Shift for −10")
+                .disabled(busy || value == i8::MIN)
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    let step = if ev.modifiers().shift { -10 } else { -1 };
+                    this.step_move_delta(ix, axis_x, step, cx);
+                })),
+        )
+        .child(
+            div()
+                .w_10()
+                .text_sm()
+                .text_center()
+                .font_family(theme.mono_font_family.clone())
+                .child(format!("{value:+}")),
+        )
+        .child(
+            Button::new(inc_id)
+                .ghost()
+                .xsmall()
+                .icon(IconName::Plus)
+                .accessibility_label(inc_label)
+                .tooltip("Hold Shift for +10")
+                .disabled(busy || value == i8::MAX)
+                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                    let step = if ev.modifiers().shift { 10 } else { 1 };
+                    this.step_move_delta(ix, axis_x, step, cx);
+                })),
+        )
+        .into_any_element()
+}
+
 fn render_step(
     ix: usize,
     id: u64,
@@ -506,33 +799,110 @@ fn render_step(
     busy: bool,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> AnyElement {
-    let kinds = ButtonGroup::new(("macro-step-kind", id))
-        .outline()
-        .xsmall()
-        .children(
-            [
-                MacroActionKind::KeyDown,
-                MacroActionKind::KeyUp,
-                MacroActionKind::KeyTap,
-            ]
-            .map(|kind| {
-                Button::new(SharedString::from(format!(
-                    "macro-step-{id}-{}",
-                    kind_label(kind).to_lowercase()
-                )))
-                .label(kind_label(kind))
-                .selected(step.kind == kind)
-                .disabled(busy)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_step_kind(ix, kind, cx)))
-            }),
+    let action_controls: AnyElement = if step.kind.is_keyboard() {
+        let kinds = ButtonGroup::new(("macro-step-kind", id))
+            .outline()
+            .xsmall()
+            .children(
+                [
+                    MacroActionKind::KeyDown,
+                    MacroActionKind::KeyUp,
+                    MacroActionKind::KeyTap,
+                ]
+                .map(|kind| {
+                    Button::new(SharedString::from(format!(
+                        "macro-step-{id}-{}",
+                        kind_label(kind).to_lowercase()
+                    )))
+                    .label(kind_label(kind))
+                    .selected(step.kind == kind)
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_step_kind(ix, kind, cx)))
+                }),
+            );
+        let key = key_chooser(
+            ("macro-step-key", id),
+            step.hid_keycode,
+            busy,
+            move |this, usage, cx| this.set_step_key(ix, usage, cx),
+            cx,
         );
-    let key = key_chooser(
-        ("macro-step-key", id),
-        step.hid_keycode,
-        busy,
-        move |this, usage, cx| this.set_step_key(ix, usage, cx),
-        cx,
-    );
+        h_flex().gap_3().child(kinds).child(key).into_any_element()
+    } else if step.kind.is_mouse_button() {
+        let kinds = ButtonGroup::new(("macro-step-kind", id))
+            .outline()
+            .xsmall()
+            .children(
+                [
+                    MacroActionKind::MouseDown,
+                    MacroActionKind::MouseUp,
+                    MacroActionKind::MouseClick,
+                ]
+                .map(|kind| {
+                    Button::new(SharedString::from(format!(
+                        "macro-step-{id}-{}",
+                        kind_label(kind).to_lowercase()
+                    )))
+                    .label(kind_label(kind))
+                    .selected(step.kind == kind)
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_step_kind(ix, kind, cx)))
+                }),
+            );
+        let button = step.mouse_button.unwrap_or(MouseButton::Left);
+        let chooser = mouse_button_chooser(
+            ("macro-step-mouse", id),
+            button,
+            busy,
+            move |this, next, cx| this.set_step_mouse_button(ix, next, cx),
+            cx,
+        );
+        h_flex()
+            .gap_3()
+            .child(kinds)
+            .child(chooser)
+            .into_any_element()
+    } else if step.kind.is_media() {
+        let kinds = ButtonGroup::new(("macro-step-kind", id))
+            .outline()
+            .xsmall()
+            .children(
+                [
+                    MacroActionKind::MediaDown,
+                    MacroActionKind::MediaUp,
+                    MacroActionKind::MediaTap,
+                ]
+                .map(|kind| {
+                    Button::new(SharedString::from(format!(
+                        "macro-step-{id}-{}",
+                        kind_label(kind).to_lowercase()
+                    )))
+                    .label(kind_label(kind))
+                    .selected(step.kind == kind)
+                    .disabled(busy)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_step_kind(ix, kind, cx)))
+                }),
+            );
+        let chooser = media_chooser(
+            ("macro-step-media", id),
+            step.consumer_usage,
+            busy,
+            move |this, next, cx| this.set_step_media(ix, next, cx),
+            cx,
+        );
+        h_flex()
+            .gap_3()
+            .child(kinds)
+            .child(chooser)
+            .into_any_element()
+    } else {
+        h_flex()
+            .gap_3()
+            .child(Tag::secondary().small().child("Move XY"))
+            .child(render_move_axis(ix, id, true, step.move_x, busy, cx))
+            .child(render_move_axis(ix, id, false, step.move_y, busy, cx))
+            .into_any_element()
+    };
     let theme = cx.theme();
     let ordinal = div()
         .w_6()
@@ -601,8 +971,7 @@ fn render_step(
         .gap_3()
         .py_1()
         .child(ordinal)
-        .child(kinds)
-        .child(key)
+        .child(action_controls)
         .child(delay)
         .child(div().flex_1())
         .child(order)

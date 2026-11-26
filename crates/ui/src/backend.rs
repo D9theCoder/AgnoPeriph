@@ -280,6 +280,27 @@ pub trait PeripheralService: Send + Sync {
     fn apply(&self, device: &DeviceId, change: SettingChange)
     -> Result<DeviceSnapshot, ApplyError>;
 
+    /// Validates and applies a sequence of changes, stopping at the first failure.
+    ///
+    /// Returns the latest confirmed snapshot (when at least one step succeeded) and any
+    /// `(failed_step_index, total_steps, error)`.
+    #[allow(clippy::type_complexity)]
+    fn apply_batch(
+        &self,
+        device: &DeviceId,
+        changes: Vec<SettingChange>,
+    ) -> (Option<DeviceSnapshot>, Option<(usize, usize, ApplyError)>) {
+        let total = changes.len();
+        let mut last = None;
+        for (ix, change) in changes.into_iter().enumerate() {
+            match self.apply(device, change) {
+                Ok(snapshot) => last = Some(snapshot),
+                Err(err) => return (last, Some((ix, total, err))),
+            }
+        }
+        (last, None)
+    }
+
     /// Returns the most recent traced HID frames, oldest first.
     fn packet_log(&self) -> Vec<PacketTraceEntry>;
 
@@ -290,6 +311,15 @@ pub trait PeripheralService: Send + Sync {
     fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
         let _ = device;
         Err(CoreError::UnsupportedCapability("live_key_travel"))
+    }
+
+    /// Lightweight read-only sync for settings users can change directly on hardware
+    /// (RGB lighting, keyboard toggles like Win Lock / Mac mode, and active onboard profile).
+    ///
+    /// Returns `Ok(Some(snapshot))` only when hardware state changed from the cached snapshot.
+    fn sync_hardware_state(&self, device: &DeviceId) -> CoreResult<Option<DeviceSnapshot>> {
+        let _ = device;
+        Ok(None)
     }
 
     fn apply_pointer_settings(
@@ -678,6 +708,28 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
             });
             if edits_readonly_slot {
                 return Err(CoreError::UnsupportedCapability("macro_readonly_slot"));
+            }
+            for slot in slots {
+                if slot.is_readonly {
+                    continue;
+                }
+                for step in &slot.steps {
+                    if step.kind.is_mouse_button() {
+                        if !mac.capabilities.supports_mouse_buttons {
+                            return Err(CoreError::UnsupportedCapability("macro_mouse_buttons"));
+                        }
+                        if step.mouse_button.is_none() {
+                            return Err(CoreError::Validation(
+                                "mouse macro step is missing a target button".to_owned(),
+                            ));
+                        }
+                    } else if step.kind.is_media() && !mac.capabilities.supports_media_keys {
+                        return Err(CoreError::UnsupportedCapability("macro_media_keys"));
+                    } else if step.kind.is_pointer_move() && !mac.capabilities.supports_pointer_move
+                    {
+                        return Err(CoreError::UnsupportedCapability("macro_pointer_move"));
+                    }
+                }
             }
             Ok(())
         }
@@ -1145,6 +1197,10 @@ impl HidTransport for BoxedTransport {
         self.0.read_input_report(buf, timeout)
     }
 
+    fn drain_input_reports(&mut self) -> TransportResult<usize> {
+        self.0.drain_input_reports()
+    }
+
     fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()> {
         self.0.send_feature_report(report)
     }
@@ -1281,12 +1337,22 @@ impl LiveHidService {
     }
 
     /// Re-enumerates and reopens `device_id` after a brief USB reset (such as changing
-    /// polling rate on an ATK RS7 keyboard). Retries with short backoff so the OS HID
-    /// interface has time to come back online.
-    fn reopen_device(&self, device_id: &DeviceId, dry_run: bool) -> Option<LiveDevice> {
+    /// polling rate on an ATK RS7 keyboard) or a stale/suspended HID handle. Retries with
+    /// short backoff so the OS HID interface has time to come back online.
+    fn reopen_device(
+        &self,
+        device_id: &DeviceId,
+        dry_run: bool,
+        wait_for_usb_reset: bool,
+    ) -> Option<LiveDevice> {
         let registry = build_registry();
         let sink: Arc<dyn PacketSink> = self.sink.clone();
-        for delay_ms in [350u64, 450, 550, 650, 750, 850] {
+        let delays: &[u64] = if wait_for_usb_reset {
+            &[350, 450, 550, 650, 750, 850]
+        } else {
+            &[50, 300, 500, 750]
+        };
+        for &delay_ms in delays {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             let Ok(descriptors) = self.enumerator.enumerate() else {
                 continue;
@@ -1436,10 +1502,29 @@ impl PeripheralService for LiveHidService {
             if is_polling_rate_change && is_disconnect_message(&err.to_string()) {
                 let dropped_device = state.devices.remove(target_ix);
                 drop(dropped_device);
-                if let Some(reopened) = self.reopen_device(device, dry_run) {
+                if let Some(reopened) = self.reopen_device(device, dry_run, true) {
                     let snap = reopened.snapshot.clone();
                     state.devices.insert(target_ix, reopened);
                     return Ok(snap);
+                }
+                return Err(ApplyError::failed_after_send(err, None));
+            }
+            // A stale/suspended HID handle (e.g. after hours idle in a game) can fail with a
+            // disconnect error; reopen cleanly and retry this write once on the fresh handle.
+            if is_disconnect_message(&err.to_string()) {
+                let dropped_device = state.devices.remove(target_ix);
+                drop(dropped_device);
+                if let Some(mut reopened) = self.reopen_device(device, dry_run, false) {
+                    if apply_to_peripheral(reopened.peripheral.as_mut(), &change).is_ok() {
+                        let snapshot = collect_snapshot(reopened.peripheral.as_mut());
+                        reopened.snapshot = snapshot.clone();
+                        state.devices.insert(target_ix, reopened);
+                        return Ok(snapshot);
+                    }
+                    let refreshed = collect_snapshot(reopened.peripheral.as_mut());
+                    reopened.snapshot = refreshed.clone();
+                    state.devices.insert(target_ix, reopened);
+                    return Err(ApplyError::failed_after_send(err, Some(refreshed)));
                 }
                 return Err(ApplyError::failed_after_send(err, None));
             }
@@ -1463,7 +1548,7 @@ impl PeripheralService for LiveHidService {
             // stale HID handle and reopen cleanly so the UI never shows disconnect errors.
             let dropped_device = state.devices.remove(target_ix);
             drop(dropped_device);
-            if let Some(reopened) = self.reopen_device(device, dry_run) {
+            if let Some(reopened) = self.reopen_device(device, dry_run, is_polling_rate_change) {
                 let snap = reopened.snapshot.clone();
                 state.devices.insert(target_ix, reopened);
                 return Ok(snap);
@@ -1476,6 +1561,220 @@ impl PeripheralService for LiveHidService {
 
         state.devices[target_ix].snapshot = snapshot.clone();
         Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_batch(
+        &self,
+        device: &DeviceId,
+        changes: Vec<SettingChange>,
+    ) -> (Option<DeviceSnapshot>, Option<(usize, usize, ApplyError)>) {
+        if changes.is_empty() {
+            return (None, None);
+        }
+        if changes.len() == 1 {
+            let change = changes.into_iter().next().expect("checked non-empty");
+            return match self.apply(device, change) {
+                Ok(snapshot) => (Some(snapshot), None),
+                Err(err) => (None, Some((0, 1, err))),
+            };
+        }
+
+        let total = changes.len();
+        let mut state = lock(&self.state);
+        let dry_run = state.dry_run;
+        let Some(target_ix) = state
+            .devices
+            .iter()
+            .position(|d| d.snapshot.info.id == *device)
+        else {
+            return (
+                None,
+                Some((
+                    0,
+                    total,
+                    ApplyError::rejected(CoreError::DeviceNotFound(device.to_string())),
+                )),
+            );
+        };
+
+        let mut applied_any = false;
+        let mut polling_rate_changed = false;
+
+        for (ix, change) in changes.into_iter().enumerate() {
+            if let Err(err) = validate_change(&state.devices[target_ix].snapshot, &change) {
+                let last = if applied_any {
+                    if dry_run {
+                        Some(state.devices[target_ix].snapshot.clone())
+                    } else {
+                        let refreshed =
+                            collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+                        state.devices[target_ix].snapshot = refreshed.clone();
+                        Some(refreshed)
+                    }
+                } else {
+                    None
+                };
+                return (last, Some((ix, total, ApplyError::rejected(err))));
+            }
+
+            let is_polling_rate_change = matches!(
+                (&change, &state.devices[target_ix].snapshot.keyboard_config),
+                (SettingChange::KeyboardConfig(next), Some(current))
+                    if next.polling_rate != current.snapshot.polling_rate
+            );
+
+            if matches!(change, SettingChange::PollCalibrationProgress) {
+                let target = &mut state.devices[target_ix];
+                let flags = match require(target.peripheral.as_hall_effect_mut(), "hall_effect")
+                    .and_then(agnoperiph_core::HallEffectKeyboard::read_calibration_key_progress)
+                {
+                    Ok(flags) => flags,
+                    Err(err) => {
+                        let last = applied_any.then(|| target.snapshot.clone());
+                        return (
+                            last,
+                            Some((ix, total, ApplyError::failed_after_send(err, None))),
+                        );
+                    }
+                };
+                if let Some(he) = target.snapshot.hall_effect.as_mut() {
+                    he.snapshot.calibrated_keys = flags;
+                }
+                applied_any = true;
+                continue;
+            }
+
+            let sequence_before = self.sink.next.load(Ordering::Relaxed);
+            if let Err(err) =
+                apply_to_peripheral(state.devices[target_ix].peripheral.as_mut(), &change)
+            {
+                let nothing_sent = self.sink.next.load(Ordering::Relaxed) == sequence_before;
+                if dry_run || nothing_sent {
+                    let last = if applied_any {
+                        if dry_run {
+                            Some(state.devices[target_ix].snapshot.clone())
+                        } else {
+                            let refreshed =
+                                collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+                            state.devices[target_ix].snapshot = refreshed.clone();
+                            Some(refreshed)
+                        }
+                    } else {
+                        None
+                    };
+                    return (last, Some((ix, total, ApplyError::rejected(err))));
+                }
+                if is_polling_rate_change && is_disconnect_message(&err.to_string()) {
+                    let dropped_device = state.devices.remove(target_ix);
+                    drop(dropped_device);
+                    if let Some(reopened) = self.reopen_device(device, dry_run, true) {
+                        state.devices.insert(target_ix, reopened);
+                        applied_any = true;
+                        polling_rate_changed = true;
+                        continue;
+                    }
+                    return (
+                        None,
+                        Some((ix, total, ApplyError::failed_after_send(err, None))),
+                    );
+                }
+                if is_disconnect_message(&err.to_string()) {
+                    let dropped_device = state.devices.remove(target_ix);
+                    drop(dropped_device);
+                    if let Some(mut reopened) = self.reopen_device(device, dry_run, false) {
+                        if apply_to_peripheral(reopened.peripheral.as_mut(), &change).is_ok() {
+                            apply_change_to_snapshot(&mut reopened.snapshot, &change);
+                            state.devices.insert(target_ix, reopened);
+                            applied_any = true;
+                            continue;
+                        }
+                        let refreshed = collect_snapshot(reopened.peripheral.as_mut());
+                        reopened.snapshot = refreshed.clone();
+                        state.devices.insert(target_ix, reopened);
+                        return (
+                            None,
+                            Some((
+                                ix,
+                                total,
+                                ApplyError::failed_after_send(err, Some(refreshed)),
+                            )),
+                        );
+                    }
+                    return (
+                        None,
+                        Some((ix, total, ApplyError::failed_after_send(err, None))),
+                    );
+                }
+                let refreshed = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+                state.devices[target_ix].snapshot = refreshed.clone();
+                return (
+                    None,
+                    Some((
+                        ix,
+                        total,
+                        ApplyError::failed_after_send(err, Some(refreshed)),
+                    )),
+                );
+            }
+
+            applied_any = true;
+            let target = &mut state.devices[target_ix];
+            apply_change_to_snapshot(&mut target.snapshot, &change);
+            if dry_run {
+                target.snapshot.is_preview = true;
+            } else if is_polling_rate_change {
+                polling_rate_changed = true;
+                if ix + 1 < total {
+                    let dropped_device = state.devices.remove(target_ix);
+                    drop(dropped_device);
+                    if let Some(reopened) = self.reopen_device(device, dry_run, true) {
+                        state.devices.insert(target_ix, reopened);
+                    } else {
+                        return (
+                            None,
+                            Some((
+                                ix,
+                                total,
+                                ApplyError::failed_after_send(
+                                    CoreError::NotConnected(device.to_string()),
+                                    None,
+                                ),
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+
+        if dry_run {
+            return (Some(state.devices[target_ix].snapshot.clone()), None);
+        }
+
+        let snapshot = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+        if polling_rate_changed || has_disconnect_warning(&snapshot) {
+            let dropped_device = state.devices.remove(target_ix);
+            drop(dropped_device);
+            if let Some(reopened) = self.reopen_device(device, dry_run, polling_rate_changed) {
+                let snap = reopened.snapshot.clone();
+                state.devices.insert(target_ix, reopened);
+                return (Some(snap), None);
+            }
+            return (
+                None,
+                Some((
+                    total - 1,
+                    total,
+                    ApplyError::failed_after_send(
+                        CoreError::NotConnected(device.to_string()),
+                        Some(snapshot),
+                    ),
+                )),
+            );
+        }
+
+        state.devices[target_ix].snapshot = snapshot.clone();
+        (Some(snapshot), None)
     }
 
     fn packet_log(&self) -> Vec<PacketTraceEntry> {
@@ -1494,6 +1793,82 @@ impl PeripheralService for LiveHidService {
             .find(|d| d.snapshot.info.id == *device)
             .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
         require(target.peripheral.as_hall_effect_mut(), "hall_effect")?.read_live_key_travel()
+    }
+
+    fn sync_hardware_state(&self, device: &DeviceId) -> CoreResult<Option<DeviceSnapshot>> {
+        let mut state = lock(&self.state);
+        let target = state
+            .devices
+            .iter_mut()
+            .find(|d| d.snapshot.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+        if target.snapshot.is_preview {
+            return Ok(None);
+        }
+
+        let mut next = target.snapshot.clone();
+        let mut changed = false;
+
+        if let Some(rgb) = target.peripheral.as_rgb_mut() {
+            let capabilities = rgb.rgb_capabilities();
+            if let Ok(snapshot) = rgb.read_rgb_state() {
+                let updated = RgbState {
+                    capabilities,
+                    snapshot,
+                };
+                if next.rgb.as_ref() != Some(&updated) {
+                    next.rgb = Some(updated);
+                    changed = true;
+                }
+            }
+        }
+
+        if let Some(kc) = target.peripheral.as_keyboard_config_mut() {
+            let capabilities = kc.keyboard_config_capabilities();
+            if let Ok(snapshot) = kc.read_keyboard_config() {
+                let updated = KeyboardConfigState {
+                    capabilities,
+                    snapshot,
+                };
+                if next.keyboard_config.as_ref() != Some(&updated) {
+                    next.keyboard_config = Some(updated);
+                    changed = true;
+                }
+            }
+        }
+
+        let mut profile_changed = false;
+        if let Some(pr) = target.peripheral.as_profiles_mut() {
+            let capabilities = pr.profile_capabilities();
+            if let Ok(snapshot) = pr.read_profile_state() {
+                let updated = ProfileState {
+                    capabilities,
+                    snapshot,
+                };
+                if next.profiles.as_ref() != Some(&updated) {
+                    profile_changed = true;
+                    next.profiles = Some(updated);
+                    changed = true;
+                }
+            }
+        }
+
+        if profile_changed && let Some(pointer) = target.peripheral.as_pointer_mut() {
+            let capabilities = pointer.pointer_capabilities();
+            if let Ok(snapshot) = pointer.read_pointer_state() {
+                next.pointer = Some(PointerState {
+                    capabilities,
+                    snapshot,
+                });
+            }
+        }
+
+        if changed {
+            target.snapshot = next.clone();
+            Ok(Some(next))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1693,8 +2068,8 @@ mod tests {
         push_rs7_snapshot(&mut live_transport, 140);
         // Next live write sends a frame, gets NO matching reply (timeout -> NotConnected),
         // and the post-failure re-read reports 160 so the UI gets the actual live device state.
-        // Push a wrong-command byte 8 times to trigger Protocol failure after send, then fresh snapshot.
-        for _ in 0..8 {
+        // Push a wrong-command byte RS7_MAX_READ_ATTEMPTS times to trigger Protocol failure after send, then fresh snapshot.
+        for _ in 0..agnoperiph_driver_atk::RS7_MAX_READ_ATTEMPTS {
             let mut bogus = vec![0u8; atk::RS7_PAYLOAD_LEN];
             bogus[0] = 0xFE;
             live_transport.push_input_response(bogus);
@@ -1786,5 +2161,129 @@ mod tests {
             validate_change(mouse, &SettingChange::Macros(edited)),
             Err(CoreError::UnsupportedCapability("macro_readonly_slot"))
         ));
+    }
+
+    #[test]
+    fn live_service_apply_batch_drains_stale_reports_and_rereads_once() {
+        let desc = rs7_descriptor();
+        let mut live_transport = MockHidTransport::new(desc.clone());
+        push_rs7_open(&mut live_transport);
+        push_rs7_snapshot(&mut live_transport, 120);
+
+        // Simulate 16 unread unsolicited frames queued while playing a game, followed by ACKs
+        // for 3 batched writes and ONLY ONE post-batch snapshot re-read.
+        for _ in 0..16 {
+            let mut unsolicited = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            unsolicited[0] = atk::cmd::LIGHTING_GET_VALUE;
+            live_transport.push_stale_input_report(unsolicited);
+        }
+        for _ in 0..3 {
+            let mut ack = vec![0u8; atk::RS7_PAYLOAD_LEN];
+            ack[0] = atk::cmd::SET_KEYBOARD_VALUE;
+            live_transport.push_input_response(ack);
+        }
+        push_rs7_snapshot(&mut live_transport, 150);
+
+        let enumerator = Arc::new(ScriptedEnumerator::new(desc, vec![live_transport]));
+        let service = LiveHidService::with_enumerator_and_mode(enumerator, false);
+        let devices = service.refresh().unwrap();
+        let id = devices[0].id().clone();
+
+        let (snapshot, failure) = service.apply_batch(
+            &id,
+            vec![
+                SettingChange::Actuation {
+                    target: ActuationTarget::Key(KeyIndex::new(0)),
+                    point: TravelHundredthsMm::from_hundredths(150),
+                },
+                SettingChange::Actuation {
+                    target: ActuationTarget::Key(KeyIndex::new(1)),
+                    point: TravelHundredthsMm::from_hundredths(150),
+                },
+                SettingChange::Deadzones {
+                    top: TravelHundredthsMm::from_hundredths(10),
+                    bottom: TravelHundredthsMm::from_hundredths(10),
+                },
+            ],
+        );
+        assert!(failure.is_none(), "batch should succeed without error");
+        let snapshot = snapshot.expect("batch should return final snapshot");
+        assert_eq!(
+            snapshot.hall_effect.as_ref().unwrap().snapshot.keys[0].actuation,
+            TravelHundredthsMm::from_hundredths(150)
+        );
+    }
+
+    #[test]
+    fn live_service_sync_hardware_state_detects_onboard_rgb_change_with_lightweight_queries() {
+        let desc = rs7_descriptor();
+        let mut live_transport = MockHidTransport::new(desc.clone());
+        push_rs7_open(&mut live_transport);
+        push_rs7_snapshot(&mut live_transport, 120);
+
+        let push_lightweight_sync =
+            |mock: &mut MockHidTransport, color: RgbColor, brightness: u8| {
+                // 1. Backlight RGB (0x08 0x41)
+                let mut rgb = vec![0u8; atk::RS7_PAYLOAD_LEN];
+                rgb[0] = atk::cmd::LIGHTING_GET_VALUE;
+                rgb[2] = 2;
+                rgb[5] = color.r;
+                rgb[6] = color.g;
+                rgb[7] = color.b;
+                rgb[8] = brightness;
+                mock.push_input_response(rgb);
+
+                // 2. Logo Light (0x02 0x96 0x21)
+                let mut logo = vec![0u8; atk::RS7_PAYLOAD_LEN];
+                logo[0] = atk::cmd::GET_KEYBOARD_VALUE;
+                logo[3] = 3;
+                logo[5] = 120;
+                logo[7] = RgbColor::WHITE.r;
+                logo[8] = RgbColor::WHITE.g;
+                logo[9] = RgbColor::WHITE.b;
+                mock.push_input_response(logo);
+
+                // 3..6. Keyboard Config (feature flags, anti-accidental, game mode, report rate)
+                let mut feat = vec![0u8; atk::RS7_PAYLOAD_LEN];
+                feat[0] = atk::cmd::GET_KEYBOARD_VALUE;
+                feat[7] = 1;
+                mock.push_input_response(feat);
+                for _ in 0..2 {
+                    let mut cfg = vec![0u8; atk::RS7_PAYLOAD_LEN];
+                    cfg[0] = atk::cmd::GET_KEYBOARD_VALUE;
+                    mock.push_input_response(cfg);
+                }
+                let mut rr = vec![0u8; atk::RS7_PAYLOAD_LEN];
+                rr[0] = atk::cmd::GET_KEYBOARD_VALUE;
+                rr[3] = 8;
+                mock.push_input_response(rr);
+            };
+
+        // First sync: unchanged (still white @ 80%) -> returns Ok(None).
+        push_lightweight_sync(&mut live_transport, RgbColor::WHITE, 80);
+        // Second sync: user pressed Fn+RGB directly on keyboard -> red @ 60% -> returns Ok(Some).
+        push_lightweight_sync(&mut live_transport, RgbColor::new(0xFF, 0x10, 0x20), 60);
+
+        let enumerator = Arc::new(ScriptedEnumerator::new(desc, vec![live_transport]));
+        let service = LiveHidService::with_enumerator_and_mode(enumerator, false);
+        let devices = service.refresh().unwrap();
+        let id = devices[0].id().clone();
+
+        assert!(service.sync_hardware_state(&id).unwrap().is_none());
+        let updated = service
+            .sync_hardware_state(&id)
+            .unwrap()
+            .expect("onboard RGB edit must be detected");
+        let zone0 = &updated.rgb.as_ref().unwrap().snapshot.zones[0];
+        assert_eq!(zone0.brightness.percent(), 60);
+        assert_eq!(
+            zone0.effect,
+            RgbEffect::Preset {
+                id: 2,
+                color: RgbColor::new(0xFF, 0x10, 0x20),
+                speed: 0,
+                colorful: false,
+            }
+        );
     }
 }

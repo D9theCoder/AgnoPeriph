@@ -18,6 +18,16 @@ pub trait HidTransport: Send + Sync {
     /// Reads an input report with a timeout (`hid_read_timeout`).
     fn read_input_report(&mut self, buf: &mut [u8], timeout: Duration) -> TransportResult<usize>;
 
+    /// Discards any stale or unsolicited input reports currently queued in the OS HID
+    /// input buffer without blocking, returning how many reports were drained.
+    ///
+    /// Drivers call this before starting a request/reply exchange so unread notifications
+    /// accumulated while the device handle sat idle cannot push the real reply past the
+    /// read attempt limit.
+    fn drain_input_reports(&mut self) -> TransportResult<usize> {
+        Ok(0)
+    }
+
     /// Sends a HID Feature report (`SET_REPORT`). Byte 0 is the Report ID.
     fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()>;
 

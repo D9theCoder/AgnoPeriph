@@ -936,6 +936,7 @@ pub fn encode_macros(macros: &[MacroSlot]) -> Vec<u8> {
                     MacroActionKind::KeyTap => macro_wire::SS_TAP_CODE,
                     MacroActionKind::KeyDown => macro_wire::SS_DOWN_CODE,
                     MacroActionKind::KeyUp => macro_wire::SS_UP_CODE,
+                    _ => continue,
                 };
                 out.push(macro_wire::PREFIX);
                 out.push(op);

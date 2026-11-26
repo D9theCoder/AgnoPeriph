@@ -31,6 +31,7 @@ pub struct MockHidTransport {
     descriptor: HidDeviceDescriptor,
     expected_writes: VecDeque<ExpectedWrite>,
     strict_writes: bool,
+    stale_input_reports: VecDeque<Vec<u8>>,
     input_responses: VecDeque<Vec<u8>>,
     feature_responses: VecDeque<Vec<u8>>,
     recorded_writes: Vec<RecordedWrite>,
@@ -43,6 +44,7 @@ impl MockHidTransport {
             descriptor,
             expected_writes: VecDeque::new(),
             strict_writes: false,
+            stale_input_reports: VecDeque::new(),
             input_responses: VecDeque::new(),
             feature_responses: VecDeque::new(),
             recorded_writes: Vec::new(),
@@ -60,6 +62,14 @@ impl MockHidTransport {
         self.strict_writes = true;
         self.expected_writes
             .push_back(ExpectedWrite { kind, bytes });
+    }
+
+    /// Enqueues a stale/unsolicited input report already sitting in the OS HID input buffer.
+    ///
+    /// Returned ahead of scripted responses by [`HidTransport::read_input_report`] unless
+    /// flushed first by [`HidTransport::drain_input_reports`].
+    pub fn push_stale_input_report(&mut self, bytes: Vec<u8>) {
+        self.stale_input_reports.push_back(bytes);
     }
 
     /// Enqueues a canned input report returned by the next [`HidTransport::read_input_report`].
@@ -116,7 +126,11 @@ impl HidTransport for MockHidTransport {
     }
 
     fn read_input_report(&mut self, buf: &mut [u8], timeout: Duration) -> TransportResult<usize> {
-        let Some(next) = self.input_responses.pop_front() else {
+        let next = self
+            .stale_input_reports
+            .pop_front()
+            .or_else(|| self.input_responses.pop_front());
+        let Some(next) = next else {
             return Err(TransportError::Timeout {
                 timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
             });
@@ -124,6 +138,12 @@ impl HidTransport for MockHidTransport {
         let copy_len = next.len().min(buf.len());
         buf[..copy_len].copy_from_slice(&next[..copy_len]);
         Ok(copy_len)
+    }
+
+    fn drain_input_reports(&mut self) -> TransportResult<usize> {
+        let count = self.stale_input_reports.len();
+        self.stale_input_reports.clear();
+        Ok(count)
     }
 
     fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()> {

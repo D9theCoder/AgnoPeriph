@@ -432,6 +432,9 @@ impl<T: HidTransport> AtkFf01Keyboard<T> {
 
     fn exchange(&mut self, cmd: u8, body: &[u8], mutating: bool) -> CoreResult<Vec<u8>> {
         let tx = encode_ff01_tx(cmd, body)?;
+        if !mutating || !self.transport.is_dry_run() {
+            let _ = self.transport.drain_input_reports();
+        }
         if mutating {
             self.transport.send_output_report(&tx)?;
             if self.transport.is_dry_run() {

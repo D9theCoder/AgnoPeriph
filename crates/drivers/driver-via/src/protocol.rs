@@ -313,6 +313,7 @@ pub fn encode_via_macros(slots: &[MacroSlot], max_bytes: usize) -> Vec<u8> {
                 MacroActionKind::KeyTap => 0x01u8,
                 MacroActionKind::KeyDown => 0x02u8,
                 MacroActionKind::KeyUp => 0x03u8,
+                _ => continue,
             };
             if out.len() + 4 > max_bytes {
                 break;

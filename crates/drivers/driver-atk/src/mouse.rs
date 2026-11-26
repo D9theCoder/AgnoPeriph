@@ -820,6 +820,9 @@ impl<T: HidTransport> AtkMouseDevice<T> {
         mutating: bool,
     ) -> CoreResult<[u8; ATK_MOUSE_PAYLOAD_LEN]> {
         let expected_cmd = tx[1];
+        if !mutating || !self.transport.is_dry_run() {
+            let _ = self.transport.drain_input_reports();
+        }
         if mutating {
             self.transport.send_output_report(&tx)?;
             if self.transport.is_dry_run() {
