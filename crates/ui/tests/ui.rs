@@ -1501,6 +1501,7 @@ fn configured_socd_entry_keeps_remove_clear_of_its_modes(cx: &mut TestAppContext
 struct RecordingSystem {
     notifications: std::sync::Mutex<Vec<(String, String)>>,
     opened: std::sync::Mutex<Vec<String>>,
+    launched: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl RecordingSystem {
@@ -1508,6 +1509,7 @@ impl RecordingSystem {
         Self {
             notifications: std::sync::Mutex::new(Vec::new()),
             opened: std::sync::Mutex::new(Vec::new()),
+            launched: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1517,6 +1519,10 @@ impl RecordingSystem {
 
     fn take_opened(&self) -> Vec<String> {
         std::mem::take(&mut *self.opened.lock().unwrap())
+    }
+
+    fn take_launched(&self) -> Vec<std::path::PathBuf> {
+        std::mem::take(&mut *self.launched.lock().unwrap())
     }
 }
 
@@ -1545,14 +1551,59 @@ impl agnoperiph::system::SystemIntegration for RecordingSystem {
         self.opened.lock().unwrap().push(url.to_owned());
         Ok(())
     }
+
+    fn launch_installer(&self, path: &std::path::Path) -> Result<bool, String> {
+        self.launched.lock().unwrap().push(path.to_path_buf());
+        Ok(false)
+    }
 }
 
 /// A release source that never touches the network.
-struct FixedReleases(Option<agnoperiph::updates::UpdateInfo>);
+struct FixedReleases {
+    release: Option<agnoperiph::updates::UpdateInfo>,
+    downloads: std::sync::Mutex<Vec<(String, std::path::PathBuf)>>,
+    download_error: Option<String>,
+}
+
+impl FixedReleases {
+    fn new(release: Option<agnoperiph::updates::UpdateInfo>) -> Self {
+        Self {
+            release,
+            downloads: std::sync::Mutex::new(Vec::new()),
+            download_error: None,
+        }
+    }
+
+    fn failing_download(
+        release: Option<agnoperiph::updates::UpdateInfo>,
+        err: impl Into<String>,
+    ) -> Self {
+        Self {
+            release,
+            downloads: std::sync::Mutex::new(Vec::new()),
+            download_error: Some(err.into()),
+        }
+    }
+
+    fn take_downloads(&self) -> Vec<(String, std::path::PathBuf)> {
+        std::mem::take(&mut *self.downloads.lock().unwrap())
+    }
+}
 
 impl agnoperiph::updates::ReleaseSource for FixedReleases {
     fn latest(&self) -> Result<Option<agnoperiph::updates::UpdateInfo>, String> {
-        Ok(self.0.clone())
+        Ok(self.release.clone())
+    }
+
+    fn download_installer(&self, url: &str, destination: &std::path::Path) -> Result<(), String> {
+        self.downloads
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), destination.to_path_buf()));
+        if let Some(err) = &self.download_error {
+            return Err(err.clone());
+        }
+        Ok(())
     }
 }
 
@@ -1607,10 +1658,9 @@ fn game_profile_switch_sends_batched_windows_notification(cx: &mut TestAppContex
 fn auto_update_check_offers_download_and_dismiss(cx: &mut TestAppContext) {
     let system = Arc::new(RecordingSystem::new());
     let release_url = "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9";
-    let releases = Arc::new(FixedReleases(Some(agnoperiph::updates::UpdateInfo::new(
-        "9.9.9",
-        release_url,
-    ))));
+    let releases = Arc::new(FixedReleases::new(Some(
+        agnoperiph::updates::UpdateInfo::new("9.9.9", release_url),
+    )));
     let options = AppOptions::default()
         .with_system(system.clone())
         .with_update_check(true)
@@ -1628,15 +1678,86 @@ fn auto_update_check_offers_download_and_dismiss(cx: &mut TestAppContext) {
 
     click(cx, handle, "update-download");
     assert_eq!(system.take_opened(), [release_url.to_owned()]);
+    assert_eq!(system.take_launched(), Vec::<std::path::PathBuf>::new());
 
     click(cx, handle, "update-dismiss");
     assert!(cx.update(|cx| app.read(cx).update_available().is_none()));
 }
 
 #[gpui_kit::test]
+fn auto_update_downloads_and_launches_installer_when_asset_exists(cx: &mut TestAppContext) {
+    let system = Arc::new(RecordingSystem::new());
+    let release_url = "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9";
+    let installer_url = "https://github.com/D9theCoder/AgnoPeriph/releases/download/v9.9.9/AgnoPeriph-Setup-x64.exe";
+    let releases = Arc::new(FixedReleases::new(Some(
+        agnoperiph::updates::UpdateInfo::new("9.9.9", release_url)
+            .with_installer("AgnoPeriph-Setup-x64.exe", installer_url),
+    )));
+    let options = AppOptions::default()
+        .with_system(system.clone())
+        .with_update_check(true)
+        .with_release_source(releases.clone());
+    let (handle, app) = open_app_with(cx, MockPeripheralService::new(), options);
+    settle(cx, handle);
+
+    click(cx, handle, "update-download");
+    settle(cx, handle);
+
+    assert_eq!(system.take_opened(), Vec::<String>::new());
+    let downloads = releases.take_downloads();
+    assert_eq!(downloads.len(), 1);
+    assert_eq!(downloads[0].0, installer_url);
+    assert_eq!(system.take_launched(), [downloads[0].1.clone()]);
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(!app.is_installing_update());
+        assert_eq!(app.banner(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn failed_update_download_shows_error_banner_without_launching(cx: &mut TestAppContext) {
+    let system = Arc::new(RecordingSystem::new());
+    let releases = Arc::new(FixedReleases::failing_download(
+        Some(
+            agnoperiph::updates::UpdateInfo::new(
+                "9.9.9",
+                "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9",
+            )
+            .with_installer(
+                "AgnoPeriph-Setup-x64.exe",
+                "https://github.com/D9theCoder/AgnoPeriph/releases/download/v9.9.9/AgnoPeriph-Setup-x64.exe",
+            ),
+        ),
+        "network timeout",
+    ));
+    let options = AppOptions::default()
+        .with_system(system.clone())
+        .with_update_check(true)
+        .with_release_source(releases);
+    let (handle, app) = open_app_with(cx, MockPeripheralService::new(), options);
+    settle(cx, handle);
+
+    click(cx, handle, "update-download");
+    settle(cx, handle);
+
+    assert_eq!(system.take_opened(), Vec::<String>::new());
+    assert_eq!(system.take_launched(), Vec::<std::path::PathBuf>::new());
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(!app.is_installing_update());
+        let banner = app
+            .banner()
+            .expect("failed update download must show a banner");
+        assert!(banner.message().contains("network timeout"));
+    });
+    assert!(exists(cx, handle, "dismiss-banner"));
+}
+
+#[gpui_kit::test]
 fn manual_update_check_stays_quiet_when_the_build_is_current(cx: &mut TestAppContext) {
     let system = Arc::new(RecordingSystem::new());
-    let releases = Arc::new(FixedReleases(None));
+    let releases = Arc::new(FixedReleases::new(None));
     let options = AppOptions::default()
         .with_system(system.clone())
         .with_release_source(releases);

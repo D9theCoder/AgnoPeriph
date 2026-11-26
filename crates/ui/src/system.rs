@@ -17,6 +17,18 @@ pub const RUN_VALUE: &str = "AgnoPeriph";
 pub const MINIMIZED_FLAG: &str = "--minimized";
 /// Windows AppUserModelID registered under `HKCU\Software\Classes\AppUserModelId` for toasts.
 pub const TOAST_APP_ID: &str = "AgnoPeriph.App";
+/// Inno Setup flags used when launching a downloaded update installer.
+///
+/// `/SILENT` shows the minimal install progress bar without wizard prompts,
+/// `/CLOSEAPPLICATIONS` closes any lingering instance, and `/RELAUNCH=1` tells
+/// `agnoperiph.iss` to reopen the updated app when the silent install finishes.
+pub const INSTALLER_ARGS: &[&str] = &[
+    "/SP-",
+    "/SILENT",
+    "/CLOSEAPPLICATIONS",
+    "/NORESTART",
+    "/RELAUNCH=1",
+];
 
 /// Builds the title and body for a Windows notification after a Game Profile switches presets.
 pub fn format_switch_notification(
@@ -62,6 +74,12 @@ pub trait SystemIntegration: Send + Sync {
 
     /// Opens `url` in the user's default browser.
     fn open_url(&self, url: &str) -> Result<(), String>;
+
+    /// Launches a downloaded Windows installer executable to apply an update.
+    ///
+    /// Returns `Ok(true)` when the app should quit so the installer can replace the
+    /// running binary cleanly, or `Ok(false)` in detached/test harnesses.
+    fn launch_installer(&self, path: &Path) -> Result<bool, String>;
 }
 
 /// No-op integration for tests and previews: nothing leaves the process.
@@ -87,6 +105,10 @@ impl SystemIntegration for DetachedSystem {
 
     fn open_url(&self, _url: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    fn launch_installer(&self, _path: &Path) -> Result<bool, String> {
+        Ok(false)
     }
 }
 
@@ -277,6 +299,40 @@ impl SystemIntegration for WindowsSystem {
             Err("opening links is only available on Windows".to_owned())
         }
     }
+
+    fn launch_installer(&self, path: &Path) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            use std::process::{Command, Stdio};
+
+            let is_exe = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+            if !is_exe {
+                return Err("only .exe installers can be launched".to_owned());
+            }
+            if !path.is_file() {
+                return Err(format!("installer not found at {}", path.display()));
+            }
+            let mut cmd = Command::new(path);
+            cmd.args(INSTALLER_ARGS)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(dir) = path.parent() {
+                cmd.current_dir(dir);
+            }
+            cmd.spawn()
+                .map(|_| true)
+                .map_err(|err| format!("launch the update installer: {err}"))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Err("installing updates is only available on Windows".to_owned())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +364,10 @@ mod tests {
                 .open_url("https://github.com/D9theCoder/AgnoPeriph")
                 .is_ok()
         );
+        assert_eq!(
+            system.launch_installer(Path::new("AgnoPeriph-Setup-x64.exe")),
+            Ok(false)
+        );
     }
 
     #[cfg(windows)]
@@ -317,6 +377,22 @@ mod tests {
         assert!(
             system
                 .open_url("file:///C:/Windows/System32/calc.exe")
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_rejects_non_exe_and_missing_installers() {
+        let system = WindowsSystem::new(None);
+        assert!(
+            system
+                .launch_installer(Path::new(r"C:\Windows\System32\drivers\etc\hosts"))
+                .is_err()
+        );
+        assert!(
+            system
+                .launch_installer(Path::new(r"C:\NonExistent\AgnoPeriph-Setup-x64.exe"))
                 .is_err()
         );
     }

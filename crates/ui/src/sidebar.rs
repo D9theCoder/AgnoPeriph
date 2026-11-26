@@ -61,6 +61,7 @@ pub(crate) fn render(
     let start_with_windows = app.config().start_with_windows;
     let low_battery_alerts = app.config().low_battery_alerts;
     let checking_updates = app.is_checking_updates();
+    let installing_update = app.is_installing_update();
     let theme = cx.theme();
     let muted = theme.muted_foreground;
 
@@ -190,7 +191,7 @@ pub(crate) fn render(
                                         .xsmall()
                                         .label("Check for updates")
                                         .loading(checking_updates)
-                                        .disabled(checking_updates)
+                                        .disabled(checking_updates || installing_update)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.check_for_updates(true, cx);
                                         })),

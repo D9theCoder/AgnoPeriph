@@ -544,10 +544,16 @@ impl agnoperiph::updates::ReleaseSource for FixedReleases {
 #[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
 fn capture_update_screen() {
     let mut cx = headless();
-    let releases = Arc::new(FixedReleases(Some(agnoperiph::updates::UpdateInfo::new(
-        "9.9.9",
-        "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9",
-    ))));
+    let releases = Arc::new(FixedReleases(Some(
+        agnoperiph::updates::UpdateInfo::new(
+            "9.9.9",
+            "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v9.9.9",
+        )
+        .with_installer(
+            "AgnoPeriph-Setup-x64.exe",
+            "https://github.com/D9theCoder/AgnoPeriph/releases/download/v9.9.9/AgnoPeriph-Setup-x64.exe",
+        ),
+    )));
     let options = AppOptions::default()
         .with_update_check(true)
         .with_release_source(releases);

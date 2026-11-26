@@ -54,8 +54,14 @@ Name: "{autodesktop}\AgnoPeriph"; Filename: "{app}\agnoperiph.exe"; Tasks: deskt
 
 [Run]
 Filename: "{app}\agnoperiph.exe"; Description: "{cm:LaunchProgram,AgnoPeriph}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\agnoperiph.exe"; Flags: nowait skipifnotsilent; Check: ShouldRelaunchAfterSilentUpdate
 
 [Code]
+function ShouldRelaunchAfterSilentUpdate: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:relaunch|0}') = '1');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
