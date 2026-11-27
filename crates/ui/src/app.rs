@@ -1924,6 +1924,9 @@ impl AgnoPeriphApp {
             )
             .child(
                 h_flex()
+                    // The title bar is a native drag area. Without occluding it here, Windows
+                    // treats a press on these controls as a window move and swallows the click.
+                    .occlude()
                     .gap_1p5()
                     .pr_2()
                     .when(self.show_dev_tools, |this| {
