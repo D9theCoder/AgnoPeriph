@@ -10,7 +10,7 @@ use agnoperiph_core::{
 };
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode, WindowExt,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, Theme, ThemeMode, TitleBar, WindowExt,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants},
     h_flex,
@@ -1837,38 +1837,34 @@ impl AgnoPeriphApp {
         };
         let locked = self.has_pending_writes() || self.is_loading;
 
-        h_flex()
-            .id("header")
-            .flex_shrink_0()
-            .h_12()
-            .px_4()
-            .gap_3()
-            .justify_between()
-            .border_b_1()
-            .border_color(theme.border)
+        TitleBar::new()
+            .h_10()
             .bg(theme.title_bar)
+            .border_color(theme.border)
             .child(
                 h_flex()
+                    .id("header")
                     .gap_2()
                     .min_w_0()
                     .child(logo_mark(theme))
                     .child(
                         div()
-                            .text_base()
+                            .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("AgnoPeriph"),
                     )
                     .child(
                         div()
                             .ml_1()
-                            .text_sm()
+                            .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(device_count_label(self.devices.len())),
                     ),
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1p5()
+                    .pr_2()
                     .when(self.show_dev_tools, |this| {
                         this.child(
                             Switch::new("dry-run")
@@ -1881,12 +1877,12 @@ impl AgnoPeriphApp {
                                 })),
                         )
                         .child(write_state)
-                        .child(div().w_px().h_5().bg(theme.border))
+                        .child(div().w_px().h_4().mx_1().bg(theme.border))
                     })
                     .child(
                         Button::new("refresh")
                             .outline()
-                            .small()
+                            .xsmall()
                             .icon(IconName::RefreshCw)
                             .label("Refresh")
                             .loading(self.is_loading)
@@ -1922,7 +1918,8 @@ impl AgnoPeriphApp {
                                 .tooltip("HID packet inspector")
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
                         )
-                    }),
+                    })
+                    .child(div().w_px().h_4().ml_1().bg(theme.border)),
             )
     }
 
@@ -2231,7 +2228,7 @@ static LOGO_IMAGE: LazyLock<Arc<Image>> = LazyLock::new(|| {
 fn logo_mark(theme: &Theme) -> AnyElement {
     img(LOGO_IMAGE.clone())
         .id("app-logo")
-        .size_6()
+        .size_5()
         .rounded(theme.radius)
         .into_any_element()
 }

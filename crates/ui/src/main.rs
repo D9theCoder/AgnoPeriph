@@ -100,9 +100,9 @@ impl Shell {
             window_min_size: Some(size(px(960.), px(640.))),
             titlebar: Some(TitlebarOptions {
                 title: Some("AgnoPeriph".into()),
-                ..Default::default()
+                ..gpui_kit::component::TitleBar::title_bar_options()
             }),
-            ..Default::default()
+            ..gpui_kit::component::TitleBar::window_options()
         };
         let close_shell = Rc::downgrade(shell);
         let opened = gpui_kit::open_window(options, cx, move |window, cx| {
