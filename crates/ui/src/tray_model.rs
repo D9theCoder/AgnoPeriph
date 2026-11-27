@@ -119,7 +119,7 @@ impl AgnoPeriphApp {
         if self.current_slot(device) == Some(slot) {
             return;
         }
-        if self.is_dirty() && self.draft_device.as_ref() == Some(device) {
+        if self.has_unsaved(device) {
             self.select_device(device.clone(), cx);
         }
         self.request_profile_switch(device, slot, window, cx);

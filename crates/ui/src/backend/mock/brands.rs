@@ -33,7 +33,7 @@ pub const MOCK_RAZER_ID: &str = "razer:1532:0099:mock-basilisk-v3";
 /// Stable id of the emulated Pulsar X2 CrazyLight (Low / Medium / High lift-off).
 pub const MOCK_PULSAR_ID: &str = "pulsar:3710:0001:mock-x2";
 /// Stable id of the emulated Keychron Q1 (QMK/VIA keymap, macros and RGB, no Hall Effect).
-pub const MOCK_VIA_ID: &str = "via:3434:0100:mock-q1";
+pub const MOCK_VIA_ID: &str = "via:3434:0107:mock-q1";
 /// Stable id of the emulated Wooting 60HE (readonly actuation, 6 x 14 matrix).
 pub const MOCK_WOOTING_ID: &str = "wooting:31E3:1302:mock-60he";
 
@@ -41,7 +41,7 @@ const RAZER_BASILISK_V3_PID: u16 = 0x0099;
 /// Pulsar's match rule is VID + usage only, so the receiver PID is a placeholder.
 const PULSAR_MOCK_PID: u16 = 0x0001;
 /// The VIA driver matches any Keychron PID, so the keyboard PID is a placeholder.
-const VIA_MOCK_PID: u16 = 0x0100;
+const VIA_MOCK_PID: u16 = 0x0107;
 const WOOTING_60HE_PID: u16 = 0x1302;
 const VIA_ROWS: u8 = 6;
 const VIA_COLS: u8 = 16;
@@ -294,23 +294,23 @@ fn pulsar_snapshot() -> DeviceSnapshot {
     }
 }
 
-/// Base layer of a 75% board on the `6 x 16` VIA matrix, as HID usages (`0` = no key).
+/// Base layer of the Q1 v2 knob on its `6 x 16` VIA matrix, as HID usages (`0` = no key).
 const VIA_BASE_LAYER: [[u8; 16]; 6] = [
     [
         0x29, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x4C, 0x00,
-        0x00,
+        0xA8,
     ],
     [
-        0x35, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2D, 0x2E, 0x2A, 0x4B,
-        0x00,
+        0x35, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2D, 0x2E, 0x2A, 0x00,
+        0x4B,
     ],
     [
-        0x2B, 0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C, 0x12, 0x13, 0x2F, 0x30, 0x31, 0x4E,
-        0x00,
+        0x2B, 0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C, 0x12, 0x13, 0x2F, 0x30, 0x31, 0x00,
+        0x4E,
     ],
     [
-        0x39, 0x04, 0x16, 0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0x33, 0x34, 0x00, 0x28, 0x4A,
-        0x00,
+        0x39, 0x04, 0x16, 0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0x33, 0x34, 0x00, 0x28, 0x00,
+        0x4A,
     ],
     [
         0xE1, 0x00, 0x1D, 0x1B, 0x06, 0x19, 0x05, 0x11, 0x10, 0x36, 0x37, 0x38, 0x00, 0xE5, 0x52,
@@ -320,6 +320,21 @@ const VIA_BASE_LAYER: [[u8; 16]; 6] = [
         0xE0, 0xE3, 0xE2, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0xE6, 0x00, 0xE4, 0x50, 0x51,
         0x4F,
     ],
+];
+
+/// The Fn key at row 5, column 11: holds layer 1.
+const VIA_FN_KEY: usize = 5 * 16 + 11;
+
+/// Media and backlight keys on layer 1, as `(matrix index, class, id)`.
+const VIA_FN_LAYER: [(usize, u8, u8); 8] = [
+    (1, 0x78, 0x28),
+    (2, 0x78, 0x27),
+    (5, 0x00, 0xAC),
+    (6, 0x00, 0xAE),
+    (7, 0x00, 0xAB),
+    (8, 0x00, 0xA8),
+    (9, 0x00, 0xAA),
+    (10, 0x00, 0xA9),
 ];
 
 fn via_snapshot() -> DeviceSnapshot {
@@ -333,14 +348,18 @@ fn via_snapshot() -> DeviceSnapshot {
     )
     .with_firmware_version("VIA v12");
 
-    let base: Vec<KeyCode> = VIA_BASE_LAYER
+    let mut base: Vec<KeyCode> = VIA_BASE_LAYER
         .iter()
         .flatten()
         .map(|&usage| KeyCode::standard(usage))
         .collect();
+    base[VIA_FN_KEY] = KeyCode::new(0x52, 1);
     let transparent = vec![KeyCode::TRANSPARENT; base.len()];
     let mut layers = vec![base];
     layers.extend((1..VIA_LAYERS).map(|_| transparent.clone()));
+    for (key, class, id) in VIA_FN_LAYER {
+        layers[1][key] = KeyCode::new(class, id);
+    }
     let keymap = KeymapState {
         capabilities: KeymapCapabilities::new(
             (0..VIA_LAYERS).map(|ix| format!("Layer {ix}")).collect(),

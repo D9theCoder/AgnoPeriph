@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use agnoperiph_core::{DeviceId, ExportedProfile, KeyIndex, ProfileSlot};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, Selectable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Icon, Sizable, WindowExt,
     alert::Alert,
-    button::{Button, ButtonGroup, ButtonVariants},
+    button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
@@ -25,10 +25,12 @@ use gpui_kit::*;
 
 use crate::app::{AfterApply, AgnoPeriphApp};
 use crate::backend::{ActuationTarget, DeviceSnapshot, SettingChange};
+use crate::design::dp;
 use crate::draft::EditKey;
 use crate::game_profiles::SavedKeyboardPreset;
 use crate::profile_io::{ImportPreview, export_file_name, export_json, stage_import};
 use crate::quick_presets::QuickPreset;
+use crate::widgets::{segment, segmented};
 
 /// Computes the exact ordered diff that transitions `current` into `preset`.
 ///
@@ -230,7 +232,9 @@ impl AgnoPeriphApp {
         if self.is_busy() || self.is_loading() {
             return;
         }
-        if self.is_dirty() && self.draft_device.as_ref() == Some(device) {
+        if self.has_unsaved(device) {
+            // The guard lists the edits, so their device has to be on screen.
+            self.select_device(device.clone(), cx);
             let target = self.config.preset_name(device, ProfileSlot::new(slot));
             crate::dirty_bar::open_guard(
                 self,
@@ -444,7 +448,7 @@ fn render_profile_tools(
         let entity = entity.clone();
         Button::new("quick-presets")
             .outline()
-            .small()
+            .h(dp(30.))
             .icon(Icon::new(IconName::SlidersHorizontal))
             .label("Quick presets")
             .dropdown_caret(true)
@@ -476,7 +480,7 @@ fn render_profile_tools(
     let file_entity = entity.clone();
     let file_menu = Button::new("profile-file-menu")
         .outline()
-        .small()
+        .size(dp(30.))
         .icon(Icon::new(IconName::Ellipsis))
         .accessibility_label("Profile file actions")
         .tooltip("Import or export a profile file")
@@ -515,23 +519,34 @@ fn render_profile_tools(
         .child(file_menu)
 }
 
+/// Whether the device has onboard or app-managed slots to switch between.
+fn has_slots(device: &DeviceSnapshot) -> bool {
+    device.profiles.is_some() || device.capabilities.has_hall_effect()
+}
+
+/// Quick presets and file actions for the device header, when there is no slot row.
+pub(crate) fn render_header_tools(
+    app: &AgnoPeriphApp,
+    device: &DeviceSnapshot,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> Option<AnyElement> {
+    let busy = app.is_busy() || app.is_loading();
+    (!has_slots(device)).then(|| render_profile_tools(device, busy, cx).into_any_element())
+}
+
+/// The slot row under the device header.
 pub(crate) fn render(
     app: &AgnoPeriphApp,
     device: &DeviceSnapshot,
     cx: &mut Context<AgnoPeriphApp>,
-) -> AnyElement {
+) -> Option<AnyElement> {
+    if !has_slots(device) {
+        return None;
+    }
     let id = device.id().clone();
     let busy = app.is_busy() || app.is_loading();
     let hardware = device.profiles.as_ref();
-    let is_keyboard = device.capabilities.has_hall_effect();
     let tools = render_profile_tools(device, busy, cx);
-    if hardware.is_none() && !is_keyboard {
-        return h_flex()
-            .id("profile-bar")
-            .gap_2()
-            .child(tools)
-            .into_any_element();
-    }
     let (slots, active, prefix): (Vec<(u8, bool)>, u8, &'static str) =
         if let Some(profiles) = hardware {
             let entries = (0..profiles.capabilities.slot_count)
@@ -557,26 +572,29 @@ pub(crate) fn render(
                 "preset",
             )
         };
-    let buttons = slots.iter().map(|&(slot, enabled)| {
+    let mut segments = segmented(cx).id(SharedString::from(format!("{prefix}-slots")));
+    for (slot, enabled) in slots {
         let label = app.config().preset_name(&id, ProfileSlot::new(slot));
         let device = id.clone();
-        let mut button = Button::new((prefix, u64::from(slot)))
-            .label(label.clone())
-            .accessibility_label(label)
-            .selected(slot == active)
-            .disabled(busy || !enabled)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if enabled && slot != active {
-                    this.request_profile_switch(&device, slot, window, cx);
-                }
-            }));
-        if !enabled {
-            button = button.tooltip("Disabled in onboard memory");
-        }
-        button
-    });
+        let button = segment(
+            Button::new((prefix, u64::from(slot))),
+            label,
+            slot == active,
+            cx,
+        )
+        .disabled(busy || !enabled)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if enabled && slot != active {
+                this.request_profile_switch(&device, slot, window, cx);
+            }
+        }));
+        segments = segments.child(if enabled {
+            button
+        } else {
+            button.opacity(0.4).tooltip("Disabled in onboard memory")
+        });
+    }
     let rename_device = id.clone();
-    let theme = cx.theme();
     let caption = if hardware.is_some() {
         "Onboard profile"
     } else {
@@ -585,24 +603,19 @@ pub(crate) fn render(
 
     h_flex()
         .id("profile-bar")
-        .gap_2()
+        .gap(dp(10.))
         .flex_wrap()
         .child(
             div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
+                .text_size(dp(13.))
+                .text_color(cx.theme().muted_foreground)
                 .child(caption),
         )
-        .child(
-            ButtonGroup::new(SharedString::from(format!("{prefix}-slots")))
-                .outline()
-                .small()
-                .children(buttons),
-        )
+        .child(segments)
         .child(
             Button::new("rename-preset")
-                .outline()
-                .small()
+                .ghost()
+                .h(dp(30.))
                 .icon(Icon::new(IconName::Pencil))
                 .label("Rename…")
                 .disabled(busy)
@@ -613,6 +626,7 @@ pub(crate) fn render(
         .child(div().flex_1())
         .child(tools)
         .into_any_element()
+        .into()
 }
 
 fn default_profile_dir() -> PathBuf {

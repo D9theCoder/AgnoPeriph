@@ -245,13 +245,26 @@ fn click(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, id: impl Into<Ele
     settle(cx, handle);
 }
 
-fn open_tab(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, tab: KeyboardTab) {
-    let index = KeyboardTab::ALL.iter().position(|t| *t == tab).unwrap();
-    cx.update_window(handle, |_, window, cx| {
-        window.within("keyboard-tabs").click(index, cx);
-    })
-    .expect("open tab");
-    settle(cx, handle);
+fn open_tab(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    app: &Entity<AgnoPeriphApp>,
+    tab: KeyboardTab,
+) {
+    let tabs = cx.update(|cx| app.read(cx).keyboard_tabs());
+    let index = tabs
+        .iter()
+        .position(|t| *t == tab)
+        .expect("the selected device offers the tab");
+    // A lone tab has no bar and is already shown.
+    if tabs.len() > 1 {
+        cx.update_window(handle, |_, window, cx| {
+            window.within("keyboard-tabs").click(index, cx);
+        })
+        .expect("open tab");
+        settle(cx, handle);
+    }
+    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tab(), tab));
 }
 
 fn set_theme(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, mode: ThemeMode) {
@@ -280,7 +293,7 @@ fn save(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, name: &str) {
 #[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
 fn capture_keyboard_screens() {
     let mut cx = headless();
-    let (handle, _app) = open(&mut cx);
+    let (handle, app) = open(&mut cx);
     click(
         &mut cx,
         handle,
@@ -289,12 +302,59 @@ fn capture_keyboard_screens() {
 
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
         set_theme(&mut cx, handle, mode);
-        open_tab(&mut cx, handle, KeyboardTab::Triggers);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Triggers);
         save(&mut cx, handle, &format!("triggers-{suffix}"));
-        open_tab(&mut cx, handle, KeyboardTab::Lighting);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Lighting);
         save(&mut cx, handle, &format!("lighting-{suffix}"));
-        open_tab(&mut cx, handle, KeyboardTab::Keybinds);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Keybinds);
         save(&mut cx, handle, &format!("keybinds-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_lighting_states() {
+    let mut cx = headless();
+    let (handle, app) = open(&mut cx);
+    click(
+        &mut cx,
+        handle,
+        device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+    );
+    open_tab(&mut cx, handle, &app, KeyboardTab::Lighting);
+    click(&mut cx, handle, "rgb-format-rgb");
+    click(&mut cx, handle, "rgb-swatch-Teal");
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("lighting-pending-{suffix}"));
+    }
+    click(&mut cx, handle, ("rgb-zone", 1u64));
+    save(&mut cx, handle, "lighting-logo-dark");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_keybind_states() {
+    let mut cx = headless();
+    let (handle, app) = open(&mut cx);
+    click(
+        &mut cx,
+        handle,
+        device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+    );
+    open_tab(&mut cx, handle, &app, KeyboardTab::Keybinds);
+    click(&mut cx, handle, ("keymap-layer", 1u64));
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("keybinds-fn-{suffix}"));
+    }
+    // A remapped, not yet applied key on the base layer: Caps sends Left Ctrl.
+    click(&mut cx, handle, ("keymap-layer", 0u64));
+    click(&mut cx, handle, ("keymap-key", 48u64));
+    click(&mut cx, handle, ("hid-key", 0xE0u64));
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("keybinds-remapped-{suffix}"));
     }
 }
 
@@ -303,41 +363,48 @@ fn capture_keyboard_screens() {
 fn capture_multi_brand_screens() {
     let mut cx = headless();
     let (handle, app) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
-    let (tall, _) = open_with(&mut cx, MockPeripheralService::multi_brand(), TALL_HEIGHT);
 
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
-        set_theme(&mut cx, tall, mode);
+        set_theme(&mut cx, handle, mode);
         click(
             &mut cx,
-            tall,
+            handle,
             device_element_id(&DeviceId::new(MOCK_PULSAR_ID)),
         );
-        save(&mut cx, tall, &format!("mouse-sensor-{suffix}"));
+        save(&mut cx, handle, &format!("sensor-pulsar-{suffix}"));
         click(
             &mut cx,
-            tall,
+            handle,
             device_element_id(&DeviceId::new(MOCK_RAZER_ID)),
         );
-        save(&mut cx, tall, &format!("mouse-rgb-{suffix}"));
-
-        set_theme(&mut cx, handle, mode);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Sensor);
+        save(&mut cx, handle, &format!("sensor-basilisk-{suffix}"));
+        open_tab(&mut cx, handle, &app, KeyboardTab::Lighting);
+        save(&mut cx, handle, &format!("mouse-rgb-{suffix}"));
+        // A cycling effect on the shell, then the logo picked on the drawing.
+        let (lit, lit_app) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
+        set_theme(&mut cx, lit, mode);
+        click(
+            &mut cx,
+            lit,
+            device_element_id(&DeviceId::new(MOCK_RAZER_ID)),
+        );
+        open_tab(&mut cx, lit, &lit_app, KeyboardTab::Lighting);
+        click(&mut cx, lit, "rgb-0-effect-SpectrumCycle");
+        click(&mut cx, lit, "mouse-logo");
+        save(&mut cx, lit, &format!("mouse-rgb-pending-{suffix}"));
         click(
             &mut cx,
             handle,
             device_element_id(&DeviceId::new(MOCK_VIA_ID)),
         );
+        // The open tab carries over from the previous device, so pick each one.
+        open_tab(&mut cx, handle, &app, KeyboardTab::Keybinds);
         save(&mut cx, handle, &format!("via-keybinds-{suffix}"));
-        cx.update(|cx| {
-            app.update(cx, |app, cx| {
-                app.set_keyboard_tab(KeyboardTab::Lighting, cx);
-            });
-        });
+        click(&mut cx, handle, ("keymap-layer", 1u64));
+        save(&mut cx, handle, &format!("via-keybinds-fn-{suffix}"));
+        open_tab(&mut cx, handle, &app, KeyboardTab::Lighting);
         save(&mut cx, handle, &format!("via-lighting-{suffix}"));
-        cx.update(|cx| {
-            app.update(cx, |app, cx| {
-                app.set_keyboard_tab(KeyboardTab::Keybinds, cx);
-            });
-        });
 
         // Own window, so the expected error banner stays out of the other views.
         let (wooting, _) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
@@ -355,6 +422,94 @@ fn capture_multi_brand_screens() {
     }
 }
 
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_sensor_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let (handle, _) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("sensor-atlantis-{suffix}"));
+        click(&mut cx, handle, ("dpi-inc", 2u64));
+        click(&mut cx, handle, ("polling-rate", 500u64));
+        click(&mut cx, handle, "angle-snapping");
+        save(&mut cx, handle, &format!("sensor-pending-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_game_profile_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let (handle, app) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(&mut cx, handle, "nav-game-profiles");
+        save(&mut cx, handle, &format!("games-empty-{suffix}"));
+        let id = cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.add_game_profile("Valorant", "VALORANT-Win64-Shipping.exe", "", cx)
+            })
+        });
+        settle(&mut cx, handle);
+        // Selecting it fills the executable field, as adding from the page does.
+        click(
+            &mut cx,
+            handle,
+            gpui_kit::SharedString::from(format!("game-profile-{id}")),
+        );
+        save(&mut cx, handle, &format!("games-profile-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_trigger_states() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        let (handle, _) = open(&mut cx);
+        set_theme(&mut cx, handle, mode);
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        for key in [33u64, 35, 36] {
+            click(&mut cx, handle, ("key", key));
+        }
+        save(&mut cx, handle, &format!("triggers-selected-{suffix}"));
+        click(&mut cx, handle, "paired-type");
+        save(&mut cx, handle, &format!("triggers-menu-{suffix}"));
+        click(&mut cx, handle, "paired-mode-socd");
+        click(&mut cx, handle, "paired-pick-first");
+        click(&mut cx, handle, ("key", 33u64));
+        save(&mut cx, handle, &format!("triggers-adding-{suffix}"));
+        click(&mut cx, handle, "paired-cancel");
+        for (kind, name) in [("paired-mode-rs", "rs"), ("paired-mode-dks", "dks")] {
+            click(&mut cx, handle, "paired-type");
+            click(&mut cx, handle, kind);
+            save(&mut cx, handle, &format!("triggers-{name}-{suffix}"));
+        }
+        click(&mut cx, handle, "paired-pick-first");
+        click(&mut cx, handle, ("key", 33u64));
+        save(&mut cx, handle, &format!("triggers-dks-adding-{suffix}"));
+
+        let (wooting, _) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
+        set_theme(&mut cx, wooting, mode);
+        click(
+            &mut cx,
+            wooting,
+            device_element_id(&DeviceId::new(MOCK_WOOTING_ID)),
+        );
+        click(&mut cx, wooting, ("key", 14u64));
+        save(
+            &mut cx,
+            wooting,
+            &format!("wooting-triggers-selected-{suffix}"),
+        );
+    }
+}
+
 /// Opens the mock keyboard on its Triggers tab with E selected and two unsaved edits.
 fn dirty_triggers(
     cx: &mut HeadlessAppContext,
@@ -367,14 +522,14 @@ fn dirty_triggers(
         handle,
         device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
     );
-    open_tab(cx, handle, KeyboardTab::Triggers);
+    open_tab(cx, handle, &app, KeyboardTab::Triggers);
     click(cx, handle, ("key", 35u64));
     click(cx, handle, "actuation-inc");
     click(cx, handle, "actuation-inc");
     click(cx, handle, "rapid-trigger");
-    open_tab(cx, handle, KeyboardTab::Advanced);
+    open_tab(cx, handle, &app, KeyboardTab::Advanced);
     click(cx, handle, "config-win-lock");
-    open_tab(cx, handle, KeyboardTab::Triggers);
+    open_tab(cx, handle, &app, KeyboardTab::Triggers);
     (handle, app)
 }
 
@@ -383,24 +538,36 @@ fn dirty_triggers(
 fn capture_unsaved_changes_screens() {
     let mut cx = headless();
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
-        let (handle, _) = dirty_triggers(&mut cx, mode);
+        let (handle, app) = dirty_triggers(&mut cx, mode);
         save(&mut cx, handle, &format!("dirty-triggers-{suffix}"));
         click(&mut cx, handle, "dirty-changes");
         save(&mut cx, handle, &format!("dirty-changes-{suffix}"));
         click(&mut cx, handle, "dirty-changes");
-        open_tab(&mut cx, handle, KeyboardTab::Advanced);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Advanced);
         save(&mut cx, handle, &format!("advanced-dirty-{suffix}"));
         click(&mut cx, handle, "dirty-discard");
         save(&mut cx, handle, &format!("discard-toast-{suffix}"));
 
-        // Leaving the device with unsaved edits asks first.
+        // Leaving the preset with unsaved edits asks first.
+        let (handle, _) = dirty_triggers(&mut cx, mode);
+        click(&mut cx, handle, ("preset", 1u64));
+        save(&mut cx, handle, &format!("unsaved-guard-{suffix}"));
+
+        // Each device keeps its own edits and shows a dot in the sidebar.
         let (handle, _) = dirty_triggers(&mut cx, mode);
         click(
             &mut cx,
             handle,
             device_element_id(&DeviceId::new(agnoperiph::backend::MOCK_MOUSE_ID)),
         );
-        save(&mut cx, handle, &format!("unsaved-guard-{suffix}"));
+        click(&mut cx, handle, ("dpi-inc", 1u64));
+        save(&mut cx, handle, &format!("two-devices-dirty-{suffix}"));
+        click(
+            &mut cx,
+            handle,
+            device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+        );
+        save(&mut cx, handle, &format!("restored-dirty-{suffix}"));
 
         let (tall, _) = open_with(&mut cx, MockPeripheralService::new(), TALL_HEIGHT);
         set_theme(&mut cx, tall, mode);
@@ -488,10 +655,10 @@ fn capture_live_tester_screens() {
                 TravelHundredthsMm::from_hundredths(180),
             )],
         );
-        let (handle, _app) = open_with(&mut cx, service, HEIGHT);
+        let (handle, app) = open_with(&mut cx, service, HEIGHT);
         set_theme(&mut cx, handle, mode);
         click(&mut cx, handle, device_element_id(&keyboard));
-        open_tab(&mut cx, handle, KeyboardTab::Triggers);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Triggers);
         // Rapid Trigger on E shows the release/press band on the meter.
         click(&mut cx, handle, ("key", 35u64));
         click(&mut cx, handle, "rapid-trigger");
@@ -523,11 +690,11 @@ fn capture_live_tester_socd_screens() {
             )
         };
         service.set_live_key_travel(&keyboard, vec![sample(49, 250)]);
-        let (handle, _app) =
+        let (handle, app) =
             open_with_service(&mut cx, service.clone(), HEIGHT, AppOptions::default());
         set_theme(&mut cx, handle, mode);
         click(&mut cx, handle, device_element_id(&keyboard));
-        open_tab(&mut cx, handle, KeyboardTab::Triggers);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Triggers);
         for _ in 0..3 {
             cx.advance_clock(LIVE_POLL_INTERVAL);
             settle(&mut cx, handle);
@@ -541,26 +708,24 @@ fn capture_live_tester_socd_screens() {
     }
 }
 
-/// Mouse window tall enough to show the Macros tab below the pointer settings.
-const MOUSE_MACRO_HEIGHT: f32 = 1900.;
-
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
 fn capture_macro_screens() {
     let mut cx = headless();
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
-        let (handle, _) = open(&mut cx);
+        let (handle, app) = open(&mut cx);
         set_theme(&mut cx, handle, mode);
         click(
             &mut cx,
             handle,
             device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
         );
-        open_tab(&mut cx, handle, KeyboardTab::Macros);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Macros);
         save(&mut cx, handle, &format!("macros-keyboard-{suffix}"));
 
-        let (handle, _) = open_with(&mut cx, MockPeripheralService::new(), MOUSE_MACRO_HEIGHT);
+        let (handle, app) = open(&mut cx);
         set_theme(&mut cx, handle, mode);
+        open_tab(&mut cx, handle, &app, KeyboardTab::Macros);
         click(&mut cx, handle, ("macro-slot", 3u64));
         click(&mut cx, handle, ("macro-repeat-inc", 3u64));
         save(&mut cx, handle, &format!("macros-mouse-{suffix}"));
@@ -604,5 +769,17 @@ fn capture_update_screen() {
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
         set_theme(&mut cx, handle, mode);
         save(&mut cx, handle, &format!("update-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_settings_screen() {
+    let mut cx = headless();
+    let (handle, _) = open_with(&mut cx, MockPeripheralService::multi_brand(), HEIGHT);
+    click(&mut cx, handle, "nav-settings");
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("settings-{suffix}"));
     }
 }

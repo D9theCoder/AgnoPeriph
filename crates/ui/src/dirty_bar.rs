@@ -1,6 +1,8 @@
 //! Unsaved-changes workflow: staging edits into the device draft, the dirty bar at the
-//! bottom of a device page, Undo / Discard / Apply, the switch guard, the keyboard
+//! bottom of a device page, Undo / Discard / Apply, the preset-switch guard, the keyboard
 //! shortcuts that drive them, and low-battery alerts fed from device snapshots.
+
+use std::collections::HashSet;
 
 use agnoperiph_core::{DeviceId, KeyIndex};
 use gpui_kit::component::{
@@ -11,7 +13,6 @@ use gpui_kit::component::{
     kbd::Kbd,
     notification::Notification,
     popover::Popover,
-    tag::Tag,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -19,18 +20,31 @@ use gpui_kit::*;
 
 use crate::app::{AfterApply, AgnoPeriphApp, JobOrigin, Route, WriteJob};
 use crate::backend::DeviceSnapshot;
-use crate::draft::{ChangeId, DeviceDraft, EditKey, PendingChange, rewrites_all_keys};
+use crate::design::dp;
+use crate::draft::{
+    ChangeId, DeviceDraft, DraftHistory, EditKey, PendingChange, rewrites_all_keys,
+};
 use crate::keymap::KeyLayout;
+use crate::motion::Entrance;
 use crate::shortcuts::{
     ApplyChanges, Dismiss, NextTab, PreviousTab, REFERENCE, SelectDevice1, SelectDevice2,
     SelectDevice3, SelectDevice4, SelectDevice5, SelectDevice6, SelectDevice7, SelectDevice8,
     SelectDevice9, ToggleShortcuts, UndoChange,
 };
+use crate::widgets::chip;
 
 /// How long the Discard notification offers Undo.
 const DISCARD_UNDO_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
 
 struct DiscardNotice;
+
+/// The unsaved edits of a device that isn't on screen, with their undo steps.
+#[derive(Debug, Default)]
+pub(crate) struct ParkedDraft {
+    draft: DeviceDraft,
+    history: DraftHistory,
+    failure: Option<SharedString>,
+}
 
 fn key_label(device: &DeviceSnapshot) -> impl Fn(KeyIndex) -> String + '_ {
     let layout = device
@@ -49,6 +63,90 @@ impl AgnoPeriphApp {
     /// Whether the selected device has edits that haven't been applied.
     pub fn is_dirty(&self) -> bool {
         !self.draft.is_empty()
+    }
+
+    /// Whether `device` has edits that haven't been applied, on screen or not.
+    pub fn has_unsaved(&self, device: &DeviceId) -> bool {
+        (self.draft_device.as_ref() == Some(device) && !self.draft.is_empty())
+            || self.parked.contains_key(device)
+    }
+
+    /// How many changes `device` has waiting.
+    pub(crate) fn unsaved_count(&self, device: &DeviceSnapshot) -> usize {
+        let draft = if self.draft_device.as_ref() == Some(device.id()) {
+            &self.draft
+        } else if let Some(parked) = self.parked.get(device.id()) {
+            &parked.draft
+        } else {
+            return 0;
+        };
+        let raw = self.device(device.id()).unwrap_or(device);
+        draft.pending(raw, &key_label(raw)).len()
+    }
+
+    /// Sets the on-screen edits aside before another device takes their place.
+    pub(crate) fn park_draft(&mut self) {
+        let Some(device) = self.draft_device.clone() else {
+            return;
+        };
+        if self.draft.is_empty() {
+            return;
+        }
+        let parked = ParkedDraft {
+            draft: std::mem::take(&mut self.draft),
+            history: std::mem::take(&mut self.history),
+            failure: self.apply_failure.take(),
+        };
+        self.parked.insert(device, parked);
+    }
+
+    /// Brings the selected device's parked edits back on screen.
+    pub(crate) fn restore_parked_draft(&mut self) {
+        let Some(device) = self.selected_device_id().cloned() else {
+            return;
+        };
+        let Some(parked) = self.parked.remove(&device) else {
+            return;
+        };
+        self.draft = parked.draft;
+        self.history = parked.history;
+        self.apply_failure = parked.failure;
+        self.draft_device = Some(device);
+        self.renormalize_draft();
+    }
+
+    /// Drops parked values the device now holds.
+    pub(crate) fn renormalize_parked_draft(&mut self, snapshot: &DeviceSnapshot) {
+        if let Some(parked) = self.parked.get_mut(snapshot.id()) {
+            parked.draft.normalize(snapshot);
+            if parked.draft.is_empty() {
+                self.parked.remove(snapshot.id());
+            }
+        }
+    }
+
+    /// After a refresh: a device that went away takes its edits with it.
+    pub(crate) fn drop_parked_of_missing_devices(&mut self) {
+        let devices: Vec<DeviceSnapshot> = self.devices().to_vec();
+        self.parked
+            .retain(|id, _| devices.iter().any(|d| d.id() == id));
+        for snapshot in &devices {
+            self.renormalize_parked_draft(snapshot);
+        }
+    }
+
+    /// Clears the edits a write has sent in full. The user may have moved to another
+    /// device while it was in flight.
+    pub(crate) fn finish_full_apply(&mut self, device: &DeviceId) {
+        if self.draft_device.as_ref() == Some(device) {
+            self.draft = DeviceDraft::default();
+            self.history.clear();
+            self.apply_failure = None;
+            self.is_changes_open = false;
+            self.sync_effective();
+        } else {
+            self.parked.remove(device);
+        }
     }
 
     pub(crate) fn has_dirty_bar(&self) -> bool {
@@ -328,43 +426,53 @@ impl AgnoPeriphApp {
         error: &agnoperiph_core::CoreError,
     ) {
         self.after_apply = None;
-        if self.draft_device.as_ref() != Some(device) {
+        let Some(raw) = self.device(device).cloned() else {
             return;
-        }
+        };
+        let is_on_screen = self.draft_device.as_ref() == Some(device);
+        let (draft, history) = if is_on_screen {
+            (&mut self.draft, &mut self.history)
+        } else if let Some(parked) = self.parked.get_mut(device) {
+            (&mut parked.draft, &mut parked.history)
+        } else {
+            return;
+        };
         let remaining = &steps[failed.min(steps.len())..];
         for id in &steps[..failed.min(steps.len())] {
             if !remaining.contains(id) {
-                self.draft.revert(*id);
+                draft.revert(*id);
             }
         }
         // Undo steps may refer to values that are now on the device.
-        self.history.clear();
+        history.clear();
         let label = steps.get(failed).and_then(|id| {
-            self.pending_changes()
+            draft
+                .pending(&raw, &key_label(&raw))
                 .into_iter()
                 .find(|c| c.id == *id)
                 .map(|c| c.label)
         });
-        self.apply_failure = Some(
-            match label {
-                Some(label) => format!("{label} wasn’t applied: {error}"),
-                None => format!("Some changes weren’t applied: {error}"),
-            }
-            .into(),
-        );
-    }
-
-    pub(crate) fn run_after_apply(&mut self, next: AfterApply, cx: &mut Context<Self>) {
-        match next {
-            AfterApply::SelectDevice(device) => self.select_device(device, cx),
-            AfterApply::SwitchProfile { device, slot } => self.switch_profile(&device, slot, cx),
+        let message: SharedString = match label {
+            Some(label) => format!("{label} wasn’t applied: {error}"),
+            None => format!("Some changes weren’t applied: {error}"),
+        }
+        .into();
+        if is_on_screen {
+            self.apply_failure = Some(message);
+        } else if let Some(parked) = self.parked.get_mut(device) {
+            parked.failure = Some(message);
         }
     }
 
+    pub(crate) fn run_after_apply(&mut self, next: AfterApply, cx: &mut Context<Self>) {
+        let AfterApply::SwitchProfile { device, slot } = next;
+        self.switch_profile(&device, slot, cx);
+    }
+
     /// Selects the device at `ix` (0-based) in the sidebar order.
-    pub fn select_device_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_device_at(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(id) = self.devices().get(ix).map(|d| d.id().clone()) {
-            self.request_select_device(id, window, cx);
+            self.select_device(id, cx);
         }
     }
 
@@ -449,7 +557,7 @@ impl AgnoPeriphApp {
     }
 }
 
-/// Opens the unsaved-changes guard before leaving the selected device or preset.
+/// Opens the unsaved-changes guard before leaving the selected device's preset.
 pub(crate) fn open_guard(
     app: &mut AgnoPeriphApp,
     next: AfterApply,
@@ -549,8 +657,8 @@ pub(crate) fn open_guard(
 /// Registers the window shortcuts on the app root.
 pub(crate) fn bind_actions(root: Stateful<Div>, cx: &mut Context<AgnoPeriphApp>) -> Stateful<Div> {
     let select = |ix: usize| {
-        move |this: &mut AgnoPeriphApp, window: &mut Window, cx: &mut Context<AgnoPeriphApp>| {
-            this.select_device_at(ix, window, cx);
+        move |this: &mut AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>| {
+            this.select_device_at(ix, cx);
         }
     };
     let s = [
@@ -582,15 +690,15 @@ pub(crate) fn bind_actions(root: Stateful<Div>, cx: &mut Context<AgnoPeriphApp>)
         this.set_shortcuts_open(open, cx);
     }))
     .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice1, w, cx| s1(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice2, w, cx| s2(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice3, w, cx| s3(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice4, w, cx| s4(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice5, w, cx| s5(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice6, w, cx| s6(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice7, w, cx| s7(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice8, w, cx| s8(this, w, cx)))
-    .on_action(cx.listener(move |this, _: &SelectDevice9, w, cx| s9(this, w, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice1, _, cx| s1(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice2, _, cx| s2(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice3, _, cx| s3(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice4, _, cx| s4(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice5, _, cx| s5(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice6, _, cx| s6(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice7, _, cx| s7(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice8, _, cx| s8(this, cx)))
+    .on_action(cx.listener(move |this, _: &SelectDevice9, _, cx| s9(this, cx)))
 }
 
 fn kbd(keys: &'static str) -> Option<Kbd> {
@@ -662,12 +770,10 @@ pub(crate) fn render(
     let can_undo = app.can_undo_draft() && !app.has_pending_writes();
     let failure = app.apply_failure.clone();
     let dry_run = app.is_dry_run();
-    let summary: SharedString = changes
-        .iter()
-        .map(|c| c.label.clone())
-        .collect::<Vec<_>>()
-        .join(", ")
-        .into();
+    let mut areas: Vec<&str> = changes.iter().map(|c| c.label.as_ref()).collect();
+    let mut seen = HashSet::new();
+    areas.retain(|area| seen.insert(*area));
+    let summary: SharedString = areas.join(", ").into();
     let entity = cx.entity().downgrade();
     let list = changes.clone();
     let list_app = entity.clone();
@@ -686,10 +792,20 @@ pub(crate) fn render(
         .trigger(
             Button::new("dirty-changes")
                 .ghost()
-                .small()
-                .icon(IconName::ChevronUp)
-                .label(count_label)
-                .tooltip("Show unsaved changes"),
+                .h(dp(28.))
+                .px(dp(6.))
+                .accessibility_label(count_label.clone())
+                .tooltip("Show unsaved changes")
+                .child(
+                    h_flex()
+                        .gap(dp(6.))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(count_label))
+                        .child(
+                            Icon::new(IconName::ChevronUp)
+                                .size(dp(13.))
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                ),
         )
         .content(move |_, _, cx| {
             let theme = cx.theme();
@@ -758,7 +874,6 @@ pub(crate) fn render(
             .flex_1()
             .min_w_0()
             .truncate()
-            .text_sm()
             .text_color(theme.danger)
             .child(message.clone()),
         None => div()
@@ -766,29 +881,40 @@ pub(crate) fn render(
             .flex_1()
             .min_w_0()
             .truncate()
-            .text_sm()
             .text_color(theme.muted_foreground)
             .child(summary),
     };
 
-    h_flex()
+    let bar = h_flex()
         .id("dirty-bar")
         .flex_shrink_0()
-        .gap_2()
-        .px_5()
-        .py_2()
+        .h(dp(52.))
+        .gap(dp(8.))
+        .px(dp(24.))
         .border_t_1()
         .border_color(theme.border)
-        .bg(theme.title_bar)
+        .bg(theme.sidebar)
+        .child(
+            div()
+                .flex_shrink_0()
+                .size(dp(8.))
+                .rounded_full()
+                .bg(theme.warning),
+        )
         .child(changes_popover)
         .child(status)
         .when(dry_run, |this| {
-            this.child(Tag::secondary().xsmall().child("Dry run: logged, not sent"))
+            this.child(
+                chip(cx)
+                    .h(dp(24.))
+                    .mr(dp(6.))
+                    .child("Dry run: logged, not sent"),
+            )
         })
         .child(
             Button::new("dirty-undo")
                 .ghost()
-                .small()
+                .h(dp(28.))
                 .icon(IconName::Undo2)
                 .label("Undo")
                 .disabled(!can_undo)
@@ -802,7 +928,7 @@ pub(crate) fn render(
         .child(
             Button::new("dirty-discard")
                 .outline()
-                .small()
+                .h(dp(28.))
                 .label("Discard")
                 .disabled(busy)
                 .on_click(cx.listener(|this, _, window, cx| this.discard_draft(window, cx))),
@@ -810,7 +936,7 @@ pub(crate) fn render(
         .child(
             Button::new("dirty-apply")
                 .primary()
-                .small()
+                .h(dp(28.))
                 .label(if failure.is_some() { "Retry" } else { "Apply" })
                 .loading(busy)
                 .disabled(!can_apply)
@@ -820,5 +946,6 @@ pub(crate) fn render(
                     Some(crate::shortcuts::CONTEXT),
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.apply_draft(window, cx))),
-        )
+        );
+    Entrance::new("dirty-bar-entrance", bar)
 }

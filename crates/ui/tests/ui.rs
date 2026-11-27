@@ -94,6 +94,12 @@ fn exists(cx: &mut TestAppContext, handle: AnyWindowHandle, id: impl Into<Elemen
         .unwrap()
 }
 
+/// Switches the paired-keys panel to another type through its drop-down.
+fn pick_paired_type(cx: &mut TestAppContext, handle: AnyWindowHandle, id: &'static str) {
+    click(cx, handle, "paired-type");
+    click(cx, handle, id);
+}
+
 fn key_id(key: u16) -> (&'static str, u64) {
     ("key", u64::from(key))
 }
@@ -410,16 +416,26 @@ fn failed_live_write_refreshes_view_and_does_not_claim_nothing_was_written(
     });
 }
 
-fn open_tab(cx: &mut TestAppContext, handle: AnyWindowHandle, tab: KeyboardTab) {
-    let index = KeyboardTab::ALL
+fn open_tab(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    app: &Entity<AgnoPeriphApp>,
+    tab: KeyboardTab,
+) {
+    let tabs = cx.update(|cx| app.read(cx).keyboard_tabs());
+    let index = tabs
         .iter()
         .position(|t| *t == tab)
-        .expect("tab exists");
-    cx.update_window(handle, |_, window, cx| {
-        window.within("keyboard-tabs").click(index, cx);
-    })
-    .unwrap();
-    settle(cx, handle);
+        .expect("the selected device offers the tab");
+    // A lone tab has no bar and is already shown.
+    if tabs.len() > 1 {
+        cx.update_window(handle, |_, window, cx| {
+            window.within("keyboard-tabs").click(index, cx);
+        })
+        .unwrap();
+        settle(cx, handle);
+    }
+    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tab(), tab));
 }
 
 /// Focuses the text input wrapped by `id`, replaces its text and renders.
@@ -458,7 +474,7 @@ fn keyboard_tabs_switch_workspaces(cx: &mut TestAppContext) {
         (KeyboardTab::Advanced, "config-win-lock".into()),
     ];
     for (tab, marker) in expected {
-        open_tab(cx, handle, tab);
+        open_tab(cx, handle, &app, tab);
         cx.update(|cx| assert_eq!(app.read(cx).keyboard_tab(), tab));
         assert!(
             exists(cx, handle, marker.clone()),
@@ -471,7 +487,7 @@ fn keyboard_tabs_switch_workspaces(cx: &mut TestAppContext) {
 fn lighting_presets_apply_per_zone(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
 
     // The Back Lamp lists every preset the keyboard reports.
     let snapshot = keyboard_snapshot(cx, &app);
@@ -535,7 +551,9 @@ fn triggers_select_many_keys_and_restore_defaults(cx: &mut TestAppContext) {
     });
     click(cx, handle, key_id(KEY_E));
     cx.update(|cx| assert!(app.read(cx).selected_keys().is_empty()));
-    assert!(is_disabled(cx, handle, "actuation-all-keys"));
+    assert!(!exists(cx, handle, "actuation-all-keys"));
+    assert!(!exists(cx, handle, "actuation-inc"));
+    assert!(exists(cx, handle, "actuation-select-all"));
     assert!(is_disabled(cx, handle, "restore-default-keys"));
 
     click(cx, handle, key_id(KEY_E));
@@ -565,7 +583,7 @@ fn triggers_select_many_keys_and_restore_defaults(cx: &mut TestAppContext) {
 fn keybinds_remap_undo_and_redo(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Keybinds);
+    open_tab(cx, handle, &app, KeyboardTab::Keybinds);
 
     let code_of = |snapshot: &DeviceSnapshot| {
         snapshot.keymap.as_ref().unwrap().snapshot.layers[0][usize::from(KEY_Q)]
@@ -587,8 +605,8 @@ fn keybinds_remap_undo_and_redo(cx: &mut TestAppContext) {
         KeyCode::standard(0x1A)
     );
 
-    // Macros are offered as extra keys; vendor groups without verified codes are listed only.
-    click(cx, handle, "keymap-picker-extra");
+    // Macro slots have their own category.
+    click(cx, handle, "keymap-picker-macro");
     click(cx, handle, ("macro-key", 2u64));
     assert_eq!(
         code_of(&keyboard_snapshot(cx, &app)),
@@ -600,7 +618,7 @@ fn keybinds_remap_undo_and_redo(cx: &mut TestAppContext) {
 fn macros_edit_steps_and_save(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Macros);
+    open_tab(cx, handle, &app, KeyboardTab::Macros);
 
     let steps =
         |snapshot: &DeviceSnapshot| snapshot.macros.as_ref().unwrap().slots[1].steps.clone();
@@ -637,6 +655,8 @@ fn heaviest_screens_render_within_the_main_thread_stack() {
         "via_keyboard_without_hall_effect_lands_on_its_own_tabs",
         "triggers_and_lighting_fit_the_default_window",
         "loads_devices_and_switches_capability_editors",
+        "sensor_switches_follow_pointer_capabilities",
+        "mouse_with_rgb_has_lighting_on_its_own_tab",
     ];
     // libtest threads honour RUST_MIN_STACK, so the same tests rerun in a child process
     // with the smaller stack; an overflow aborts that process instead of this one.
@@ -665,8 +685,13 @@ fn mouse_macro_cycle_times_stage_discard_and_save(cx: &mut TestAppContext) {
     use agnoperiph_driver_lamzu::crystall;
 
     let (handle, app) = open_app(cx, MockPeripheralService::new());
-    // The mouse offers only the Macros tab under its pointer settings.
-    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tabs(), [KeyboardTab::Macros]));
+    cx.update(|cx| {
+        assert_eq!(
+            app.read(cx).keyboard_tabs(),
+            [KeyboardTab::Sensor, KeyboardTab::Macros]
+        );
+    });
+    open_tab(cx, handle, &app, KeyboardTab::Macros);
     assert!(exists(cx, handle, "save-macros"));
 
     let repeat = |cx: &mut TestAppContext| {
@@ -713,6 +738,7 @@ fn mouse_macro_edits_clicks_media_and_pointer_move(cx: &mut TestAppContext) {
     use agnoperiph_core::MouseButton;
 
     let (handle, app) = open_app(cx, MockPeripheralService::new());
+    open_tab(cx, handle, &app, KeyboardTab::Macros);
     let stored = |cx: &mut TestAppContext| device_snapshot(cx, &app, &mouse()).macros.unwrap();
 
     // Captured `spam click` in slot 5 loads as editable mouse-button steps.
@@ -748,6 +774,7 @@ fn unsupported_macro_stays_readonly_and_survives_saves(cx: &mut TestAppContext) 
     use agnoperiph_driver_lamzu::crystall;
 
     let (handle, app) = open_app(cx, MockPeripheralService::new());
+    open_tab(cx, handle, &app, KeyboardTab::Macros);
     let stored = |cx: &mut TestAppContext| device_snapshot(cx, &app, &mouse()).macros.unwrap();
     assert!(stored(cx).slots[7].is_readonly);
 
@@ -779,9 +806,9 @@ fn unsupported_macro_stays_readonly_and_survives_saves(cx: &mut TestAppContext) 
 
 #[gpui_kit::test]
 fn keyboard_macros_hide_cycle_times(cx: &mut TestAppContext) {
-    let (handle, _) = open_app(cx, MockPeripheralService::new());
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Macros);
+    open_tab(cx, handle, &app, KeyboardTab::Macros);
     assert!(exists(cx, handle, ("macro-slot", 0u64)));
     assert!(!exists(cx, handle, ("macro-repeat-inc", 0u64)));
 }
@@ -790,7 +817,7 @@ fn keyboard_macros_hide_cycle_times(cx: &mut TestAppContext) {
 fn advanced_settings_write_keyboard_config(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Advanced);
+    open_tab(cx, handle, &app, KeyboardTab::Advanced);
 
     click(cx, handle, ("config-rate", 4000u64));
     click(cx, handle, "config-win-lock");
@@ -955,7 +982,7 @@ fn key_actuation(cx: &mut TestAppContext, app: &Entity<AgnoPeriphApp>, key: u16)
 fn software_preset_restores_saved_lighting(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
 
     // Every confirmed edit auto-saves to the active software preset (no manual Save button).
     assert!(!exists(cx, handle, "save-preset"));
@@ -1090,7 +1117,7 @@ fn paired_keys_have_separate_travel_and_rt_and_disable_matrix_selection(cx: &mut
     assert!(after.rapid_trigger);
 
     // Creating a new RS pair on free keys (Q + E) saves its dedicated travel and Rapid Trigger state.
-    click(cx, handle, "paired-mode-rs");
+    pick_paired_type(cx, handle, "paired-mode-rs");
     click(cx, handle, "paired-pick-first");
     click(cx, handle, key_id(KEY_Q));
     click(cx, handle, key_id(KEY_E));
@@ -1127,6 +1154,7 @@ fn workspace_scrolls_at_the_default_window_size(cx: &mut TestAppContext) {
     });
     settle(cx, handle);
     click(cx, handle, device_element_id(&keyboard()));
+    click(cx, handle, key_id(KEY_Q));
 
     // With dev tools (packet inspector) open at 1240x820, the bottom trigger deck sits below the fold.
     let visible = |cx: &mut TestAppContext| {
@@ -1215,7 +1243,7 @@ fn advanced_keys_refuse_keys_owned_by_another_function(cx: &mut TestAppContext) 
         "paired-mode-tgl",
         "paired-mode-dks",
     ] {
-        click(cx, handle, mode);
+        pick_paired_type(cx, handle, mode);
         click(cx, handle, "paired-pick-first");
         assert!(exists(cx, handle, "paired-pick-hint"), "{mode} arms a pick");
 
@@ -1272,7 +1300,7 @@ fn advanced_keys_refuse_keys_owned_by_another_function(cx: &mut TestAppContext) 
 fn lighting_deck_picks_colors_and_toggles_entry_format(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
     // Picks stage as unsaved edits; the editors show them, so read the shown values.
     let shown =
         |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).selected_device().unwrap().clone());
@@ -1326,7 +1354,7 @@ fn lighting_deck_picks_colors_and_toggles_entry_format(cx: &mut TestAppContext) 
 fn keybinds_offer_verified_extra_keys(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Keybinds);
+    open_tab(cx, handle, &app, KeyboardTab::Keybinds);
     let code_of = |cx: &mut TestAppContext| {
         keyboard_snapshot(cx, &app)
             .keymap
@@ -1337,17 +1365,26 @@ fn keybinds_offer_verified_extra_keys(cx: &mut TestAppContext) {
     };
 
     click(cx, handle, ("keymap-key", u64::from(KEY_Q)));
-    click(cx, handle, "keymap-picker-extra");
-    // Media & audio, Windows system keys, Backlight control, Logo light control.
-    for id in [0x00A8u64, 0x00A9, 0x00B1, 0x7820, 0x7E1F] {
+    // Media & audio and Windows system keys, then backlight and logo light control.
+    click(cx, handle, "keymap-picker-lighting");
+    for id in [0x7820u64, 0x7E1F] {
+        assert!(exists(cx, handle, ("extra-key", id)), "extra key {id:#06X}");
+    }
+    click(cx, handle, "keymap-picker-media");
+    for id in [0x00A8u64, 0x00A9, 0x00B1] {
         assert!(exists(cx, handle, ("extra-key", id)), "extra key {id:#06X}");
     }
     click(cx, handle, ("extra-key", 0x00A8u64));
     assert_eq!(code_of(cx), KeyCode::new(0x00, 0xA8));
     click(cx, handle, ("extra-key", 0x00A9u64));
     assert_eq!(code_of(cx), KeyCode::new(0x00, 0xA9));
+    click(cx, handle, "keymap-picker-lighting");
     click(cx, handle, ("extra-key", 0x7820u64));
     assert_eq!(code_of(cx), KeyCode::new(0x78, 0x20));
+
+    // The selected key's restore button puts the printed key back.
+    click(cx, handle, "keymap-restore-key");
+    assert_eq!(code_of(cx), KeyCode::standard(0x14));
 }
 
 #[gpui_kit::test]
@@ -1408,11 +1445,12 @@ fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
         );
     };
 
-    // The matrix, its selection tools, the paired-keys card and the whole trigger deck share one screen.
+    // The matrix, its selection tools, the paired-keys card and the tools below share one screen.
+    click(cx, handle, key_id(KEY_Q));
     for id in [
         ElementId::from(key_id(KEY_W)),
         "restore-default-keys".into(),
-        "paired-mode-tgl".into(),
+        "paired-type".into(),
         "socd-remove-49-51-x".into(),
         "socd-rt-49-51-sw".into(),
         "deadzone-top-inc".into(),
@@ -1424,7 +1462,7 @@ fn triggers_and_lighting_fit_the_default_window(cx: &mut TestAppContext) {
         on_screen(cx, id);
     }
 
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
     for id in [
         ElementId::from("rgb-0-preset-39"),
         "rgb-swatch-White".into(),
@@ -1484,7 +1522,7 @@ fn configured_socd_entry_keeps_remove_clear_of_its_modes(cx: &mut TestAppContext
     };
     let remove = bounds(cx, "socd-remove-49-51-x");
     let card = bounds(cx, "paired-configured");
-    for label in ["Last input", "Neutral", "First key", "Second key"] {
+    for label in ["last", "neutral", "first", "second"] {
         let mode = bounds(cx, &format!("socd-mode-49-51-{label}"));
         assert!(
             !mode.intersects(&remove),
@@ -1763,6 +1801,7 @@ fn manual_update_check_stays_quiet_when_the_build_is_current(cx: &mut TestAppCon
         .with_release_source(releases);
     let (handle, app) = open_app_with(cx, MockPeripheralService::new(), options);
 
+    click(cx, handle, "nav-settings");
     click(cx, handle, "check-updates");
     cx.update(|cx| {
         let app = app.read(cx);
@@ -1827,17 +1866,31 @@ fn sensor_switches_follow_pointer_capabilities(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn mouse_with_rgb_shows_lighting_beside_pointer_settings(cx: &mut TestAppContext) {
+fn mouse_with_rgb_has_lighting_on_its_own_tab(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::multi_brand());
     let razer = DeviceId::new(MOCK_RAZER_ID);
     click(cx, handle, device_element_id(&razer));
 
     assert!(exists(cx, handle, ("polling-rate", 1000u64)));
     assert!(!exists(cx, handle, ("keymap-key", 0u64)));
+    assert!(!exists(cx, handle, ("rgb-zone", 0u64)));
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
     // Zone ids are the device's LED ids (0, 1, 4), not list positions.
     for zone in [0u64, 1, 4] {
         assert!(exists(cx, handle, ("rgb-zone", zone)), "zone {zone}");
     }
+    // The drawing's parts pick their zones too, without touching the mouse.
+    let packets = cx.update(|cx| app.read(cx).packets().len());
+    click(cx, handle, "mouse-wheel");
+    assert!(exists(cx, handle, "rgb-1-effect-Static"));
+    click(cx, handle, "mouse-logo");
+    assert!(exists(cx, handle, "rgb-4-effect-Static"));
+    click(cx, handle, "mouse-art");
+    assert!(exists(cx, handle, "rgb-0-effect-Static"));
+    cx.update(|cx| {
+        assert!(!app.read(cx).is_dirty());
+        assert_eq!(app.read(cx).packets().len(), packets);
+    });
     click(cx, handle, ("rgb-zone", 4u64));
     click(cx, handle, "rgb-4-effect-Static");
     apply(cx, handle);
@@ -1850,6 +1903,63 @@ fn mouse_with_rgb_shows_lighting_beside_pointer_settings(cx: &mut TestAppContext
         .unwrap();
     assert!(matches!(logo.effect, RgbEffect::Static { .. }));
     cx.update(|cx| assert_eq!(app.read(cx).banner(), None));
+}
+
+#[gpui_kit::test]
+fn a_tab_another_device_lacks_resolves_to_its_first(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    open_tab(cx, handle, &app, KeyboardTab::Sensor);
+    click(cx, handle, device_element_id(&keyboard()));
+    // The keyboard has no Sensor tab, so its first one is on screen and reported as current.
+    cx.update(|cx| assert_eq!(app.read(cx).keyboard_tab(), KeyboardTab::Triggers));
+    assert!(exists(cx, handle, ElementId::from(key_id(KEY_W))));
+}
+
+#[gpui_kit::test]
+fn a_disabled_dpi_stepper_does_not_pick_its_stage(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    let pointer = |cx: &mut TestAppContext| device_snapshot(cx, &app, &mouse()).pointer.unwrap();
+    let lowest = pointer(cx).capabilities.dpi_min;
+    // Walk the first stage down to the sensor's minimum, then make another one active.
+    for _ in 0..64 {
+        click(cx, handle, ("dpi-dec", 0u64));
+    }
+    apply(cx, handle);
+    assert_eq!(pointer(cx).snapshot.dpi_stages[0].x.value(), lowest);
+    click(cx, handle, ("dpi-stage", 1u64));
+    let before = pointer(cx).snapshot.active_dpi_stage;
+    let packets = cx.update(|cx| app.read(cx).packets().len());
+
+    click(cx, handle, ("dpi-dec", 0u64));
+
+    assert_eq!(pointer(cx).snapshot.active_dpi_stage, before);
+    assert_eq!(cx.update(|cx| app.read(cx).packets().len()), packets);
+    assert!(!is_dirty(cx, &app));
+}
+
+#[gpui_kit::test]
+fn dpi_stage_tiles_switch_stages_but_their_steppers_do_not(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    let active = |cx: &mut TestAppContext| {
+        let pointer = device_snapshot(cx, &app, &mouse()).pointer.unwrap();
+        pointer.snapshot.active_dpi_stage
+    };
+    assert_eq!(active(cx), 1);
+    let packets = |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).packets().len());
+    let before = packets(cx);
+
+    // Stepping an inactive stage only stages its value; nothing reaches the mouse.
+    click(cx, handle, ("dpi-inc", 2u64));
+    click(cx, handle, ("dpi-dec", 3u64));
+    assert_eq!(active(cx), 1);
+    assert_eq!(pending_ids(cx, &app), [ChangeId::DpiStages]);
+    assert_eq!(packets(cx), before);
+
+    // Selecting a stage is immediate, from its name or anywhere else on its tile.
+    click(cx, handle, ("dpi-active", 2u64));
+    assert_eq!(active(cx), 2);
+    click(cx, handle, ("dpi-stage", 0u64));
+    assert_eq!(active(cx), 0);
 }
 
 #[gpui_kit::test]
@@ -1945,9 +2055,9 @@ fn dirty_bar_collects_edits_across_sections_and_applies_once(cx: &mut TestAppCon
     click(cx, handle, key_id(KEY_E));
     click(cx, handle, "actuation-inc");
     click(cx, handle, "deadzone-top-inc");
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
     click(cx, handle, "rgb-0-preset-5");
-    open_tab(cx, handle, KeyboardTab::Advanced);
+    open_tab(cx, handle, &app, KeyboardTab::Advanced);
     click(cx, handle, "config-win-lock");
 
     assert_eq!(
@@ -2025,46 +2135,6 @@ fn discard_clears_everything_and_offers_undo(cx: &mut TestAppContext) {
     assert!(!exists(cx, handle, "discard-undo"));
 }
 
-#[gpui_kit::test]
-fn switching_device_with_unsaved_edits_asks_first(cx: &mut TestAppContext) {
-    let (handle, app) = open_app(cx, MockPeripheralService::new());
-    let mouse = DeviceId::new(MOCK_MOUSE_ID);
-    click(cx, handle, device_element_id(&keyboard()));
-    click(cx, handle, key_id(KEY_E));
-    click(cx, handle, "actuation-inc");
-
-    // Cancel keeps the device and the edit.
-    click(cx, handle, device_element_id(&mouse));
-    assert!(exists(cx, handle, "guard-apply"));
-    click(cx, handle, "guard-cancel");
-    assert_eq!(selected_id(cx, &app), Some(keyboard()));
-    assert!(is_dirty(cx, &app));
-
-    // Discard and switch drops the edit.
-    click(cx, handle, device_element_id(&mouse));
-    click(cx, handle, "guard-discard");
-    assert_eq!(selected_id(cx, &app), Some(mouse.clone()));
-    assert!(!is_dirty(cx, &app));
-    assert_eq!(key_actuation(cx, &app, KEY_E), 120);
-
-    // Apply and switch writes first.
-    click(cx, handle, device_element_id(&keyboard()));
-    click(cx, handle, key_id(KEY_E));
-    click(cx, handle, "actuation-inc");
-    click(cx, handle, device_element_id(&mouse));
-    click(cx, handle, "guard-apply");
-    cx.executor().advance_clock(Duration::from_millis(500));
-    settle(cx, handle);
-    assert_eq!(selected_id(cx, &app), Some(mouse));
-    assert!(!is_dirty(cx, &app));
-    assert_eq!(key_actuation(cx, &app, KEY_E), 122);
-
-    // Without edits, switching needs no confirmation.
-    click(cx, handle, device_element_id(&keyboard()));
-    assert!(!exists(cx, handle, "guard-apply"));
-    assert_eq!(selected_id(cx, &app), Some(keyboard()));
-}
-
 fn active_slot(
     cx: &mut TestAppContext,
     app: &Entity<AgnoPeriphApp>,
@@ -2113,6 +2183,167 @@ fn switching_preset_with_unsaved_edits_asks_first(cx: &mut TestAppContext) {
     click(cx, handle, "guard-discard");
     assert_eq!(active_slot(cx, &app, &mouse), Some(1));
     assert!(!is_dirty(cx, &app));
+}
+
+fn has_retry(cx: &mut TestAppContext, handle: AnyWindowHandle) -> bool {
+    use gpui_kit::test::TestQueryExt as _;
+    cx.update_window(handle, |_, window, _| {
+        window.try_find_by_label("Retry").is_some()
+    })
+    .unwrap()
+}
+
+fn has_unsaved(cx: &mut TestAppContext, app: &Entity<AgnoPeriphApp>, device: &DeviceId) -> bool {
+    cx.update(|cx| app.read(cx).has_unsaved(device))
+}
+
+#[gpui_kit::test]
+fn each_device_keeps_its_own_unsaved_edits(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+    click(cx, handle, key_id(KEY_E));
+    click(cx, handle, "actuation-inc");
+
+    // Switching away asks nothing, and the other device starts clean.
+    click(cx, handle, device_element_id(&mouse()));
+    assert!(!exists(cx, handle, "guard-cancel"));
+    assert_eq!(selected_id(cx, &app), Some(mouse()));
+    assert!(!is_dirty(cx, &app));
+    assert!(has_unsaved(cx, &app, &keyboard()));
+
+    // Coming back brings the edit and its undo step with it.
+    click(cx, handle, ("dpi-inc", 1u64));
+    click(cx, handle, device_element_id(&keyboard()));
+    assert_eq!(pending_ids(cx, &app), [ChangeId::Actuation]);
+    assert!(has_unsaved(cx, &app, &mouse()));
+    let shown = cx.update(|cx| {
+        let device = app.read(cx).selected_device().unwrap();
+        let he = device.hall_effect.as_ref().unwrap();
+        he.snapshot.keys.clone()
+    });
+    let e = shown.iter().find(|k| k.key.value() == KEY_E).unwrap();
+    assert_eq!(e.actuation.as_hundredths(), 122);
+    click(cx, handle, "dirty-undo");
+    assert!(!is_dirty(cx, &app));
+    assert!(!has_unsaved(cx, &app, &keyboard()));
+
+    // Apply writes only the device on screen.
+    click(cx, handle, key_id(KEY_E));
+    click(cx, handle, "actuation-inc");
+    apply(cx, handle);
+    assert_eq!(key_actuation(cx, &app, KEY_E), 122);
+    assert!(has_unsaved(cx, &app, &mouse()));
+    let pointer = device_snapshot(cx, &app, &mouse()).pointer.unwrap();
+    assert_eq!(pointer.snapshot.dpi_stages[1].x.value(), 800);
+
+    // A preset switch for a device with parked edits shows that device and asks first.
+    request_switch(cx, handle, &app, &mouse(), 1);
+    assert_eq!(selected_id(cx, &app), Some(mouse()));
+    assert!(exists(cx, handle, "guard-cancel"));
+    click(cx, handle, "guard-cancel");
+    assert_eq!(pending_ids(cx, &app), [ChangeId::DpiStages]);
+    assert_eq!(active_slot(cx, &app, &mouse()), Some(0));
+}
+
+#[gpui_kit::test]
+fn a_write_finishing_after_a_device_switch_clears_only_its_own_edits(cx: &mut TestAppContext) {
+    let service = Arc::new(ScriptedService::new());
+    *service.fail_polling_rate.lock().unwrap() = true;
+    let (handle, app) = open_app(cx, SharedService(service.clone()));
+    click(cx, handle, ("dpi-inc", 1u64));
+    click(cx, handle, ("polling-rate", 500u64));
+    click(cx, handle, device_element_id(&keyboard()));
+    click(cx, handle, key_id(KEY_E));
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, device_element_id(&mouse()));
+
+    // The mouse's write is still in flight when the keyboard takes the screen.
+    let apply_then_leave = |cx: &mut TestAppContext| {
+        cx.update_window(handle, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.apply_draft(window, cx);
+                app.select_device(keyboard(), cx);
+            });
+        })
+        .unwrap();
+        settle(cx, handle);
+    };
+    apply_then_leave(cx);
+
+    assert_eq!(pending_ids(cx, &app), [ChangeId::Actuation]);
+    assert!(!has_retry(cx, handle));
+    assert!(has_unsaved(cx, &app, &mouse()));
+
+    click(cx, handle, device_element_id(&mouse()));
+    assert_eq!(pending_ids(cx, &app), [ChangeId::PollingRate]);
+    assert!(has_retry(cx, handle));
+
+    *service.fail_polling_rate.lock().unwrap() = false;
+    apply_then_leave(cx);
+    assert!(!has_unsaved(cx, &app, &mouse()));
+    assert_eq!(pending_ids(cx, &app), [ChangeId::Actuation]);
+}
+
+#[gpui_kit::test]
+fn a_disconnected_device_takes_its_parked_edits_with_it(cx: &mut TestAppContext) {
+    let service = Arc::new(ScriptedService::new());
+    let (handle, app) = open_app(cx, SharedService(service.clone()));
+    click(cx, handle, ("dpi-inc", 1u64));
+    click(cx, handle, device_element_id(&keyboard()));
+
+    click(cx, handle, "refresh");
+    assert!(has_unsaved(cx, &app, &mouse()));
+
+    *service.hide_mouse.lock().unwrap() = true;
+    click(cx, handle, "refresh");
+    assert!(!has_unsaved(cx, &app, &mouse()));
+
+    *service.hide_mouse.lock().unwrap() = false;
+    click(cx, handle, "refresh");
+    click(cx, handle, device_element_id(&mouse()));
+    assert!(!is_dirty(cx, &app));
+}
+
+#[gpui_kit::test]
+fn auto_switch_leaves_a_device_with_parked_edits_alone(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    let id = cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            let id = app.add_game_profile("Valorant", "VALORANT-Win64-Shipping.exe", "", cx);
+            app.set_game_target(Some(&id), &keyboard(), Some(1), cx);
+            app.set_game_target(Some(&id), &mouse(), Some(1), cx);
+            id
+        })
+    });
+    click(cx, handle, device_element_id(&keyboard()));
+    click(cx, handle, key_id(KEY_E));
+    click(cx, handle, "actuation-inc");
+    click(cx, handle, device_element_id(&mouse()));
+
+    let running = HashSet::from(["valorant-win64-shipping.exe".to_owned()]);
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+
+    assert_eq!(
+        cx.update(|cx| app.read(cx).active_game().map(str::to_owned)),
+        Some(id)
+    );
+    assert_eq!(active_slot(cx, &app, &mouse()), Some(1));
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(0));
+    assert!(has_unsaved(cx, &app, &keyboard()));
+    let status = |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).auto_switch_status());
+    assert_eq!(
+        status(cx),
+        "Detected Valorant. ATK RS7 RGB switches once its changes are applied or discarded."
+    );
+
+    // Once the edit is gone, the next process poll switches it.
+    click(cx, handle, device_element_id(&keyboard()));
+    click(cx, handle, "dirty-discard");
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(1));
+    assert_eq!(status(cx), "Detected Valorant. Its presets are active.");
 }
 
 #[gpui_kit::test]
@@ -2233,7 +2464,7 @@ fn live_key_tester_polls_only_while_visible(cx: &mut TestAppContext) {
     });
 
     // Another tab stops polling.
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
     let stopped = polls(cx);
     cx.executor().advance_clock(LIVE_POLL_INTERVAL * 4);
     settle(cx, handle);
@@ -2241,7 +2472,7 @@ fn live_key_tester_polls_only_while_visible(cx: &mut TestAppContext) {
     assert_eq!(polls(cx), stopped);
 
     // Back on Triggers it resumes.
-    open_tab(cx, handle, KeyboardTab::Triggers);
+    open_tab(cx, handle, &app, KeyboardTab::Triggers);
     assert!(polling(cx));
 
     // Leaving the device stops it too.
@@ -2396,9 +2627,9 @@ impl PeripheralService for FunctionKeysService {
 
 #[gpui_kit::test]
 fn function_key_toggles_follow_keyboard_capabilities(cx: &mut TestAppContext) {
-    let (handle, _) = open_app(cx, MockPeripheralService::new());
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Advanced);
+    open_tab(cx, handle, &app, KeyboardTab::Advanced);
     assert!(!exists(cx, handle, "config-fn-inversion"));
     assert!(!exists(cx, handle, "config-game-mode"));
 
@@ -2409,7 +2640,7 @@ fn function_key_toggles_follow_keyboard_capabilities(cx: &mut TestAppContext) {
         },
     );
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Advanced);
+    open_tab(cx, handle, &app, KeyboardTab::Advanced);
     assert_eq!(is_checked(cx, handle, "config-fn-inversion"), Some(false));
     click(cx, handle, "config-fn-inversion");
     click(cx, handle, "config-game-mode");
@@ -2427,11 +2658,12 @@ fn function_key_toggles_follow_keyboard_capabilities(cx: &mut TestAppContext) {
     });
 }
 
-/// Mock devices with scripted differences: no paired keys, a fixed mouse battery level,
-/// or a polling-rate write that fails.
+/// Mock devices with scripted differences: no paired keys, an unplugged mouse, a fixed
+/// mouse battery level, or a polling-rate write that fails.
 struct ScriptedService {
     inner: MockPeripheralService,
     strip_pairs: bool,
+    hide_mouse: Mutex<bool>,
     mouse_battery: Mutex<Option<u8>>,
     fail_polling_rate: Mutex<bool>,
 }
@@ -2441,6 +2673,7 @@ impl ScriptedService {
         Self {
             inner: MockPeripheralService::new(),
             strip_pairs: false,
+            hide_mouse: Mutex::new(false),
             mouse_battery: Mutex::new(None),
             fail_polling_rate: Mutex::new(false),
         }
@@ -2481,6 +2714,7 @@ impl PeripheralService for ScriptedService {
             .inner
             .refresh()?
             .into_iter()
+            .filter(|d| !(*self.hide_mouse.lock().unwrap() && d.info.id == mouse()))
             .map(|d| self.adjust(d))
             .collect())
     }
@@ -2538,13 +2772,12 @@ fn rewriting_every_key_asks_first_from_the_bar_and_the_guard(cx: &mut TestAppCon
     assert!(is_dirty(cx, &app));
     assert_eq!(key_actuation(cx, &app, KEY_E), 120);
 
-    // "Apply and switch" asks too; cancelling it stays on the keyboard with the edit.
-    let mouse = DeviceId::new(MOCK_MOUSE_ID);
-    click(cx, handle, device_element_id(&mouse));
+    // "Apply and switch" asks too; cancelling it stays on the preset with the edit.
+    click(cx, handle, ("preset", 1u64));
     click(cx, handle, "guard-apply");
     assert!(exists(cx, handle, "cancel"));
     click(cx, handle, "cancel");
-    assert_eq!(selected_id(cx, &app), Some(keyboard()));
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(0));
     assert!(is_dirty(cx, &app));
 
     // A later Apply from the bar doesn't run the abandoned switch.
@@ -2553,7 +2786,7 @@ fn rewriting_every_key_asks_first_from_the_bar_and_the_guard(cx: &mut TestAppCon
     assert!(!is_dirty(cx, &app));
     let preset_travel = key_actuation(cx, &app, KEY_E);
     assert_ne!(preset_travel, 120);
-    assert_eq!(selected_id(cx, &app), Some(keyboard()));
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(0));
 
     // Confirmed through the guard, it writes and then switches.
     cx.update(|cx| {
@@ -2562,12 +2795,13 @@ fn rewriting_every_key_asks_first_from_the_bar_and_the_guard(cx: &mut TestAppCon
         });
     });
     settle(cx, handle);
-    click(cx, handle, device_element_id(&mouse));
+    click(cx, handle, ("preset", 1u64));
     click(cx, handle, "guard-apply");
     assert!(exists(cx, handle, "ok"));
     click(cx, handle, "ok");
-    assert_eq!(selected_id(cx, &app), Some(mouse));
+    assert_eq!(active_slot(cx, &app, &keyboard()), Some(1));
     assert!(!is_dirty(cx, &app));
+    request_switch(cx, handle, &app, &keyboard(), 0);
     assert_ne!(key_actuation(cx, &app, KEY_E), preset_travel);
 }
 
@@ -2611,7 +2845,6 @@ fn tray_profile_switch_keeps_unsaved_edits_until_confirmed(cx: &mut TestAppConte
 
 #[gpui_kit::test]
 fn partial_apply_keeps_only_the_failed_change_and_retries(cx: &mut TestAppContext) {
-    use gpui_kit::test::TestQueryExt as _;
     let service = Arc::new(ScriptedService::new());
     *service.fail_polling_rate.lock().unwrap() = true;
     let (handle, app) = open_app(cx, SharedService(service.clone()));
@@ -2620,20 +2853,14 @@ fn partial_apply_keeps_only_the_failed_change_and_retries(cx: &mut TestAppContex
     apply(cx, handle);
 
     assert_eq!(pending_ids(cx, &app), [ChangeId::PollingRate]);
-    let has_retry = |cx: &mut TestAppContext| {
-        cx.update_window(handle, |_, window, _| {
-            window.try_find_by_label("Retry").is_some()
-        })
-        .unwrap()
-    };
-    assert!(has_retry(cx));
+    assert!(has_retry(cx, handle));
     let pointer = device_snapshot(cx, &app, &mouse()).pointer.unwrap();
     assert_eq!(pointer.snapshot.dpi_stages[1].x.value(), 900);
 
     *service.fail_polling_rate.lock().unwrap() = false;
     apply(cx, handle);
     assert!(!is_dirty(cx, &app));
-    assert!(!has_retry(cx));
+    assert!(!has_retry(cx, handle));
     let pointer = device_snapshot(cx, &app, &mouse()).pointer.unwrap();
     assert_eq!(
         pointer.snapshot.polling_rate,
@@ -2691,6 +2918,7 @@ fn low_battery_alerts_fire_once_per_threshold_and_respect_the_switch(cx: &mut Te
     assert_eq!(system.take(), Vec::<(String, String)>::new());
 
     // With alerts off, even the 5% threshold stays quiet.
+    click(cx, handle, "nav-settings");
     click(cx, handle, "pref-low-battery");
     assert!(!cx.update(|cx| app.read(cx).config().low_battery_alerts));
     *service.mouse_battery.lock().unwrap() = Some(4);
@@ -2701,13 +2929,12 @@ fn low_battery_alerts_fire_once_per_threshold_and_respect_the_switch(cx: &mut Te
 #[gpui_kit::test]
 fn shortcuts_still_work_after_overlays_close(cx: &mut TestAppContext) {
     let (handle, app) = open_app(cx, MockPeripheralService::new());
-    let mouse = DeviceId::new(MOCK_MOUSE_ID);
     click(cx, handle, device_element_id(&keyboard()));
     click(cx, handle, key_id(KEY_E));
     click(cx, handle, "actuation-inc");
 
     // Escape on the guard keeps the edit.
-    click(cx, handle, device_element_id(&mouse));
+    click(cx, handle, ("preset", 1u64));
     assert!(exists(cx, handle, "guard-apply"));
     cx.simulate_keystrokes(handle, "escape");
     settle(cx, handle);
@@ -2716,7 +2943,7 @@ fn shortcuts_still_work_after_overlays_close(cx: &mut TestAppContext) {
     assert!(!exists(cx, handle, "guard-apply"));
     assert!(is_dirty(cx, &app));
 
-    click(cx, handle, device_element_id(&mouse));
+    click(cx, handle, ("preset", 1u64));
     click(cx, handle, "guard-cancel");
     cx.simulate_keystrokes(handle, "ctrl-s");
     settle(cx, handle);
@@ -2982,7 +3209,7 @@ fn hardware_sync_detects_direct_keyboard_rgb_and_auto_saves_to_active_preset(
     let (handle, app) = open_app_with(cx, SharedMock(service.clone()), options);
 
     click(cx, handle, device_element_id(&keyboard()));
-    open_tab(cx, handle, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
 
     // Simulate the user pressing Fn + RGB directly on the keyboard (preset 13 @ 55%).
     let onboard_effect = RgbEffect::Preset {

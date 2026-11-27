@@ -13,7 +13,7 @@ use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, DraftScope, JobOrigin, WriteJob, muted_note};
 use crate::backend::SettingChange;
-use crate::key_matrix::{self, KeyFace, KeyTone};
+use crate::key_matrix::{self, KeyContent, KeyFace, KeyTone};
 use crate::keymap::KeyLayout;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -252,13 +252,15 @@ impl Render for CalibrationModal {
                     .get(usize::from(cap.index.value()))
                     .copied()
                     .unwrap_or(false);
-                KeyFace::plain(if calibrated {
+                let tone = if calibrated {
                     KeyTone::Done
                 } else {
                     KeyTone::Normal
-                })
+                };
+                KeyFace::new(KeyContent::Legend, tone)
             },
-            cx.theme(),
+            Vec::new(),
+            cx,
         );
         let theme = cx.theme();
         v_flex()

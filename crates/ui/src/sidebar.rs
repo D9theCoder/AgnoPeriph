@@ -1,14 +1,14 @@
-//! Persistent navigation: connected peripherals, the Game Profiles manager and app preferences.
+//! Persistent navigation: connected peripherals, Game profiles and Settings.
 
-use agnoperiph_core::{BatteryStatus, ChargingState, DeviceId};
+use agnoperiph_core::{BatteryStatus, ConnectionKind, DeviceId};
 
+use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable,
+    ActiveTheme, Icon, IconName, Selectable,
     button::{Button, ButtonVariants},
     h_flex,
     scroll::ScrollableElement,
-    switch::Switch,
-    tag::Tag,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -16,22 +16,15 @@ use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, Route};
 use crate::backend::DeviceSnapshot;
-use crate::updates::CURRENT_VERSION;
+use crate::design::{dp, tokens};
+use crate::widgets::{battery_glyph, battery_label, connection_icon};
+
+/// Below this charge the sidebar marks a battery as low, matching the first alert.
+const LOW_BATTERY_PERCENT: u8 = 20;
 
 /// Stable element id for a device row, derived from its domain [`DeviceId`].
 pub fn device_element_id(device: &DeviceId) -> ElementId {
     ElementId::Name(format!("device-{device}").into())
-}
-
-fn heading(text: &'static str, muted: Hsla) -> Div {
-    div()
-        .px_4()
-        .pt_4()
-        .pb_2()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(muted)
-        .child(text)
 }
 
 pub(crate) fn render(
@@ -45,191 +38,154 @@ pub(crate) fn render(
         .iter()
         .map(|device| {
             let is_selected = route == Route::Device && selected.as_ref() == Some(device.id());
-            let preset = app.current_slot(device.id()).map(|slot| {
-                app.config()
-                    .preset_name(device.id(), agnoperiph_core::ProfileSlot::new(slot))
-            });
-            let unsaved = (app.draft_device.as_ref() == Some(device.id()))
-                .then(|| app.pending_changes().len())
-                .filter(|n| *n > 0);
-            render_row(device, is_selected, preset, unsaved, cx).into_any_element()
+            let unsaved = app.unsaved_count(device);
+            render_row(device, is_selected, unsaved, cx).into_any_element()
         })
         .collect();
-    let game_count = app.config().game_profiles.len();
-    let active_game = app.active_game_name().map(str::to_owned);
-    let close_to_tray = app.config().close_to_tray;
-    let start_with_windows = app.config().start_with_windows;
-    let low_battery_alerts = app.config().low_battery_alerts;
-    let checking_updates = app.is_checking_updates();
-    let installing_update = app.is_installing_update();
+    let games_status: SharedString =
+        match (app.active_game_name(), app.config().auto_switch_enabled) {
+            (Some(name), true) => format!("Playing {name}").into(),
+            (_, false) => "Auto switch off".into(),
+            (None, true) => match app.config().game_profiles.len() {
+                0 => "None yet".into(),
+                1 => "1 game".into(),
+                n => format!("{n} games").into(),
+            },
+        };
+    let games = nav_row(
+        "nav-game-profiles",
+        Icon::new(LucideIcon::Gamepad2),
+        "Game profiles",
+        Some(games_status),
+        route == Route::GameProfiles,
+        cx,
+    )
+    .on_click(cx.listener(|this, _, _, cx| this.open_game_profiles(cx)));
+    let settings = nav_row(
+        "nav-settings",
+        Icon::new(IconName::Settings),
+        "Settings",
+        None,
+        route == Route::Settings,
+        cx,
+    )
+    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
     let theme = cx.theme();
-    let muted = theme.muted_foreground;
-
-    let games_status: SharedString = match (&active_game, app.config().auto_switch_enabled) {
-        (Some(name), true) => format!("Playing {name}").into(),
-        (_, false) => "Auto switch off".into(),
-        (None, true) => match game_count {
-            0 => "No games yet".into(),
-            1 => "1 game".into(),
-            n => format!("{n} games").into(),
-        },
-    };
 
     v_flex()
         .id("sidebar")
-        .w_64()
+        .w(dp(264.))
         .flex_shrink_0()
         .min_h_0()
+        .pt(dp(14.))
+        .px(dp(10.))
+        .pb(dp(10.))
         .border_r_1()
         .border_color(theme.sidebar_border)
         .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
-        .child(heading("Devices", muted))
+        .child(
+            div()
+                .px(dp(10.))
+                .pb(dp(8.))
+                .text_size(dp(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child("Devices"),
+        )
         .child(
             v_flex()
                 .id("sidebar-devices")
                 .flex_1()
                 .min_h_0()
-                .px_2()
-                .pb_2()
-                .gap_1()
+                .gap(dp(2.))
                 .children(rows)
                 .overflow_y_scrollbar(),
         )
         .child(
             v_flex()
                 .flex_shrink_0()
+                .pt(dp(8.))
+                .gap(dp(2.))
                 .border_t_1()
                 .border_color(theme.sidebar_border)
-                .child(heading("Automation", muted))
+                .child(games)
+                .child(settings),
+        )
+}
+
+fn nav_row(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    meta: Option<SharedString>,
+    is_selected: bool,
+    cx: &App,
+) -> Button {
+    let theme = cx.theme();
+    let faint = tokens(cx).faint;
+    Button::new(id)
+        .ghost()
+        .selected(is_selected)
+        .accessibility_label(label)
+        .w_full()
+        .h(dp(34.))
+        .px(dp(10.))
+        .map(|this| {
+            if is_selected {
+                this.bg(theme.muted).text_color(theme.foreground)
+            } else {
+                this.text_color(theme.muted_foreground)
+            }
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap(dp(10.))
+                .text_size(dp(13.5))
+                .child(icon.size(dp(16.)))
                 .child(
-                    div().px_2().child(
-                        Button::new("nav-game-profiles")
-                            .ghost()
-                            .selected(route == Route::GameProfiles)
-                            .w_full()
-                            .h_auto()
-                            .py_2()
-                            .px_2()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_3()
-                                    .child(Icon::new(IconName::LayoutDashboard).small().text_color(muted))
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_0p5()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .child("Game Profiles"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(muted)
-                                                    .truncate()
-                                                    .child(games_status),
-                                            ),
-                                    ),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.open_game_profiles(cx))),
-                    ),
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(if is_selected {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .child(label),
                 )
-                .child(
-                    v_flex()
-                        .px_4()
-                        .pt_4()
-                        .pb_4()
-                        .gap_3()
-                        .child(
-                            Switch::new("pref-close-to-tray")
-                                .small()
-                                .label("Close to tray")
-                                .checked(close_to_tray)
-                                .tooltip("Keep running in the notification area when the window closes, so Game Profiles keep switching")
-                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_close_to_tray(*checked, cx);
-                                })),
-                        )
-                        .child(
-                            Switch::new("pref-start-with-windows")
-                                .small()
-                                .label("Start with Windows")
-                                .checked(start_with_windows)
-                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_start_with_windows(*checked, cx);
-                                })),
-                        )
-                        .child(
-                            Switch::new("pref-low-battery")
-                                .small()
-                                .label("Low-battery alerts")
-                                .checked(low_battery_alerts)
-                                .tooltip("Notify once below 20% and again below 5% while a wireless device runs on battery")
-                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_low_battery_alerts(*checked, cx);
-                                })),
-                        )
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(format!("v{CURRENT_VERSION}")),
-                                )
-                                .child(
-                                    Button::new("check-updates")
-                                        .ghost()
-                                        .xsmall()
-                                        .label("Check for updates")
-                                        .loading(checking_updates)
-                                        .disabled(checking_updates || installing_update)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.check_for_updates(true, cx);
-                                        })),
-                                ),
-                        ),
-                ),
+                .child(div().flex_1())
+                .when_some(meta, |this, meta| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(dp(12.))
+                            .text_color(faint)
+                            .child(meta),
+                    )
+                }),
         )
 }
 
 fn render_row(
     device: &DeviceSnapshot,
     is_selected: bool,
-    preset: Option<String>,
-    unsaved: Option<usize>,
+    unsaved: usize,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
+    let panel = tokens(cx).panel;
     let theme = cx.theme();
     let info = &device.info;
     let muted = theme.muted_foreground;
     let caps = device.capabilities;
     let icon = if caps.has_hall_effect() || caps.has_keymap() || caps.has_keyboard_config() {
-        IconName::Frame
+        LucideIcon::Keyboard
     } else {
-        IconName::Cpu
+        LucideIcon::Mouse
     };
-    let mut detail = preset.unwrap_or_else(|| {
-        info.firmware_version
-            .clone()
-            .unwrap_or_else(|| "Firmware unknown".to_owned())
-    });
-    if let Some(count) = unsaved {
-        detail = format!("{detail} · {count} unsaved");
-    }
-    let battery = device
-        .capabilities
-        .has_battery()
-        .then_some(device.battery)
-        .flatten();
+    let battery = caps.has_battery().then_some(device.battery).flatten();
     let id = device.id().clone();
 
     Button::new(device_element_id(&id))
@@ -238,57 +194,101 @@ fn render_row(
         .accessibility_label(info.model_name.clone())
         .w_full()
         .h_auto()
-        .py_2()
-        .px_2()
+        .py(dp(8.))
+        .px(dp(10.))
+        .when(is_selected, |this| this.bg(theme.muted))
         .child(
             h_flex()
                 .w_full()
                 .min_w_0()
-                .gap_3()
-                .items_start()
+                .gap(dp(10.))
                 .child(
-                    div()
-                        .pt_0p5()
-                        .child(Icon::new(icon).small().text_color(muted)),
+                    h_flex()
+                        .flex_shrink_0()
+                        .size(dp(32.))
+                        .justify_center()
+                        .rounded(theme.radius)
+                        .bg(panel)
+                        .text_color(if is_selected { theme.primary } else { muted })
+                        .child(Icon::new(icon).size(dp(18.))),
                 )
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w_0()
-                        .gap_1()
+                        .gap(dp(1.))
                         .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .truncate()
-                                .child(info.model_name.clone()),
+                            h_flex()
+                                .min_w_0()
+                                .gap(dp(6.))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(dp(13.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(info.model_name.clone()),
+                                )
+                                .when(unsaved > 0, |this| {
+                                    this.child(unsaved_dot(&id, unsaved, cx))
+                                }),
                         )
                         .child(
                             h_flex()
-                                .gap_2()
-                                .child(Tag::secondary().xsmall().child(info.connection.to_string()))
+                                .gap(dp(5.))
+                                .text_size(dp(12.))
+                                .text_color(muted)
+                                .child(connection_icon(info.connection).size(dp(13.)))
+                                .child(short_connection(info.connection))
                                 .when_some(battery, |this, battery| {
-                                    this.child(battery_tag(battery))
+                                    this.child(battery_note(battery, cx))
                                 }),
-                        )
-                        .child(div().text_xs().text_color(muted).truncate().child(detail)),
+                        ),
                 ),
         )
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.request_select_device(id.clone(), window, cx);
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.select_device(id.clone(), cx);
         }))
 }
 
-fn battery_tag(battery: BatteryStatus) -> Tag {
-    let label = match (battery.percentage, battery.state) {
-        (Some(pct), ChargingState::Charging) => format!("{pct}% charging"),
-        (Some(pct), _) => format!("{pct}%"),
-        (None, state) => state.to_string(),
+fn unsaved_dot(device: &DeviceId, count: usize, cx: &App) -> impl IntoElement + use<> {
+    let note: SharedString = match count {
+        1 => "1 unsaved change".into(),
+        n => format!("{n} unsaved changes").into(),
     };
-    let tag = if battery.percentage.is_some_and(|pct| pct <= 15) {
-        Tag::warning()
+    div()
+        .id(ElementId::Name(format!("device-unsaved-{device}").into()))
+        .flex_shrink_0()
+        .size(dp(7.))
+        .rounded_full()
+        .bg(cx.theme().warning)
+        .tooltip(move |window, cx| Tooltip::new(note.clone()).build(window, cx))
+}
+
+fn short_connection(connection: ConnectionKind) -> &'static str {
+    match connection {
+        ConnectionKind::WiredUsb => "Wired",
+        ConnectionKind::WirelessDongle24Ghz => "2.4 GHz",
+        ConnectionKind::Bluetooth => "Bluetooth",
+    }
+}
+
+fn battery_note(battery: BatteryStatus, cx: &App) -> Div {
+    let theme = cx.theme();
+    let is_low = battery
+        .percentage
+        .is_some_and(|pct| pct < LOW_BATTERY_PERCENT);
+    let color = if is_low {
+        theme.warning
     } else {
-        Tag::secondary()
+        theme.muted_foreground
     };
-    tag.xsmall().child(label)
+    h_flex()
+        .ml(dp(8.))
+        .gap(dp(4.))
+        .text_color(color)
+        .when_some(battery.percentage, |this, pct| {
+            this.child(battery_glyph(pct, color))
+        })
+        .child(battery_label(battery))
 }

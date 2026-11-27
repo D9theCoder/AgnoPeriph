@@ -57,9 +57,92 @@ gpui_kit::assets::icon_assets!(
         Upload,
         SlidersHorizontal,
         Ellipsis,
-        FileText
+        FileText,
+        Plug,
+        Wifi,
+        Bluetooth,
+        Mouse,
+        Gamepad2,
+        LocateFixed,
+        MousePointer2,
+        ArrowDown,
+        ArrowUp,
+        ArrowDownUp
     ]
 );
+
+macro_rules! effect_icons {
+    ($($slug:literal),* $(,)?) => {
+        [$((
+            concat!("icons/effects/", $slug, ".svg"),
+            include_bytes!(concat!("../assets/icons/effects/", $slug, ".svg")).as_slice(),
+        )),*]
+    };
+}
+
+/// Line icons for lighting effects, named after the effect.
+const EFFECT_ICONS: [(&str, &[u8]); 23] = effect_icons!(
+    "christmas",
+    "colorful-swirls",
+    "crucifix",
+    "customization",
+    "digital-rain",
+    "double-vortex",
+    "fingertip-rainbow",
+    "fluttering-ribbons",
+    "focus",
+    "laser",
+    "left-right-rainbow",
+    "monochrome-breath",
+    "off",
+    "pinwheel",
+    "reactive",
+    "single-color",
+    "single-light-up",
+    "spectral-cycle",
+    "spectrum-breathing",
+    "spectrum-float",
+    "up-down-rainbow",
+    "vortex",
+    "wave",
+);
+
+/// The icon for a lighting effect shown as `name`.
+pub fn effect_icon_path(name: &str) -> &'static str {
+    let slug = name.to_lowercase().replace(' ', "-");
+    let slug = match slug.as_str() {
+        "breathing" => "monochrome-breath",
+        "spectrum-cycle" | "cycle-all" => "spectral-cycle",
+        "gradient-up-down" | "cycle-up-down" => "up-down-rainbow",
+        "gradient-left-right" | "cycle-left-right" => "left-right-rainbow",
+        "band-sat" => "fluttering-ribbons",
+        "rainbow-moving-chevron" | "streamer" => "wave",
+        "always-on" => "single-color",
+        other => other,
+    };
+    let find = |slug: &str| {
+        EFFECT_ICONS
+            .iter()
+            .map(|(path, _)| *path)
+            .find(|path| path.strip_suffix(".svg").and_then(|p| p.rsplit('/').next()) == Some(slug))
+    };
+    find(slug)
+        .or_else(|| find("customization"))
+        .unwrap_or_default()
+}
+
+macro_rules! mouse_layers {
+    ($($name:literal),* $(,)?) => {
+        [$((
+            concat!("icons/mouse/", $name, ".svg"),
+            include_bytes!(concat!("../assets/icons/mouse/", $name, ".svg")).as_slice(),
+        )),*]
+    };
+}
+
+/// The layers of the mouse drawing on the Lighting tab.
+const MOUSE_LAYERS: [(&str, &[u8]); 6] =
+    mouse_layers!("body", "rim", "glow", "rim-rainbow", "glow-rainbow", "seam");
 
 /// Asset source combining AgnoPeriph's embedded custom SVGs with GPUI Kit's Lucide icons.
 #[derive(Clone, Copy, Debug, Default)]
@@ -90,7 +173,12 @@ const CUSTOM_ICONS: [(&str, &[u8]); 5] = [
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if let Some((_, bytes)) = CUSTOM_ICONS.iter().find(|(p, _)| *p == path) {
+        if let Some((_, bytes)) = CUSTOM_ICONS
+            .iter()
+            .chain(&EFFECT_ICONS)
+            .chain(&MOUSE_LAYERS)
+            .find(|(p, _)| *p == path)
+        {
             return Ok(Some(Cow::Borrowed(*bytes)));
         }
         if let Some(bytes) = ExtraIcons.load(path)? {
@@ -102,7 +190,11 @@ impl AssetSource for AppAssets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut out = gpui_kit::assets::Assets.list(path)?;
         out.extend(ExtraIcons.list(path)?);
-        for (p, _) in CUSTOM_ICONS {
+        for (p, _) in CUSTOM_ICONS
+            .into_iter()
+            .chain(EFFECT_ICONS)
+            .chain(MOUSE_LAYERS)
+        {
             if p.starts_with(path) {
                 out.push(p.into());
             }

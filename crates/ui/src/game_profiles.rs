@@ -11,8 +11,11 @@ use agnoperiph_core::{
     DeviceId, DksBinding, KeyHallEffectConfig, KeyboardConfigSnapshot, ModTapBinding, ProfileSlot,
     RapidSwitchPair, RgbZoneState, SocdPair, ToggleKeyBinding, TravelHundredthsMm,
 };
+use gpui_kit::component::ThemeMode;
 use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessesToUpdate, System};
+
+use crate::design::Accent;
 
 /// Number of default software profile slots provisioned for devices without multi-slot hardware profiles.
 pub const DEFAULT_SOFTWARE_PROFILE_SLOTS: u8 = 4;
@@ -216,6 +219,10 @@ pub struct AppConfig {
     /// Show a Windows notification when a wireless device's battery runs low.
     #[serde(default = "default_true")]
     pub low_battery_alerts: bool,
+    /// Light or dark appearance.
+    pub theme_mode: ThemeMode,
+    /// Accent colour preset.
+    pub accent: Accent,
 }
 
 fn default_true() -> bool {
@@ -234,6 +241,8 @@ impl Default for AppConfig {
             close_to_tray: true,
             start_with_windows: false,
             low_battery_alerts: true,
+            theme_mode: crate::design::default_mode(),
+            accent: Accent::default(),
         }
     }
 }

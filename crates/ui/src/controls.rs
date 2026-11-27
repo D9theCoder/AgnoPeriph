@@ -3,8 +3,6 @@
 //! The app entity outlives its window when AgnoPeriph runs in the notification area, so
 //! these entities are rebuilt by [`AgnoPeriphApp::attach_window`] for every new window.
 
-use std::collections::BTreeMap;
-
 use agnoperiph_core::TravelHundredthsMm;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::slider::{SliderEvent, SliderState, SliderValue};
@@ -12,23 +10,12 @@ use gpui_kit::*;
 
 use crate::app::AgnoPeriphApp;
 
-/// Stable key identifying a configured RS or SOCD pair's actuation slider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ConfiguredPairKey {
-    pub(crate) is_socd: bool,
-    pub(crate) key_a: u16,
-    pub(crate) key_b: u16,
-}
-
 /// Which value a slider edits; one subscription per slider routes events by role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SliderRole {
     Travel,
-    PairTravel,
     RtPress,
     RtRelease,
-    DeadzoneTop,
-    DeadzoneBottom,
     Brightness,
     Speed,
 }
@@ -97,13 +84,8 @@ pub(crate) fn single(value: SliderValue) -> f32 {
 /// Sliders and inputs that need a window to exist.
 pub(crate) struct Controls {
     pub(crate) travel: Entity<SliderState>,
-    pub(crate) pair_travel: Entity<SliderState>,
-    pub(crate) configured_pair_sliders:
-        BTreeMap<ConfiguredPairKey, (Entity<SliderState>, Subscription)>,
     pub(crate) rt_press: Entity<SliderState>,
     pub(crate) rt_release: Entity<SliderState>,
-    pub(crate) deadzone_top: Entity<SliderState>,
-    pub(crate) deadzone_bottom: Entity<SliderState>,
     pub(crate) brightness: Entity<SliderState>,
     pub(crate) speed: Entity<SliderState>,
     pub(crate) hex: Entity<InputState>,
@@ -145,16 +127,11 @@ impl Controls {
         window: &mut Window,
         cx: &mut Context<AgnoPeriphApp>,
     ) -> (Self, Vec<Subscription>) {
-        let deadzone = SliderRange::new(0u16, 100u16, 1u16);
         let percent = SliderRange::new(0u16, 100u16, 1u16);
         let controls = Self {
             travel: slider(travel_range, travel_range.min, cx),
-            pair_travel: slider(travel_range, 150.0, cx),
-            configured_pair_sliders: BTreeMap::new(),
             rt_press: slider(rt_range, rt_range.min, cx),
             rt_release: slider(rt_range, rt_range.min, cx),
-            deadzone_top: slider(deadzone, 0.0, cx),
-            deadzone_bottom: slider(deadzone, 0.0, cx),
             brightness: slider(percent, 100.0, cx),
             speed: slider(
                 SliderRange::new(0.0_f32, speed_max.max(1.0), 1.0_f32),
@@ -168,7 +145,8 @@ impl Controls {
             manual_exe: cx
                 .new(|cx| InputState::new(window, cx).placeholder("VALORANT-Win64-Shipping.exe")),
             profile_exe: cx.new(|cx| InputState::new(window, cx).placeholder("game.exe")),
-            key_search: cx.new(|cx| InputState::new(window, cx).placeholder("Search keys…")),
+            key_search: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Search keys, media and macros")),
             travel_range,
             rt_range,
             speed_max,
@@ -180,11 +158,8 @@ impl Controls {
     fn subscribe(&self, window: &mut Window, cx: &mut Context<AgnoPeriphApp>) -> Vec<Subscription> {
         let sliders = [
             (&self.travel, SliderRole::Travel),
-            (&self.pair_travel, SliderRole::PairTravel),
             (&self.rt_press, SliderRole::RtPress),
             (&self.rt_release, SliderRole::RtRelease),
-            (&self.deadzone_top, SliderRole::DeadzoneTop),
-            (&self.deadzone_bottom, SliderRole::DeadzoneBottom),
             (&self.brightness, SliderRole::Brightness),
             (&self.speed, SliderRole::Speed),
         ];
@@ -222,50 +197,6 @@ impl Controls {
             ));
         }
         subscriptions
-    }
-
-    pub(crate) fn configured_pair_slider(
-        &self,
-        key: ConfiguredPairKey,
-    ) -> Option<Entity<SliderState>> {
-        self.configured_pair_sliders
-            .get(&key)
-            .map(|(state, _)| state.clone())
-    }
-
-    /// Creates, updates, and prunes per-pair actuation sliders for configured RS / SOCD pairs.
-    pub(crate) fn sync_configured_pair_sliders(
-        &mut self,
-        pairs: &[(ConfiguredPairKey, TravelHundredthsMm)],
-        drafts: &BTreeMap<ConfiguredPairKey, TravelHundredthsMm>,
-        window: &mut Window,
-        cx: &mut Context<AgnoPeriphApp>,
-    ) {
-        self.configured_pair_sliders
-            .retain(|key, _| pairs.iter().any(|(k, _)| k == key));
-        let range = self.travel_range;
-        for &(key, point) in pairs {
-            let value = drafts.get(&key).copied().unwrap_or(point);
-            if let Some((state, _)) = self.configured_pair_sliders.get(&key) {
-                if !drafts.contains_key(&key) {
-                    sync_slider(state, f32::from(value.as_hundredths()), window, cx);
-                }
-            } else {
-                let state = slider(range, f32::from(value.as_hundredths()), cx);
-                let sub = cx.subscribe_in(
-                    &state,
-                    window,
-                    move |this, _, event: &SliderEvent, _, cx| {
-                        let (val, released) = match event {
-                            SliderEvent::Change(v) => (single(*v), false),
-                            SliderEvent::Release(v) => (single(*v), true),
-                        };
-                        this.on_configured_pair_slider(key, val, released, cx);
-                    },
-                );
-                self.configured_pair_sliders.insert(key, (state, sub));
-            }
-        }
     }
 }
 

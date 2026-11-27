@@ -3,7 +3,7 @@
 
 use agnoperiph_core::{DeviceId, ProfileSlot};
 use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
     dialog::{DialogAction, DialogClose, DialogFooter},
     h_flex,
@@ -15,16 +15,20 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, group, muted_note};
+use crate::app::{AgnoPeriphApp, muted_note};
 use crate::backend::DeviceSnapshot;
 use crate::controls::{InputRole, sync_input};
+use crate::design::{DISPLAY_FONT, dp};
 use crate::game_profiles::{
     DEFAULT_SOFTWARE_PROFILE_SLOTS, DetectedGame, GameProfile, normalize_exe_name,
 };
 use crate::keycodes::matches_search;
+use crate::widgets::{page_title, panel, panel_head, segment, segmented, setting_row};
 
 /// Scan results shown at once; the search narrows the rest.
 const MAX_SCAN_RESULTS: usize = 200;
+const GAP: f32 = 16.0;
+const LIST_WIDTH: f32 = 232.0;
 
 /// What the shared rename dialog renames.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +226,44 @@ impl AgnoPeriphApp {
         self.applied_targets.clear();
         self.save_config();
         cx.notify();
+    }
+
+    /// The automatic-switching status line, naming devices that are waiting because they
+    /// have unsaved edits.
+    pub fn auto_switch_status(&self) -> String {
+        if !self.config.auto_switch_enabled {
+            return "Off. Devices keep the presets they have.".to_owned();
+        }
+        let game = self
+            .active_game()
+            .and_then(|id| self.config.game_profile(id));
+        let targets = game.map_or(&self.config.default_targets, |g| &g.device_targets);
+        let waiting: Vec<&str> = self
+            .devices()
+            .iter()
+            .filter(|d| {
+                self.has_unsaved(d.id())
+                    && targets
+                        .get(d.id().as_str())
+                        .is_some_and(|&slot| self.current_slot(d.id()) != Some(slot))
+            })
+            .map(|d| d.info.model_name.as_str())
+            .collect();
+        let detected = game.map_or_else(
+            || "No configured game is running.".to_owned(),
+            |g| format!("Detected {}.", g.name),
+        );
+        match waiting.as_slice() {
+            [] if game.is_some() => format!("{detected} Its presets are active."),
+            [] => format!("{detected} Desktop / Default presets are active."),
+            [one] => {
+                format!("{detected} {one} switches once its changes are applied or discarded.")
+            }
+            many => format!(
+                "{detected} {} switch once their changes are applied or discarded.",
+                many.join(" and ")
+            ),
+        }
     }
 
     /// Sets which preset `device` uses for a game (`None` = the Desktop fallback);
@@ -453,19 +495,12 @@ pub(crate) fn render(
     workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let theme = cx.theme();
     let header = v_flex()
         .gap_1()
+        .child(page_title("Game profiles"))
         .child(
             div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child("Game Profiles"),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.muted_foreground)
+                .text_color(cx.theme().muted_foreground)
                 .child("Switch every connected device to the right preset when a game starts, and back when it closes."),
         );
     let stacked = workspace_width < 760.0;
@@ -476,26 +511,21 @@ pub(crate) fn render(
     let detail = v_flex()
         .flex_1()
         .min_w_0()
-        .gap_5()
+        .gap(dp(GAP))
         .child(editor)
         .child(discovery);
     let body = if stacked {
-        v_flex()
-            .gap_4()
-            .child(list)
-            .child(detail)
-            .into_any_element()
+        v_flex().gap(dp(GAP)).child(list).child(detail)
     } else {
         h_flex()
             .items_start()
-            .gap_5()
+            .gap(dp(GAP))
             .child(list)
             .child(detail)
-            .into_any_element()
     };
     v_flex()
         .id("game-profiles")
-        .gap_5()
+        .gap(dp(14.))
         .child(header)
         .child(status)
         .child(body)
@@ -504,86 +534,42 @@ pub(crate) fn render(
 fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl IntoElement + use<> {
     let enabled = app.config.auto_switch_enabled;
     let notify = app.config.notify_on_game_switch;
-    let playing = app.active_game_name().map(str::to_owned);
-    let theme = cx.theme();
-    let line = match (&playing, enabled) {
-        (_, false) => "Automatic switching is off.".to_owned(),
-        (Some(name), true) => format!("Detected {name}. Its presets are active."),
-        (None, true) => {
-            "No configured game is running. Desktop / Default presets are active.".to_owned()
-        }
-    };
-    let dot = if playing.is_some() && enabled {
-        theme.success
-    } else {
-        theme.muted_foreground
-    };
-    h_flex()
-        .id("auto-switch-status")
-        .flex_wrap()
-        .gap_4()
-        .p_4()
-        .rounded(theme.radius_lg)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.group_box)
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_48()
-                .gap_1()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().size_2().rounded_full().bg(dot))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
-                            match (&playing, enabled) {
-                                (Some(name), true) => name.clone(),
-                                _ => "Desktop / Default".to_owned(),
-                            },
-                        )),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(line),
-                )
-                .when_some(app.auto_switch_note.clone(), |this, note| {
-                    this.child(div().text_xs().text_color(theme.warning).child(note))
-                }),
-        )
-        .child(
-            h_flex()
-                .flex_wrap()
-                .gap_4()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().text_sm().child("Notify on switch"))
-                        .child(
-                            Switch::new("notify-on-switch")
-                                .checked(notify)
-                                .disabled(!enabled)
-                                .tooltip("Show a Windows notification when a game switches presets")
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_notify_on_game_switch(*checked, cx);
-                                })),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().text_sm().child("Switch automatically"))
-                        .child(
-                            Switch::new("auto-switch")
-                                .checked(enabled)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_auto_switch(*checked, cx);
-                                })),
-                        ),
-                ),
-        )
+    let line = app.auto_switch_status();
+    let automatic = Switch::new("auto-switch")
+        .accessibility_label("Switch automatically")
+        .checked(enabled)
+        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+            this.set_auto_switch(*checked, cx);
+        }));
+    let notifications = Switch::new("notify-on-switch")
+        .accessibility_label("Notify on switch")
+        .checked(notify)
+        .disabled(!enabled)
+        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+            this.set_notify_on_game_switch(*checked, cx);
+        }));
+    let note = app.auto_switch_note.clone();
+    let warning = cx.theme().warning;
+
+    panel("auto-switch-status", cx)
+        .child(panel_head("Automatic switching"))
+        .child(setting_row(
+            "Switch automatically",
+            Some(line.into()),
+            automatic,
+            true,
+            cx,
+        ))
+        .child(setting_row(
+            "Notify on switch",
+            Some("Shows a Windows notification when a game switches presets.".into()),
+            notifications,
+            false,
+            cx,
+        ))
+        .when_some(note, |this, note| {
+            this.child(div().text_size(dp(12.5)).text_color(warning).child(note))
+        })
 }
 
 fn render_list(
@@ -593,30 +579,33 @@ fn render_list(
 ) -> impl IntoElement + use<> {
     let selected = app.games_ui.selected.clone();
     let active = app.active_game().map(str::to_owned);
-    let mut items: Vec<AnyElement> = Vec::new();
-    items.push(
+    let muted = cx.theme().muted_foreground;
+    let success = cx.theme().success;
+    let mut items: Vec<AnyElement> = vec![
         Button::new("game-profile-default")
             .ghost()
-            .small()
             .w_full()
             .justify_start()
-            .icon(IconName::LayoutDashboard)
-            .label("Desktop / Default")
+            .accessibility_label("Desktop / Default")
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(Icon::new(IconName::LayoutDashboard).small())
+                    .child("Desktop / Default"),
+            )
             .selected(selected.is_none())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.select_game_profile(None, window, cx);
             }))
             .into_any_element(),
-    );
+    ];
     for profile in &app.config.game_profiles {
         let id = profile.id.clone();
         let is_running = active.as_deref() == Some(id.as_str());
-        let muted = cx.theme().muted_foreground;
-        let success = cx.theme().success;
         items.push(
             Button::new(SharedString::from(format!("game-profile-{id}")))
                 .ghost()
-                .small()
                 .w_full()
                 .justify_start()
                 .selected(selected.as_deref() == Some(id.as_str()))
@@ -638,28 +627,27 @@ fn render_list(
                 .into_any_element(),
         );
     }
-    let theme = cx.theme();
-    v_flex()
-        .id("game-profile-list")
+    let count = app.config.game_profiles.len();
+    let empty = (count == 0).then(|| {
+        div().pt_2().child(muted_note(
+            "No games yet. Scan installed games or add one by its executable.",
+            cx.theme(),
+        ))
+    });
+    panel("game-profile-list", cx)
         .when(full_width, Styled::w_full)
-        .when(!full_width, |this| this.w_56().flex_none())
-        .gap_0p5()
+        .when(!full_width, |this| this.w(dp(LIST_WIDTH)).flex_none())
+        .gap(dp(2.))
         .child(
-            div()
-                .px_2()
-                .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.muted_foreground)
-                .child(format!("Profiles ({})", app.config.game_profiles.len())),
+            panel_head("Profiles").child(div().flex_1()).child(
+                div()
+                    .text_size(dp(12.))
+                    .text_color(muted)
+                    .child(count.to_string()),
+            ),
         )
         .children(items)
-        .when(app.config.game_profiles.is_empty(), |this| {
-            this.child(div().px_2().pt_2().child(muted_note(
-                "No games yet. Scan installed games or add one by its executable.",
-                theme,
-            )))
-        })
+        .children(empty)
 }
 
 fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyElement {
@@ -670,27 +658,20 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
         .cloned();
     let matrix = render_matrix(app, profile.as_ref(), cx);
     let Some(profile) = profile else {
-        let theme = cx.theme();
-        return group("game-editor-default", "Desktop / Default", theme)
-            .child(muted_note(
-                "Presets restored when no configured game is running. Devices set to “Don’t change” keep whatever preset they have.",
-                theme,
-            ))
+        let note = muted_note(
+            "Presets restored when no configured game is running. Devices set to “Don’t change” keep whatever preset they have.",
+            cx.theme(),
+        );
+        return panel("game-editor-default", cx)
+            .gap(dp(10.))
+            .child(panel_head("Desktop / Default").mb_0())
+            .child(note)
             .child(matrix)
             .into_any_element();
     };
     let id = profile.id.clone();
     let exe_input = app.controls.as_ref().map(|c| c.profile_exe.clone());
-    let theme = cx.theme();
-    let title = h_flex()
-        .gap_2()
-        .child(
-            div()
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .truncate()
-                .child(profile.name.clone()),
-        )
+    let head = panel_head("Game")
         .child(div().flex_1())
         .child(
             Button::new("rename-game")
@@ -706,6 +687,7 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
             Button::new("delete-game")
                 .ghost()
                 .small()
+                .text_color(cx.theme().danger)
                 .icon(IconName::Delete)
                 .label("Delete…")
                 .on_click(cx.listener({
@@ -713,36 +695,17 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
                     move |this, _, window, cx| this.request_delete_game(id.clone(), window, cx)
                 })),
         );
-    let enabled_row = h_flex()
-        .gap_4()
-        .child(
-            div()
-                .w_40()
-                .flex_shrink_0()
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                .child("Switch for this game"),
-        )
-        .child(
-            Switch::new("game-enabled")
-                .checked(profile.enabled)
-                .on_click(cx.listener({
-                    let id = id.clone();
-                    move |this, checked: &bool, _, cx| this.set_game_enabled(&id, *checked, cx)
-                })),
-        );
-    let exe_row = h_flex()
-        .gap_4()
-        .child(
-            div()
-                .w_40()
-                .flex_shrink_0()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child("Executable"),
-        )
+    let enabled = Switch::new("game-enabled")
+        .accessibility_label("Switch for this game")
+        .checked(profile.enabled)
+        .on_click(cx.listener({
+            let id = id.clone();
+            move |this, checked: &bool, _, cx| this.set_game_enabled(&id, *checked, cx)
+        }));
+    let executable = h_flex()
+        .gap_2()
         .when_some(exe_input, |this, input| {
-            this.child(div().flex_1().max_w_96().child(Input::new(&input).small()))
+            this.child(div().w(dp(240.)).child(Input::new(&input).small()))
         })
         .child(
             Button::new("save-game-exe")
@@ -751,24 +714,29 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
                 .label("Save")
                 .on_click(cx.listener(|this, _, _, cx| this.commit_game_exe(cx))),
         );
-    let theme = cx.theme();
-    group(
-        SharedString::from(format!("game-editor-{id}")),
-        "Game",
-        theme,
-    )
-    .child(title)
-    .child(enabled_row)
-    .child(exe_row)
-    .when(
-        !profile.exe_path.is_empty() && profile.exe_path != profile.exe_name,
-        |this| this.child(muted_note(profile.exe_path.clone(), theme)),
-    )
-    .when_some(app.games_ui.exe_error.clone(), |this, err| {
-        this.child(div().text_xs().text_color(theme.danger).child(err))
-    })
-    .child(matrix)
-    .into_any_element()
+    let path = (!profile.exe_path.is_empty() && profile.exe_path != profile.exe_name)
+        .then(|| SharedString::from(profile.exe_path.clone()));
+    let error = app.games_ui.exe_error.clone();
+    let danger = cx.theme().danger;
+
+    panel(SharedString::from(format!("game-editor-{id}")), cx)
+        .child(head)
+        .child(
+            div()
+                .pb(dp(10.))
+                .font_family(DISPLAY_FONT)
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(dp(18.))
+                .truncate()
+                .child(profile.name.clone()),
+        )
+        .child(setting_row("Switch for this game", None, enabled, true, cx))
+        .child(setting_row("Executable", path, executable, false, cx))
+        .when_some(error, |this, error| {
+            this.child(div().text_size(dp(12.5)).text_color(danger).child(error))
+        })
+        .child(div().pt(dp(10.)).child(matrix))
+        .into_any_element()
 }
 
 fn render_matrix(
@@ -787,7 +755,6 @@ fn render_matrix(
         let slots = app.preset_slots(device);
         let current = targets.get(id.as_str()).copied();
         let row_id = SharedString::from(format!("target-{id}"));
-        let theme = cx.theme();
         let name = h_flex()
             .flex_1()
             .min_w_0()
@@ -797,104 +764,88 @@ fn render_matrix(
             .gap_y_0p5()
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .truncate()
                     .child(device.info.model_name.clone()),
             )
-            .child(div().text_xs().text_color(theme.muted_foreground).child(
-                if device.profiles.is_some() {
-                    "Onboard profiles"
-                } else if slots.is_empty() {
-                    "No presets"
-                } else {
-                    "AgnoPeriph presets"
-                },
-            ));
+            .child(
+                div()
+                    .text_size(dp(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if device.profiles.is_some() {
+                        "Onboard profiles"
+                    } else if slots.is_empty() {
+                        "No presets"
+                    } else {
+                        "AgnoPeriph presets"
+                    }),
+            );
+        let row = v_flex()
+            .id(row_id)
+            .gap(dp(6.))
+            .py(dp(10.))
+            .border_t_1()
+            .border_color(cx.theme().border);
         if slots.is_empty() {
             rows.push(
-                v_flex()
-                    .id(row_id)
-                    .gap_1()
-                    .child(name)
-                    .child(muted_note("This device has no presets to switch.", theme))
+                row.child(name)
+                    .child(muted_note(
+                        "This device has no presets to switch.",
+                        cx.theme(),
+                    ))
                     .into_any_element(),
             );
             continue;
         }
-        let mut buttons: Vec<AnyElement> = Vec::new();
-        {
+        let choices: Vec<(Option<u8>, SharedString)> =
+            std::iter::once((None, "Don’t change".into()))
+                .chain(
+                    slots
+                        .iter()
+                        .map(|(slot, name)| (Some(*slot), SharedString::from(name.clone()))),
+                )
+                .collect();
+        let mut switch = segmented(cx)
+            .id(SharedString::from(format!("targets-{id}")))
+            .self_start()
+            .flex_wrap();
+        for (slot, label) in choices {
+            let suffix = slot.map_or_else(|| "none".to_owned(), |slot| slot.to_string());
             let game = game.clone();
-            let id = id.clone();
-            let selected = current.is_none();
-            let btn = Button::new(SharedString::from(format!("target-{id}-none")))
-                .small()
-                .label("Don’t change")
-                .selected(selected)
+            let target = id.clone();
+            switch = switch.child(
+                segment(
+                    Button::new(SharedString::from(format!("target-{id}-{suffix}"))),
+                    label,
+                    current == slot,
+                    cx,
+                )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_game_target(game.as_deref(), &id, None, cx);
-                }));
-            buttons.push(
-                if selected {
-                    btn.primary()
-                } else {
-                    btn.outline()
-                }
-                .into_any_element(),
-            );
-        }
-        for (slot, slot_name) in &slots {
-            let slot = *slot;
-            let game = game.clone();
-            let id = id.clone();
-            let selected = current == Some(slot);
-            let btn = Button::new(SharedString::from(format!("target-{id}-{slot}")))
-                .small()
-                .label(slot_name.clone())
-                .selected(selected)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_game_target(game.as_deref(), &id, Some(slot), cx);
-                }));
-            buttons.push(
-                if selected {
-                    btn.primary()
-                } else {
-                    btn.outline()
-                }
-                .into_any_element(),
+                    this.set_game_target(game.as_deref(), &target, slot, cx);
+                })),
             );
         }
         let rename = rename_menu(&id, &slots, cx);
         rows.push(
-            v_flex()
-                .id(row_id)
-                .gap_1p5()
-                .child(h_flex().justify_between().gap_2().child(name).child(rename))
-                .child(
-                    h_flex()
-                        .id(SharedString::from(format!("targets-{id}")))
-                        .flex_wrap()
-                        .gap_1()
-                        .children(buttons),
-                )
+            row.child(h_flex().justify_between().gap_2().child(name).child(rename))
+                .child(switch)
                 .into_any_element(),
         );
     }
-    let theme = cx.theme();
+    let no_devices = rows
+        .is_empty()
+        .then(|| muted_note("No devices connected.", cx.theme()));
     v_flex()
         .id("device-preset-matrix")
-        .gap_3()
-        .pt_1()
         .child(
             div()
-                .text_xs()
+                .pb(dp(8.))
+                .text_size(dp(12.))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.muted_foreground)
+                .text_color(cx.theme().muted_foreground)
                 .child("Device presets"),
         )
-        .when(rows.is_empty(), |this| {
-            this.child(muted_note("No devices connected.", theme))
-        })
+        .children(no_devices)
         .children(rows)
         .into_any_element()
 }
@@ -1013,7 +964,7 @@ fn render_discovery(
                             Input::new(&search)
                                 .small()
                                 .cleanable(true)
-                                .prefix(gpui_kit::component::Icon::new(IconName::Search).xsmall()),
+                                .prefix(Icon::new(IconName::Search).xsmall()),
                         ),
                     )
                 }),
@@ -1076,24 +1027,29 @@ fn render_discovery(
                 .label("Add game")
                 .on_click(cx.listener(|this, _, window, cx| this.add_manual_game(window, cx))),
         );
-    group("game-discovery", "Add a game", theme)
+    let border = theme.border;
+    let muted = theme.muted_foreground;
+    let danger = theme.danger;
+    panel("game-discovery", cx)
+        .child(panel_head("Add a game"))
         .child(picker)
         .child(
             v_flex()
                 .gap_2()
-                .pt_2()
+                .mt(dp(12.))
+                .pt(dp(12.))
                 .border_t_1()
-                .border_color(theme.border)
+                .border_color(border)
                 .child(
                     div()
                         .text_xs()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.muted_foreground)
+                        .text_color(muted)
                         .child("Add by executable"),
                 )
                 .child(form)
                 .when_some(app.games_ui.form_error.clone(), |this, err| {
-                    this.child(div().text_xs().text_color(theme.danger).child(err))
+                    this.child(div().text_xs().text_color(danger).child(err))
                 }),
         )
 }

@@ -3,18 +3,18 @@
 
 use agnoperiph_core::{KeyboardConfigSnapshot, PollingRateHz};
 use gpui_kit::component::{
-    ActiveTheme, Disableable, Selectable, Sizable,
-    button::{Button, ButtonGroup},
-    h_flex,
-    switch::Switch,
-    v_flex,
+    ActiveTheme, Disableable, button::Button, h_flex, switch::Switch, v_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, group, muted_note, section, was_note};
+use crate::app::AgnoPeriphApp;
 use crate::backend::DeviceSnapshot;
+use crate::design::dp;
 use crate::draft::{ChangeId, EditKey};
+use crate::widgets::{device_setting_row, panel, panel_head, segment, segmented};
+
+const GAP: f32 = 16.0;
+const MIN_COLUMN_WIDTH: f32 = 340.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigToggle {
@@ -80,188 +80,256 @@ impl AgnoPeriphApp {
     }
 }
 
+/// What a toggle row shows and whether the keyboard offers it.
+#[derive(Clone, Copy)]
+struct ToggleRow {
+    id: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    kind: ConfigToggle,
+    is_supported: bool,
+}
+
+/// The staged and the stored settings, so rows can mark what isn't applied.
+#[derive(Clone, Copy)]
+struct Config {
+    staged: KeyboardConfigSnapshot,
+    saved: KeyboardConfigSnapshot,
+    busy: bool,
+}
+
+fn toggle_panel(
+    id: &'static str,
+    title: &'static str,
+    rows: Vec<ToggleRow>,
+    config: Config,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> Stateful<Div> {
+    let mut group = panel(id, cx).child(panel_head(title));
+    for (ix, row) in rows.into_iter().enumerate() {
+        group = group.child(toggle_row(row, ix == 0, config, cx));
+    }
+    group
+}
+
+fn toggle_row(
+    row: ToggleRow,
+    is_first: bool,
+    config: Config,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> impl IntoElement + use<> {
+    let ToggleRow {
+        id,
+        title,
+        detail,
+        kind,
+        is_supported,
+    } = row;
+    let description = if is_supported {
+        detail
+    } else {
+        "Not supported by this keyboard."
+    };
+    let switch = Switch::new(id)
+        .checked(kind.get(config.staged))
+        .disabled(config.busy || !is_supported)
+        .accessibility_label(title)
+        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+            let checked = *checked;
+            this.write_keyboard_config(|c| kind.set(c, checked), cx);
+        }));
+    let is_pending = kind.get(config.saved) != kind.get(config.staged);
+    device_setting_row(
+        title,
+        Some(description.into()),
+        switch,
+        is_first,
+        is_pending,
+        cx,
+    )
+}
+
 pub(crate) fn render(
     app: &AgnoPeriphApp,
     device: &DeviceSnapshot,
+    workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
-) -> impl IntoElement + use<> {
-    let base = section(
-        "keyboard-config-panel",
-        "Advanced",
-        "Keyboard-wide behaviour. Changes are sent when you apply them.",
-        cx.theme(),
-    );
+) -> AnyElement {
     let Some(state) = device.keyboard_config.as_ref() else {
-        return base.child(muted_note(
-            "Advanced settings couldn’t be read.",
-            cx.theme(),
-        ));
+        return panel("keyboard-config-panel", cx)
+            .child(panel_head("Advanced"))
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Advanced settings couldn’t be read."),
+            )
+            .into_any_element();
     };
-    let busy = app.is_busy() || app.is_loading();
-    let caps = &state.capabilities;
-    let cfg = state.snapshot;
-    let saved = app
-        .selected_raw()
-        .and_then(|d| d.keyboard_config.as_ref())
-        .map_or(cfg, |kc| kc.snapshot);
+    let caps = state.capabilities.clone();
+    let config = Config {
+        staged: state.snapshot,
+        saved: app
+            .selected_raw()
+            .and_then(|d| d.keyboard_config.as_ref())
+            .map_or(state.snapshot, |kc| kc.snapshot),
+        busy: app.is_busy() || app.is_loading(),
+    };
+    let row = |id, title, detail, kind, is_supported| ToggleRow {
+        id,
+        title,
+        detail,
+        kind,
+        is_supported,
+    };
 
-    let toggle =
-        |id: &'static str,
-         title: &'static str,
-         detail: &'static str,
-         kind: ConfigToggle,
-         supported: bool,
-         cx: &mut Context<AgnoPeriphApp>| {
-            let theme = cx.theme();
-            h_flex()
-                .id(SharedString::from(format!("{id}-row")))
-                .gap_4()
-                .py_1()
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap_0p5()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(
-                            if supported {
-                                detail
-                            } else {
-                                "Not supported by this keyboard."
-                            },
-                        ))
-                        .when(kind.get(saved) != kind.get(cfg), |this| {
-                            this.child(was_note(if kind.get(saved) { "on" } else { "off" }, theme))
-                        }),
-                )
-                .child(
-                    Switch::new(id)
-                        .checked(kind.get(cfg))
-                        .disabled(busy || !supported)
-                        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                            let checked = *checked;
-                            this.write_keyboard_config(|c| kind.set(c, checked), cx);
-                        })),
-                )
-        };
-
-    let layout = group("config-layout", "Key layout", cx.theme())
-        .child(toggle(
-            "config-mac-mode",
-            "Mac mode",
-            "Swap the Windows and Alt keys to match a Mac layout.",
-            ConfigToggle::MacMode,
-            caps.supports_mac_mode,
-            cx,
-        ))
-        .child(toggle(
-            "config-exchange-wasd",
-            "Exchange WASD and arrows",
-            "WASD sends the arrow keys and the arrows send WASD.",
-            ConfigToggle::ExchangeWasd,
-            caps.supports_wasd_swap,
-            cx,
+    let layout = toggle_panel(
+        "config-layout",
+        "Key layout",
+        vec![
+            row(
+                "config-mac-mode",
+                "Mac mode",
+                "Swap the Windows and Alt keys to match a Mac layout.",
+                ConfigToggle::MacMode,
+                caps.supports_mac_mode,
+            ),
+            row(
+                "config-exchange-wasd",
+                "Exchange WASD and arrows",
+                "WASD sends the arrow keys and the arrows send WASD.",
+                ConfigToggle::ExchangeWasd,
+                caps.supports_wasd_swap,
+            ),
+        ],
+        config,
+        cx,
+    );
+    // Function-key rows only appear on keyboards that have them.
+    let mut function_rows = Vec::new();
+    if caps.supports_fn_inversion {
+        function_rows.push(row(
+            "config-fn-inversion",
+            "Fn key inversion",
+            "F1–F12 send media and brightness keys; hold Fn for F1–F12.",
+            ConfigToggle::FnInversion,
+            true,
         ));
-    let function_keys = (caps.supports_fn_inversion || caps.supports_game_mode).then(|| {
-        let mut keys = group("config-function", "Function keys", cx.theme());
-        if caps.supports_fn_inversion {
-            keys = keys.child(toggle(
-                "config-fn-inversion",
-                "Fn key inversion",
-                "F1–F12 send media and brightness keys; hold Fn for F1–F12.",
-                ConfigToggle::FnInversion,
-                true,
-                cx,
-            ));
-        }
-        if caps.supports_game_mode {
-            keys = keys.child(toggle(
-                "config-game-mode",
-                "Game mode",
-                "Block keys the keyboard marks for game mode, such as the Windows key.",
-                ConfigToggle::GameMode,
-                true,
-                cx,
-            ));
-        }
-        keys
+    }
+    if caps.supports_game_mode {
+        function_rows.push(row(
+            "config-game-mode",
+            "Game mode",
+            "Block keys the keyboard marks for game mode, such as the Windows key.",
+            ConfigToggle::GameMode,
+            true,
+        ));
+    }
+    let function_keys = (!function_rows.is_empty()).then(|| {
+        toggle_panel(
+            "config-function",
+            "Function keys",
+            function_rows,
+            config,
+            cx,
+        )
     });
-    let conflict = group("config-conflict", "Key conflict", cx.theme())
-        .child(toggle(
-            "config-win-lock",
-            "Windows key lock",
-            "Disable the Windows keys so they can’t interrupt a game.",
-            ConfigToggle::WinLock,
-            caps.supports_win_lock,
-            cx,
-        ))
-        .child(toggle(
-            "config-six-key",
-            "6-key rollover",
-            "Report at most six keys at once for older BIOS and KVM switches.",
-            ConfigToggle::SixKeyRollover,
-            caps.supports_six_key_rollover,
-            cx,
-        ))
-        .child(toggle(
-            "config-anti-accidental",
-            "Anti-accidental touch",
-            "Ignore very light brushes against the keys.",
-            ConfigToggle::AntiAccidental,
-            caps.supports_anti_accidental_touch,
-            cx,
-        ))
-        .child(toggle(
+    let conflict = toggle_panel(
+        "config-conflict",
+        "Key conflict",
+        vec![
+            row(
+                "config-win-lock",
+                "Windows key lock",
+                "Disable the Windows keys so they can’t interrupt a game.",
+                ConfigToggle::WinLock,
+                caps.supports_win_lock,
+            ),
+            row(
+                "config-six-key",
+                "6-key rollover",
+                "Report at most six keys at once for older BIOS and KVM switches.",
+                ConfigToggle::SixKeyRollover,
+                caps.supports_six_key_rollover,
+            ),
+            row(
+                "config-anti-accidental",
+                "Anti-accidental touch",
+                "Ignore very light brushes against the keys.",
+                ConfigToggle::AntiAccidental,
+                caps.supports_anti_accidental_touch,
+            ),
+        ],
+        config,
+        cx,
+    );
+    let extreme = toggle_row(
+        row(
             "config-extreme",
             "Extreme mode (0.01 mm)",
             "Use 0.01 mm actuation and Rapid Trigger steps instead of 0.02 mm.",
             ConfigToggle::Extreme,
             caps.supports_extreme_mode,
-            cx,
-        ));
+        ),
+        true,
+        config,
+        cx,
+    );
+    let polling = polling_row(caps.supported_polling_rates, config, cx);
+    let precision = panel("config-polling", cx)
+        .child(panel_head("Precision and polling"))
+        .child(extreme)
+        .child(polling);
 
-    let mut rates: Vec<PollingRateHz> = caps.supported_polling_rates.clone();
-    rates.sort_by_key(|r| std::cmp::Reverse(r.as_hz()));
-    let rate_buttons = rates.into_iter().map(|rate| {
+    let first = v_flex().gap(dp(GAP)).child(layout).children(function_keys);
+    let second = v_flex().gap(dp(GAP)).child(conflict).child(precision);
+    let columns = if workspace_width >= MIN_COLUMN_WIDTH * 2.0 + GAP {
+        h_flex()
+            .items_start()
+            .gap(dp(GAP))
+            .child(first.flex_1().min_w_0())
+            .child(second.flex_1().min_w_0())
+    } else {
+        v_flex().gap(dp(GAP)).child(first).child(second)
+    };
+    div()
+        .id("keyboard-config-panel")
+        .child(columns)
+        .into_any_element()
+}
+
+fn polling_row(
+    mut rates: Vec<PollingRateHz>,
+    config: Config,
+    cx: &mut Context<AgnoPeriphApp>,
+) -> impl IntoElement + use<> {
+    rates.sort_by_key(|r| r.as_hz());
+    let mut choices = segmented(cx).id("config-polling-rate");
+    for rate in rates {
         let label = if rate.as_hz() >= 1000 {
             format!("{}K", rate.as_hz() / 1000)
         } else {
             rate.as_hz().to_string()
         };
-        Button::new(("config-rate", u64::from(rate.as_hz())))
-            .label(label)
-            .selected(cfg.polling_rate == rate)
-            .disabled(busy)
+        choices = choices.child(
+            segment(
+                Button::new(("config-rate", u64::from(rate.as_hz()))),
+                label,
+                config.staged.polling_rate == rate,
+                cx,
+            )
+            .px(dp(9.))
+            .disabled(config.busy)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.write_keyboard_config(|c| c.polling_rate = rate, cx);
-            }))
-    });
-    let theme = cx.theme();
-    let rate = group("config-polling", "Polling rate", theme)
-        .child(
-            h_flex().child(
-                ButtonGroup::new("config-polling-rate")
-                    .outline()
-                    .small()
-                    .children(rate_buttons),
-            ),
-        )
-        .child(muted_note(
-            if saved.polling_rate == cfg.polling_rate {
-                format!(
-                    "Currently {}. Higher rates lower input latency but use more CPU.",
-                    cfg.polling_rate
-                )
-            } else {
-                format!(
-                    "Was {}. Higher rates lower input latency but use more CPU.",
-                    saved.polling_rate
-                )
-            },
-            theme,
-        ));
-
-    base.child(layout)
-        .children(function_keys)
-        .child(conflict)
-        .child(rate)
+            })),
+        );
+    }
+    device_setting_row(
+        "Polling rate",
+        Some("Reports per second, in Hz.".into()),
+        choices,
+        false,
+        config.saved.polling_rate != config.staged.polling_rate,
+        cx,
+    )
 }

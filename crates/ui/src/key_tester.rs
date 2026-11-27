@@ -15,13 +15,15 @@ use agnoperiph_core::{
     CoreError, DeviceId, KeyIndex, KeyTravelSample, RapidTriggerConfig, SocdMode,
     TravelHundredthsMm,
 };
-use gpui_kit::component::{ActiveTheme, Sizable, Theme, h_flex, tag::Tag, v_flex};
+use gpui_kit::component::{ActiveTheme, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app::{AgnoPeriphApp, KeyboardTab, Route, mm, muted_note};
+use crate::app::{AgnoPeriphApp, KeyboardTab, Route, mm};
 use crate::backend::{HallEffectState, PeripheralService};
+use crate::design::{DISPLAY_FONT, KEY_FONT, dp, glow, tabular, tokens};
 use crate::keymap::KeyLayout;
+use crate::widgets::{keycap, panel, panel_title};
 
 /// Target live travel read cadence while the tester is showing (~166 Hz to feed 165 Hz+ displays).
 pub const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(6);
@@ -375,7 +377,7 @@ impl Render for KeyTesterView {
             app.tester.live_key,
             app.tester.live_error.as_ref(),
             &layout,
-            cx.theme(),
+            cx,
         )
     }
 }
@@ -732,7 +734,11 @@ pub(crate) fn render(app: &AgnoPeriphApp, he: &HallEffectState) -> AnyElement {
     app.tester_view.clone().into_any_element()
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Height of the travel gauge's track, in pixels at the default text size.
+const GAUGE_TRACK: f32 = 136.0;
+const GAUGE_TOP: f32 = 8.0;
+
+#[allow(clippy::too_many_arguments)]
 fn render_column(
     key: KeyIndex,
     depth: u16,
@@ -744,104 +750,245 @@ fn render_column(
     live_key: Option<KeyIndex>,
     live_error: Option<&SharedString>,
     layout: &KeyLayout,
-    theme: &Theme,
+    cx: &App,
 ) -> AnyElement {
-    let max = f32::from(params.max_travel);
-    let frac = |v: u16| (f32::from(v) / max).clamp(0.0, 1.0);
+    let theme = cx.theme();
+    let mut summary = format!("Actuates at {} mm.", hundredths(params.actuation));
+    if params.rapid_trigger.is_enabled() {
+        summary.push_str(" Rapid Trigger is on.");
+    }
+    if let Some((pair, partner)) = pair.and_then(|p| Some((p, p.partner_of(key)?))) {
+        summary = format!("{} with {}. {summary}", pair.badge(), layout.label(partner));
+    }
+    let (note, note_color): (SharedString, Hsla) = match live_error {
+        Some(error) => (error.clone(), theme.danger),
+        None => (summary.into(), theme.muted_foreground),
+    };
+
+    panel("key-tester", cx)
+        .flex_1()
+        .test_support()
+        .child(
+            h_flex()
+                .gap_2()
+                .min_h(dp(26.))
+                .mb(dp(10.))
+                .child(panel_title("Key tester"))
+                .child(div().flex_1())
+                .when(live_key.is_none(), |this| {
+                    this.child(
+                        div()
+                            .text_size(dp(12.))
+                            .text_color(theme.muted_foreground)
+                            .child("Press any key"),
+                    )
+                }),
+        )
+        .child(
+            h_flex()
+                .items_start()
+                .gap(dp(14.))
+                .child(gauge(depth, pressed, params, cx))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_start()
+                        .gap(dp(6.))
+                        .child(keycap(layout.label(key), 44., 18., cx))
+                        .child(depth_readout(depth, cx))
+                        .child(div().id("tester-state").child(state_pill(pressed, cx)))
+                        .child(
+                            div()
+                                .id("tester-note")
+                                .text_size(dp(12.))
+                                .text_color(note_color)
+                                .child(note),
+                        ),
+                ),
+        )
+        .child(div().flex_1())
+        .child(trace(params, app, now, cx))
+        .into_any_element()
+}
+
+/// The key's travel from top to bottom, with its dead zones and actuation point.
+fn gauge(depth: u16, pressed: bool, params: TriggerParams, cx: &App) -> Div {
+    let theme = cx.theme();
+    let colors = tokens(cx);
+    let max = f32::from(params.max_travel.max(1));
+    let y = |value: u16| (f32::from(value) / max).clamp(0.0, 1.0) * GAUGE_TRACK;
+    let ticks = (0..=params.max_travel / 10).map(|tenth| {
+        let is_major = tenth % 5 == 0;
+        div()
+            .absolute()
+            .top(dp(GAUGE_TOP + y(tenth * 10)))
+            .left(dp(if is_major { 22. } else { 27. }))
+            .w(dp(if is_major { 10. } else { 5. }))
+            .h(px(1.))
+            .bg(colors.tick)
+    });
+    let labels = (0..=params.max_travel / 50).map(|half| {
+        let value = half * 50;
+        div()
+            .absolute()
+            .top(dp(GAUGE_TOP + y(value) - 6.))
+            .left_0()
+            .w(dp(18.))
+            .text_right()
+            .font_family(KEY_FONT)
+            .text_size(dp(9.5))
+            .line_height(dp(12.))
+            .text_color(colors.faint)
+            .child(format!("{}.{}", value / 100, value % 100 / 10))
+    });
+    let dead_zone = |height: f32| {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .h(dp(height))
+            .bg(pattern_slash(colors.tick, 1.4, 4.0))
+    };
     let rt = params.rapid_trigger;
     let band = rt.is_enabled().then(|| {
-        let start = params
+        let start = y(params
             .actuation
-            .saturating_sub(rt.release_sensitivity.as_hundredths());
-        let end = params.actuation + rt.press_sensitivity.as_hundredths();
-        (frac(start), frac(end))
+            .saturating_sub(rt.release_sensitivity.as_hundredths()));
+        let end = y(params.actuation + rt.press_sensitivity.as_hundredths());
+        (start, (end - start).max(1.0))
     });
-
-    let bar = div()
+    let track = div()
         .id("tester-meter")
-        .relative()
-        .w_6()
-        .h_full()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.muted)
+        .absolute()
+        .top(dp(GAUGE_TOP))
+        .left(dp(38.))
+        .w(dp(22.))
+        .h(dp(GAUGE_TRACK))
+        .rounded(dp(5.))
         .overflow_hidden()
+        .bg(colors.raised)
+        .child(dead_zone(y(params.top_deadzone)).top_0())
+        .child(dead_zone(y(params.bottom_deadzone)).bottom_0())
         .child(
             div()
                 .absolute()
                 .top_0()
                 .left_0()
                 .right_0()
-                .h(relative(frac(params.top_deadzone)))
-                .bg(theme.border),
+                .h(dp(y(depth)))
+                .bg(theme.primary.opacity(if pressed { 0.45 } else { 0.28 })),
         )
-        .child(
-            div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .h(relative(frac(params.bottom_deadzone)))
-                .bg(theme.border),
-        )
-        .when_some(band, |this, (start, end)| {
+        .when(depth > 0, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .top(dp((y(depth) - 1.5).max(0.0)))
+                    .left_0()
+                    .right_0()
+                    .h(dp(1.5))
+                    .bg(theme.foreground),
+            )
+        })
+        // Where Rapid Trigger releases and presses again around the actuation point.
+        .when_some(band, |this, (start, height)| {
             this.child(
                 div()
                     .absolute()
                     .left_0()
-                    .right_0()
-                    .top(relative(start))
-                    .h(relative((end - start).max(0.01)))
-                    .bg(theme.warning.opacity(0.3)),
+                    .top(dp(start))
+                    .w(dp(3.))
+                    .h(dp(height))
+                    .bg(theme.primary),
             )
-        })
+        });
+    let line = GAUGE_TOP + y(params.actuation);
+    div()
+        .relative()
+        .flex_shrink_0()
+        .w(dp(96.))
+        .h(dp(GAUGE_TRACK + 2.0 * GAUGE_TOP))
+        .children(ticks)
+        .children(labels)
+        .child(track)
         .child(
             div()
                 .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(relative(frac(depth)))
-                .bg(theme.primary.opacity(if pressed { 0.7 } else { 0.35 })),
+                .top(dp(line - 1.1))
+                .left(dp(31.))
+                .w(dp(36.))
+                .h(dp(2.2))
+                .rounded_full()
+                .bg(theme.primary)
+                .shadow(vec![glow(theme.primary, 6.)]),
         )
         .child(
             div()
                 .absolute()
-                .left_0()
-                .right_0()
-                .top(relative(frac(params.actuation)))
-                .h_0p5()
-                .bg(theme.foreground),
-        );
+                .top(dp(line - 7.))
+                .left(dp(70.))
+                .font_family(KEY_FONT)
+                .font_weight(FontWeight::BOLD)
+                .text_size(dp(10.5))
+                .line_height(dp(14.))
+                .text_color(theme.primary)
+                .child(hundredths(params.actuation)),
+        )
+}
 
-    let readout = v_flex()
-        .flex_1()
-        .min_w_0()
-        .gap_1()
-        .child(
-            div()
-                .text_lg()
-                .font_weight(FontWeight::SEMIBOLD)
-                .truncate()
-                .child(layout.label(key)),
-        )
+fn depth_readout(depth: u16, cx: &App) -> Div {
+    h_flex()
+        .items_baseline()
+        .gap(dp(4.))
         .child(
             div()
                 .id("tester-depth")
-                .text_sm()
-                .font_family(theme.mono_font_family.clone())
-                .child(format!("{} mm", hundredths(depth))),
+                .font_family(DISPLAY_FONT)
+                .font_weight(FontWeight::SEMIBOLD)
+                .font_features(tabular())
+                .text_size(dp(34.))
+                .line_height(relative(1.))
+                .child(hundredths(depth)),
         )
-        .child(div().id("tester-state").child(if pressed {
-            Tag::primary().xsmall().child("Pressed")
-        } else {
-            Tag::secondary().xsmall().child("Released")
-        }));
+        .child(
+            div()
+                .font_family(DISPLAY_FONT)
+                .text_size(dp(14.))
+                .text_color(cx.theme().muted_foreground)
+                .child("mm"),
+        )
+}
 
+fn state_pill(pressed: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (fill, text) = if pressed {
+        (tokens(cx).accent_soft, theme.primary)
+    } else {
+        (tokens(cx).raised, theme.muted_foreground)
+    };
+    h_flex()
+        .h(dp(22.))
+        .px(dp(9.))
+        .rounded_full()
+        .bg(fill)
+        .text_size(dp(12.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(text)
+        .child(if pressed { "Pressed" } else { "Released" })
+}
+
+/// The recent travel of the key as a scrolling waveform.
+fn trace(
+    params: TriggerParams,
+    app: WeakEntity<AgnoPeriphApp>,
+    now: Instant,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
     let trace_color = theme.primary.opacity(0.5);
     let max_travel = params.max_travel;
-    let trace_canvas = canvas(
+    let actuation = f32::from(params.actuation) / f32::from(max_travel.max(1));
+    let waveform = canvas(
         |_, _, _| (),
         move |bounds, (), window, cx| {
             if let Some(app) = app.upgrade() {
@@ -857,81 +1004,26 @@ fn render_column(
         },
     )
     .size_full();
-
-    let trace_view = div()
+    div()
         .id("tester-trace")
         .relative()
+        .flex_shrink_0()
         .w_full()
-        .h_6()
+        .mt(dp(8.))
+        .h(dp(24.))
         .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
         .overflow_hidden()
-        .child(trace_canvas)
+        .bg(tokens(cx).raised)
+        .child(waveform)
         .child(
             div()
                 .absolute()
                 .left_0()
                 .right_0()
-                .top(relative(frac(params.actuation)))
+                .top(relative(actuation.clamp(0.0, 1.0)))
                 .h_px()
                 .bg(theme.muted_foreground),
-        );
-
-    let mut legend = if rt.is_enabled() {
-        format!(
-            "Actuates at {} mm · RT {}/{}",
-            hundredths(params.actuation),
-            mm(rt.press_sensitivity),
-            mm(rt.release_sensitivity)
         )
-    } else {
-        format!("Actuates at {} mm · RT off", hundredths(params.actuation))
-    };
-    if let Some((pair, partner)) = pair.and_then(|p| Some((p, p.partner_of(key)?))) {
-        legend = format!("{} with {} · {legend}", pair.badge(), layout.label(partner));
-    }
-    // One note line: a reconnect/error state wins, then the live prompt, then the trigger summary.
-    let note: SharedString = match (live_error, live_key) {
-        (Some(err), _) => err.clone(),
-        (None, None) => "Press any key on the keyboard.".into(),
-        (None, Some(_)) => legend.into(),
-    };
-
-    v_flex()
-        .id("key-tester")
-        .w_40()
-        .flex_shrink_0()
-        .gap_2()
-        .test_support()
-        .child(
-            h_flex().min_h_6().justify_between().gap_2().child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Key tester"),
-            ),
-        )
-        .child(
-            h_flex()
-                .h_24()
-                .items_stretch()
-                .gap_2()
-                .child(
-                    v_flex()
-                        .justify_between()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child("0.00")
-                        .child(hundredths(params.max_travel)),
-                )
-                .child(bar)
-                .child(readout),
-        )
-        .child(trace_view)
-        .child(muted_note(note, theme).id("tester-note"))
-        .into_any_element()
 }
 
 /// Paints the continuous time-mapped travel waveform as a single GPU filled path.

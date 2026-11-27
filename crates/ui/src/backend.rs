@@ -19,7 +19,7 @@ use agnoperiph_core::{
     RgbCapabilities, RgbEffect, RgbSnapshot, RgbZoneId, SocdPair, ToggleKeyBinding,
     TravelHundredthsMm,
 };
-use agnoperiph_driver_atk::AtkDevice;
+use agnoperiph_driver_atk::{AtkDevice, protocol as atk_protocol};
 use agnoperiph_driver_endgame_gear::EndgameGearDevice;
 use agnoperiph_driver_finalmouse::FinalmouseDevice;
 use agnoperiph_driver_lamzu::LamzuAtlantisDevice;
@@ -98,6 +98,18 @@ pub struct KeymapState {
 pub struct MacroState {
     pub capabilities: MacroCapabilities,
     pub slots: Vec<MacroSlot>,
+}
+
+/// Bytes `slots` take in the device's shared macro memory, where the driver's encoding is
+/// known.
+pub fn macro_bytes_used(info: &DeviceInfo, slots: &[MacroSlot]) -> Option<usize> {
+    (info.vid == atk_protocol::ATK_VID && info.pid == atk_protocol::ATK_RS7_PID)
+        .then(|| atk_protocol::encode_macros(slots).len())
+}
+
+/// Whether the device's firmware understands ATK's vendor keycodes.
+pub fn offers_atk_keycodes(info: &DeviceInfo) -> bool {
+    info.vid == atk_protocol::ATK_VID
 }
 
 /// Advanced keyboard system configuration capability limits and active toggles.
