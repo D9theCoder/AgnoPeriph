@@ -27,6 +27,8 @@ use crate::app::AgnoPeriphApp;
 pub const CURRENT_VERSION: &str = env!("AGNO_APP_VERSION");
 /// GitHub endpoint that returns the newest published release.
 pub const RELEASES_API: &str = "https://api.github.com/repos/D9theCoder/AgnoPeriph/releases/latest";
+/// Repository releases base URL, used for web fallback when the REST API is rate-limited.
+pub const RELEASES_BASE: &str = "https://github.com/D9theCoder/AgnoPeriph/releases";
 /// Human-facing release list, used when a release carries no usable link.
 pub const RELEASES_PAGE: &str = "https://github.com/D9theCoder/AgnoPeriph/releases/latest";
 /// Default filename for the published Windows installer asset.
@@ -103,14 +105,21 @@ pub trait ReleaseSource: Send + Sync {
 }
 
 /// GitHub's latest-release API, read with the `curl.exe` that ships with Windows.
+///
+/// Falls back to GitHub's web `/releases/latest` JSON endpoint when the unauthenticated
+/// REST API hits its 60 req/hr per-IP rate limit (common on VPN/WARP/CGNAT exits).
 #[derive(Debug, Clone)]
 pub struct GithubReleases {
     endpoint: String,
+    web_base: Option<String>,
 }
 
 impl Default for GithubReleases {
     fn default() -> Self {
-        Self::new(RELEASES_API)
+        Self {
+            endpoint: RELEASES_API.to_owned(),
+            web_base: Some(RELEASES_BASE.to_owned()),
+        }
     }
 }
 
@@ -118,14 +127,39 @@ impl GithubReleases {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            web_base: None,
         }
     }
 }
 
 impl ReleaseSource for GithubReleases {
     fn latest(&self) -> Result<Option<UpdateInfo>, String> {
-        let body = fetch(&self.endpoint)?;
-        latest_release(&body, CURRENT_VERSION)
+        let api_result = fetch(&self.endpoint, "application/vnd.github+json")
+            .and_then(|body| latest_release(&body, CURRENT_VERSION));
+        match api_result {
+            Ok(info) => Ok(info),
+            Err(api_err) => {
+                let Some(web_base) = self.web_base.as_deref() else {
+                    return Err(api_err);
+                };
+                let web_url = format!("{web_base}/latest");
+                let Ok(web_body) = fetch(&web_url, "application/json") else {
+                    return Err(api_err);
+                };
+                match latest_release_from_web_json(&web_body, CURRENT_VERSION, web_base) {
+                    Ok(Some(info)) => {
+                        if let Some(installer_url) = info.installer_url()
+                            && !url_exists(installer_url)
+                        {
+                            return Ok(Some(UpdateInfo::new(info.version(), info.url())));
+                        }
+                        Ok(Some(info))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(_) => Err(api_err),
+                }
+            }
+        }
     }
 
     fn download_installer(&self, url: &str, destination: &Path) -> Result<(), String> {
@@ -134,7 +168,7 @@ impl ReleaseSource for GithubReleases {
 }
 
 #[cfg(windows)]
-fn fetch(endpoint: &str) -> Result<String, String> {
+fn fetch(endpoint: &str, accept: &str) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -146,7 +180,7 @@ fn fetch(endpoint: &str) -> Result<String, String> {
             "-A",
             concat!("AgnoPeriph/", env!("CARGO_PKG_VERSION")),
             "-H",
-            "Accept: application/vnd.github+json",
+            &format!("Accept: {accept}"),
             endpoint,
         ])
         .stdin(Stdio::null())
@@ -162,8 +196,38 @@ fn fetch(endpoint: &str) -> Result<String, String> {
 }
 
 #[cfg(not(windows))]
-fn fetch(_endpoint: &str) -> Result<String, String> {
+fn fetch(_endpoint: &str, _accept: &str) -> Result<String, String> {
     Err("update checks run on Windows only".to_owned())
+}
+
+#[cfg(windows)]
+fn url_exists(url: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    if !is_valid_https_url(url) {
+        return false;
+    }
+    Command::new("curl")
+        .args([
+            "-fsSLI",
+            "--max-time",
+            "8",
+            "-A",
+            concat!("AgnoPeriph/", env!("CARGO_PKG_VERSION")),
+            url,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(windows))]
+fn url_exists(_url: &str) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -324,13 +388,20 @@ fn find_installer_asset(value: &Value) -> Option<(String, String)> {
 
 /// Reads a GitHub release reply and returns it when it is newer than `current`.
 ///
-/// A reply without `tag_name` (the 404 body when the repository has no releases yet)
-/// means there is nothing to offer, not an error.
+/// A `"Not Found"` reply (the 404 body when the repository has no releases yet) means there
+/// is nothing to offer; other API error messages (such as HTTP 403 rate limits) are surfaced
+/// as errors rather than falsely reporting "up to date".
 pub fn latest_release(json: &str, current: &str) -> Result<Option<UpdateInfo>, String> {
     let value: Value =
         serde_json::from_str(json).map_err(|err| format!("read the release reply: {err}"))?;
     let Some(tag) = value.get("tag_name").and_then(Value::as_str) else {
-        return Ok(None);
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            if message.eq_ignore_ascii_case("Not Found") {
+                return Ok(None);
+            }
+            return Err(message.to_owned());
+        }
+        return Err("unexpected release reply".to_owned());
     };
     let flagged = |field: &str| value.get(field).and_then(Value::as_bool) == Some(true);
     if flagged("draft") || flagged("prerelease") || !is_newer(tag, current) {
@@ -344,6 +415,49 @@ pub fn latest_release(json: &str, current: &str) -> Result<Option<UpdateInfo>, S
     let mut info = UpdateInfo::new(tag.trim().trim_start_matches(['v', 'V']), url);
     if let Some((name, download_url)) = find_installer_asset(&value) {
         info = info.with_installer(name, download_url);
+    }
+    Ok(Some(info))
+}
+
+fn is_safe_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && !tag.contains("..")
+        && !tag
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '\\' | '?' | '#'))
+}
+
+/// Parses GitHub's web `/releases/latest` JSON reply (`Accept: application/json`), which is
+/// not subject to the 60 req/hr unauthenticated REST API rate limit.
+pub fn latest_release_from_web_json(
+    json: &str,
+    current: &str,
+    releases_base: &str,
+) -> Result<Option<UpdateInfo>, String> {
+    let value: Value =
+        serde_json::from_str(json).map_err(|err| format!("read the release reply: {err}"))?;
+    let Some(raw_tag) = value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tag| is_safe_release_tag(tag))
+    else {
+        return Err("missing release tag".to_owned());
+    };
+    if !is_newer(raw_tag, current) {
+        return Ok(None);
+    }
+    let base = releases_base.trim_end_matches('/');
+    let page_url = format!("{base}/tag/{raw_tag}");
+    let url = if is_valid_https_url(&page_url) {
+        page_url
+    } else {
+        RELEASES_PAGE.to_owned()
+    };
+    let mut info = UpdateInfo::new(raw_tag.trim_start_matches(['v', 'V']), url);
+    let installer_url = format!("{base}/download/{raw_tag}/{DEFAULT_INSTALLER_NAME}");
+    if is_valid_https_url(&installer_url) {
+        info = info.with_installer(DEFAULT_INSTALLER_NAME, installer_url);
     }
     Ok(Some(info))
 }
@@ -608,7 +722,8 @@ pub(crate) fn render_notice(
 #[cfg(test)]
 mod tests {
     use super::{
-        RELEASES_PAGE, installer_download_path, is_newer, latest_release, verify_pe_executable,
+        RELEASES_BASE, RELEASES_PAGE, installer_download_path, is_newer, latest_release,
+        latest_release_from_web_json, verify_pe_executable,
     };
 
     #[test]
@@ -716,6 +831,40 @@ mod tests {
     fn a_repository_without_releases_reports_nothing() {
         let json = r#"{"message": "Not Found"}"#;
         assert_eq!(latest_release(json, "0.1.0").unwrap(), None);
+    }
+
+    #[test]
+    fn api_rate_limit_reply_is_an_error_not_up_to_date() {
+        let json = r#"{
+            "message": "API rate limit exceeded for 104.28.213.128.",
+            "documentation_url": "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting"
+        }"#;
+        let err = latest_release(json, "0.1.0.8").unwrap_err();
+        assert!(err.contains("rate limit"));
+    }
+
+    #[test]
+    fn web_release_fallback_resolves_tag_and_installer_url() {
+        let json = r#"{"id":460312233,"tag_name":"v0.1.0-9","update_url":"/D9theCoder/AgnoPeriph/releases/tag/v0.1.0-9"}"#;
+        let release = latest_release_from_web_json(json, "0.1.0.8", RELEASES_BASE)
+            .unwrap()
+            .expect("v0.1.0-9 must be offered over 0.1.0.8");
+        assert_eq!(release.version(), "0.1.0-9");
+        assert_eq!(
+            release.url(),
+            "https://github.com/D9theCoder/AgnoPeriph/releases/tag/v0.1.0-9"
+        );
+        assert_eq!(release.installer_name(), Some("AgnoPeriph-Setup-x64.exe"));
+        assert_eq!(
+            release.installer_url(),
+            Some(
+                "https://github.com/D9theCoder/AgnoPeriph/releases/download/v0.1.0-9/AgnoPeriph-Setup-x64.exe"
+            )
+        );
+        assert_eq!(
+            latest_release_from_web_json(json, "0.1.0.9", RELEASES_BASE).unwrap(),
+            None
+        );
     }
 
     #[test]
