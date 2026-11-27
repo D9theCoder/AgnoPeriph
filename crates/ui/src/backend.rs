@@ -313,6 +313,17 @@ pub trait PeripheralService: Send + Sync {
         Err(CoreError::UnsupportedCapability("live_key_travel"))
     }
 
+    /// Reads live analog travel with an optional focus key hint for high-rate key tester
+    /// polling. Defaults to [`Self::read_live_key_travel`].
+    fn read_live_key_travel_focused(
+        &self,
+        device: &DeviceId,
+        focus_key: Option<KeyIndex>,
+    ) -> CoreResult<Vec<KeyTravelSample>> {
+        let _ = focus_key;
+        self.read_live_key_travel(device)
+    }
+
     /// Lightweight read-only sync for settings users can change directly on hardware
     /// (RGB lighting, keyboard toggles like Win Lock / Mac mode, and active onboard profile).
     ///
@@ -1285,7 +1296,8 @@ fn open_driver(
 }
 
 struct LiveDevice {
-    peripheral: Box<dyn Peripheral>,
+    /// Active HID handle, or `None` after a transient disconnect while awaiting auto-reopen.
+    peripheral: Option<Box<dyn Peripheral>>,
     snapshot: DeviceSnapshot,
 }
 
@@ -1348,6 +1360,35 @@ impl LiveHidService {
         }
     }
 
+    /// Immediately enumerates and opens a fresh driver handle for `device_id` without sleeping.
+    fn open_matching_peripheral(
+        &self,
+        device_id: &DeviceId,
+        dry_run: bool,
+    ) -> Option<Box<dyn Peripheral>> {
+        let registry = build_registry();
+        let sink: Arc<dyn PacketSink> = self.sink.clone();
+        let Ok(descriptors) = self.enumerator.enumerate() else {
+            return None;
+        };
+        for descriptor in &descriptors {
+            let Some(matched) = registry.match_interface(&descriptor.to_match_descriptor()) else {
+                continue;
+            };
+            let Ok(transport) = self.enumerator.open_path(descriptor) else {
+                continue;
+            };
+            let Ok(peripheral) = open_driver(&matched.driver_id, transport, dry_run, sink.clone())
+            else {
+                continue;
+            };
+            if peripheral.info().id == *device_id {
+                return Some(peripheral);
+            }
+        }
+        None
+    }
+
     /// Re-enumerates and reopens `device_id` after a brief USB reset (such as changing
     /// polling rate on an ATK RS7 keyboard) or a stale/suspended HID handle. Retries with
     /// short backoff so the OS HID interface has time to come back online.
@@ -1357,55 +1398,105 @@ impl LiveHidService {
         dry_run: bool,
         wait_for_usb_reset: bool,
     ) -> Option<LiveDevice> {
-        let registry = build_registry();
-        let sink: Arc<dyn PacketSink> = self.sink.clone();
         let delays: &[u64] = if wait_for_usb_reset {
             &[350, 450, 550, 650, 750, 850]
         } else {
-            &[50, 300, 500, 750]
+            &[0, 150, 350, 600]
         };
         for &delay_ms in delays {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            let Ok(descriptors) = self.enumerator.enumerate() else {
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            let Some(mut peripheral) = self.open_matching_peripheral(device_id, dry_run) else {
                 continue;
             };
-            for descriptor in &descriptors {
-                let Some(matched) = registry.match_interface(&descriptor.to_match_descriptor())
-                else {
-                    continue;
-                };
-                let Ok(transport) = self.enumerator.open_path(descriptor) else {
-                    continue;
-                };
-                let Ok(mut peripheral) =
-                    open_driver(&matched.driver_id, transport, dry_run, sink.clone())
-                else {
-                    continue;
-                };
-                if peripheral.info().id == *device_id {
-                    let snapshot = collect_snapshot(peripheral.as_mut());
-                    if !has_disconnect_warning(&snapshot) {
-                        return Some(LiveDevice {
-                            peripheral,
-                            snapshot,
-                        });
-                    }
-                }
+            let snapshot = collect_snapshot(peripheral.as_mut());
+            if !has_disconnect_warning(&snapshot) {
+                return Some(LiveDevice {
+                    peripheral: Some(peripheral),
+                    snapshot,
+                });
             }
         }
         None
     }
+
+    fn read_live_key_travel_inner(
+        &self,
+        device: &DeviceId,
+        focus_key: Option<KeyIndex>,
+        focused: bool,
+    ) -> CoreResult<Vec<KeyTravelSample>> {
+        let mut state = lock(&self.state);
+        let dry_run = state.dry_run;
+        let target_ix = state
+            .devices
+            .iter()
+            .position(|d| d.snapshot.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+
+        if state.devices[target_ix].peripheral.is_none() {
+            let Some(fresh) = self.open_matching_peripheral(device, dry_run) else {
+                return Err(CoreError::NotConnected(device.to_string()));
+            };
+            state.devices[target_ix].peripheral = Some(fresh);
+        }
+
+        let read_once = |peripheral: &mut dyn Peripheral| -> CoreResult<Vec<KeyTravelSample>> {
+            let he = require(peripheral.as_hall_effect_mut(), "hall_effect")?;
+            if focused {
+                he.read_live_key_travel_focused(focus_key)
+            } else {
+                he.read_live_key_travel()
+            }
+        };
+
+        let attempt = read_once(
+            state.devices[target_ix]
+                .peripheral
+                .as_deref_mut()
+                .expect("checked Some above"),
+        );
+        match attempt {
+            Ok(samples) => Ok(samples),
+            Err(err) if is_recoverable_live_error(&err) => {
+                // Close the stale/suspended Windows HID handle before reopening so the OS
+                // releases it cleanly, keeping the device entry intact for automatic retries.
+                state.devices[target_ix].peripheral = None;
+                if let Some(mut fresh) = self.open_matching_peripheral(device, dry_run) {
+                    let retry = read_once(fresh.as_mut());
+                    if let Err(ref retry_err) = retry
+                        && is_recoverable_live_error(retry_err)
+                    {
+                        return retry;
+                    }
+                    state.devices[target_ix].peripheral = Some(fresh);
+                    return retry;
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 /// Returns `true` when an error message indicates the USB HID handle disconnected
-/// (for example Windows `ERROR_DEVICE_NOT_CONNECTED` `0x0000048F` during a polling-rate reset).
+/// (for example Windows `ERROR_DEVICE_NOT_CONNECTED` `0x0000048F` during a polling-rate reset
+/// or after USB selective suspend).
 pub fn is_disconnect_message(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("0x0000048f")
+        || lower.contains("0x0000001f")
         || lower.contains("not connected")
         || lower.contains("disconnected")
+        || lower.contains("not functioning")
         || lower.contains("writefile")
+        || lower.contains("readfile")
         || lower.contains("getoverlappedresult")
+}
+
+fn is_recoverable_live_error(err: &CoreError) -> bool {
+    matches!(err, CoreError::NotConnected(_)) || is_disconnect_message(&err.to_string())
 }
 
 fn has_disconnect_warning(snapshot: &DeviceSnapshot) -> bool {
@@ -1457,7 +1548,7 @@ impl PeripheralService for LiveHidService {
             }
             let snapshot = collect_snapshot(peripheral.as_mut());
             state.devices.push(LiveDevice {
-                peripheral,
+                peripheral: Some(peripheral),
                 snapshot,
             });
         }
@@ -1488,9 +1579,24 @@ impl PeripheralService for LiveHidService {
                 if next.polling_rate != current.snapshot.polling_rate
         );
 
+        if state.devices[target_ix].peripheral.is_none() {
+            if let Some(fresh) = self.open_matching_peripheral(device, dry_run) {
+                state.devices[target_ix].peripheral = Some(fresh);
+            } else {
+                return Err(ApplyError::failed_after_send(
+                    CoreError::NotConnected(device.to_string()),
+                    None,
+                ));
+            }
+        }
+
         if matches!(change, SettingChange::PollCalibrationProgress) {
             let target = &mut state.devices[target_ix];
-            let flags = require(target.peripheral.as_hall_effect_mut(), "hall_effect")
+            let peripheral = target
+                .peripheral
+                .as_deref_mut()
+                .expect("checked Some above");
+            let flags = require(peripheral.as_hall_effect_mut(), "hall_effect")
                 .map_err(ApplyError::rejected)?
                 .read_calibration_key_progress()
                 .map_err(|err| ApplyError::failed_after_send(err, None))?;
@@ -1501,8 +1607,13 @@ impl PeripheralService for LiveHidService {
         }
 
         let sequence_before = self.sink.next.load(Ordering::Relaxed);
-        if let Err(err) = apply_to_peripheral(state.devices[target_ix].peripheral.as_mut(), &change)
-        {
+        if let Err(err) = apply_to_peripheral(
+            state.devices[target_ix]
+                .peripheral
+                .as_deref_mut()
+                .expect("checked Some above"),
+            &change,
+        ) {
             // A driver that refuses a write it cannot express (e.g. Wooting's readonly actuation
             // table) fails before tracing any frame; only then is it safe to skip the re-read.
             let nothing_sent = self.sink.next.load(Ordering::Relaxed) == sequence_before;
@@ -1512,11 +1623,10 @@ impl PeripheralService for LiveHidService {
             // Changing USB polling rate resets the keyboard's USB interface immediately; drop the
             // stale handle and reopen it automatically once Windows re-enumerates the device.
             if is_polling_rate_change && is_disconnect_message(&err.to_string()) {
-                let dropped_device = state.devices.remove(target_ix);
-                drop(dropped_device);
+                state.devices[target_ix].peripheral = None;
                 if let Some(reopened) = self.reopen_device(device, dry_run, true) {
                     let snap = reopened.snapshot.clone();
-                    state.devices.insert(target_ix, reopened);
+                    state.devices[target_ix] = reopened;
                     return Ok(snap);
                 }
                 return Err(ApplyError::failed_after_send(err, None));
@@ -1524,25 +1634,33 @@ impl PeripheralService for LiveHidService {
             // A stale/suspended HID handle (e.g. after hours idle in a game) can fail with a
             // disconnect error; reopen cleanly and retry this write once on the fresh handle.
             if is_disconnect_message(&err.to_string()) {
-                let dropped_device = state.devices.remove(target_ix);
-                drop(dropped_device);
+                state.devices[target_ix].peripheral = None;
                 if let Some(mut reopened) = self.reopen_device(device, dry_run, false) {
-                    if apply_to_peripheral(reopened.peripheral.as_mut(), &change).is_ok() {
-                        let snapshot = collect_snapshot(reopened.peripheral.as_mut());
+                    let peripheral = reopened
+                        .peripheral
+                        .as_deref_mut()
+                        .expect("reopened device always has a live peripheral");
+                    if apply_to_peripheral(peripheral, &change).is_ok() {
+                        let snapshot = collect_snapshot(peripheral);
                         reopened.snapshot = snapshot.clone();
-                        state.devices.insert(target_ix, reopened);
+                        state.devices[target_ix] = reopened;
                         return Ok(snapshot);
                     }
-                    let refreshed = collect_snapshot(reopened.peripheral.as_mut());
+                    let refreshed = collect_snapshot(peripheral);
                     reopened.snapshot = refreshed.clone();
-                    state.devices.insert(target_ix, reopened);
+                    state.devices[target_ix] = reopened;
                     return Err(ApplyError::failed_after_send(err, Some(refreshed)));
                 }
                 return Err(ApplyError::failed_after_send(err, None));
             }
             // Frames may have already reached hardware before the failure (e.g. a timeout
             // mid-chunk during a global actuation write); re-read best-effort live state.
-            let refreshed = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+            let refreshed = collect_snapshot(
+                state.devices[target_ix]
+                    .peripheral
+                    .as_deref_mut()
+                    .expect("checked Some above"),
+            );
             state.devices[target_ix].snapshot = refreshed.clone();
             return Err(ApplyError::failed_after_send(err, Some(refreshed)));
         }
@@ -1554,15 +1672,19 @@ impl PeripheralService for LiveHidService {
             return Ok(target.snapshot.clone());
         }
 
-        let snapshot = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+        let snapshot = collect_snapshot(
+            state.devices[target_ix]
+                .peripheral
+                .as_deref_mut()
+                .expect("checked Some above"),
+        );
         if is_polling_rate_change || has_disconnect_warning(&snapshot) {
             // Device briefly disconnected / re-enumerated (e.g. polling rate change): close the
             // stale HID handle and reopen cleanly so the UI never shows disconnect errors.
-            let dropped_device = state.devices.remove(target_ix);
-            drop(dropped_device);
+            state.devices[target_ix].peripheral = None;
             if let Some(reopened) = self.reopen_device(device, dry_run, is_polling_rate_change) {
                 let snap = reopened.snapshot.clone();
-                state.devices.insert(target_ix, reopened);
+                state.devices[target_ix] = reopened;
                 return Ok(snap);
             }
             return Err(ApplyError::failed_after_send(
@@ -1613,16 +1735,37 @@ impl PeripheralService for LiveHidService {
         let mut applied_any = false;
         let mut polling_rate_changed = false;
 
+        if state.devices[target_ix].peripheral.is_none() {
+            if let Some(fresh) = self.open_matching_peripheral(device, dry_run) {
+                state.devices[target_ix].peripheral = Some(fresh);
+            } else {
+                return (
+                    None,
+                    Some((
+                        0,
+                        total,
+                        ApplyError::failed_after_send(
+                            CoreError::NotConnected(device.to_string()),
+                            None,
+                        ),
+                    )),
+                );
+            }
+        }
+
         for (ix, change) in changes.into_iter().enumerate() {
             if let Err(err) = validate_change(&state.devices[target_ix].snapshot, &change) {
                 let last = if applied_any {
                     if dry_run {
                         Some(state.devices[target_ix].snapshot.clone())
-                    } else {
-                        let refreshed =
-                            collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+                    } else if let Some(peripheral) =
+                        state.devices[target_ix].peripheral.as_deref_mut()
+                    {
+                        let refreshed = collect_snapshot(peripheral);
                         state.devices[target_ix].snapshot = refreshed.clone();
                         Some(refreshed)
+                    } else {
+                        None
                     }
                 } else {
                     None
@@ -1638,7 +1781,11 @@ impl PeripheralService for LiveHidService {
 
             if matches!(change, SettingChange::PollCalibrationProgress) {
                 let target = &mut state.devices[target_ix];
-                let flags = match require(target.peripheral.as_hall_effect_mut(), "hall_effect")
+                let peripheral = target
+                    .peripheral
+                    .as_deref_mut()
+                    .expect("checked Some above");
+                let flags = match require(peripheral.as_hall_effect_mut(), "hall_effect")
                     .and_then(agnoperiph_core::HallEffectKeyboard::read_calibration_key_progress)
                 {
                     Ok(flags) => flags,
@@ -1658,19 +1805,26 @@ impl PeripheralService for LiveHidService {
             }
 
             let sequence_before = self.sink.next.load(Ordering::Relaxed);
-            if let Err(err) =
-                apply_to_peripheral(state.devices[target_ix].peripheral.as_mut(), &change)
-            {
+            if let Err(err) = apply_to_peripheral(
+                state.devices[target_ix]
+                    .peripheral
+                    .as_deref_mut()
+                    .expect("checked Some above"),
+                &change,
+            ) {
                 let nothing_sent = self.sink.next.load(Ordering::Relaxed) == sequence_before;
                 if dry_run || nothing_sent {
                     let last = if applied_any {
                         if dry_run {
                             Some(state.devices[target_ix].snapshot.clone())
-                        } else {
-                            let refreshed =
-                                collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+                        } else if let Some(peripheral) =
+                            state.devices[target_ix].peripheral.as_deref_mut()
+                        {
+                            let refreshed = collect_snapshot(peripheral);
                             state.devices[target_ix].snapshot = refreshed.clone();
                             Some(refreshed)
+                        } else {
+                            None
                         }
                     } else {
                         None
@@ -1678,10 +1832,9 @@ impl PeripheralService for LiveHidService {
                     return (last, Some((ix, total, ApplyError::rejected(err))));
                 }
                 if is_polling_rate_change && is_disconnect_message(&err.to_string()) {
-                    let dropped_device = state.devices.remove(target_ix);
-                    drop(dropped_device);
+                    state.devices[target_ix].peripheral = None;
                     if let Some(reopened) = self.reopen_device(device, dry_run, true) {
-                        state.devices.insert(target_ix, reopened);
+                        state.devices[target_ix] = reopened;
                         applied_any = true;
                         polling_rate_changed = true;
                         continue;
@@ -1692,18 +1845,21 @@ impl PeripheralService for LiveHidService {
                     );
                 }
                 if is_disconnect_message(&err.to_string()) {
-                    let dropped_device = state.devices.remove(target_ix);
-                    drop(dropped_device);
+                    state.devices[target_ix].peripheral = None;
                     if let Some(mut reopened) = self.reopen_device(device, dry_run, false) {
-                        if apply_to_peripheral(reopened.peripheral.as_mut(), &change).is_ok() {
+                        let peripheral = reopened
+                            .peripheral
+                            .as_deref_mut()
+                            .expect("reopened device always has a live peripheral");
+                        if apply_to_peripheral(peripheral, &change).is_ok() {
                             apply_change_to_snapshot(&mut reopened.snapshot, &change);
-                            state.devices.insert(target_ix, reopened);
+                            state.devices[target_ix] = reopened;
                             applied_any = true;
                             continue;
                         }
-                        let refreshed = collect_snapshot(reopened.peripheral.as_mut());
+                        let refreshed = collect_snapshot(peripheral);
                         reopened.snapshot = refreshed.clone();
-                        state.devices.insert(target_ix, reopened);
+                        state.devices[target_ix] = reopened;
                         return (
                             None,
                             Some((
@@ -1718,7 +1874,12 @@ impl PeripheralService for LiveHidService {
                         Some((ix, total, ApplyError::failed_after_send(err, None))),
                     );
                 }
-                let refreshed = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+                let refreshed = collect_snapshot(
+                    state.devices[target_ix]
+                        .peripheral
+                        .as_deref_mut()
+                        .expect("checked Some above"),
+                );
                 state.devices[target_ix].snapshot = refreshed.clone();
                 return (
                     None,
@@ -1738,10 +1899,9 @@ impl PeripheralService for LiveHidService {
             } else if is_polling_rate_change {
                 polling_rate_changed = true;
                 if ix + 1 < total {
-                    let dropped_device = state.devices.remove(target_ix);
-                    drop(dropped_device);
+                    state.devices[target_ix].peripheral = None;
                     if let Some(reopened) = self.reopen_device(device, dry_run, true) {
-                        state.devices.insert(target_ix, reopened);
+                        state.devices[target_ix] = reopened;
                     } else {
                         return (
                             None,
@@ -1763,13 +1923,17 @@ impl PeripheralService for LiveHidService {
             return (Some(state.devices[target_ix].snapshot.clone()), None);
         }
 
-        let snapshot = collect_snapshot(state.devices[target_ix].peripheral.as_mut());
+        let snapshot = collect_snapshot(
+            state.devices[target_ix]
+                .peripheral
+                .as_deref_mut()
+                .expect("checked Some above"),
+        );
         if polling_rate_changed || has_disconnect_warning(&snapshot) {
-            let dropped_device = state.devices.remove(target_ix);
-            drop(dropped_device);
+            state.devices[target_ix].peripheral = None;
             if let Some(reopened) = self.reopen_device(device, dry_run, polling_rate_changed) {
                 let snap = reopened.snapshot.clone();
-                state.devices.insert(target_ix, reopened);
+                state.devices[target_ix] = reopened;
                 return (Some(snap), None);
             }
             return (
@@ -1798,30 +1962,45 @@ impl PeripheralService for LiveHidService {
     }
 
     fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
-        let mut state = lock(&self.state);
-        let target = state
-            .devices
-            .iter_mut()
-            .find(|d| d.snapshot.info.id == *device)
-            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
-        require(target.peripheral.as_hall_effect_mut(), "hall_effect")?.read_live_key_travel()
+        self.read_live_key_travel_inner(device, None, false)
+    }
+
+    fn read_live_key_travel_focused(
+        &self,
+        device: &DeviceId,
+        focus_key: Option<KeyIndex>,
+    ) -> CoreResult<Vec<KeyTravelSample>> {
+        self.read_live_key_travel_inner(device, focus_key, true)
     }
 
     fn sync_hardware_state(&self, device: &DeviceId) -> CoreResult<Option<DeviceSnapshot>> {
         let mut state = lock(&self.state);
-        let target = state
+        let dry_run = state.dry_run;
+        let target_ix = state
             .devices
-            .iter_mut()
-            .find(|d| d.snapshot.info.id == *device)
+            .iter()
+            .position(|d| d.snapshot.info.id == *device)
             .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
-        if target.snapshot.is_preview {
+        if state.devices[target_ix].snapshot.is_preview {
             return Ok(None);
         }
+        if state.devices[target_ix].peripheral.is_none() {
+            let Some(fresh) = self.open_matching_peripheral(device, dry_run) else {
+                return Ok(None);
+            };
+            state.devices[target_ix].peripheral = Some(fresh);
+        }
+
+        let target = &mut state.devices[target_ix];
+        let peripheral = target
+            .peripheral
+            .as_deref_mut()
+            .expect("checked Some above");
 
         let mut next = target.snapshot.clone();
         let mut changed = false;
 
-        if let Some(rgb) = target.peripheral.as_rgb_mut() {
+        if let Some(rgb) = peripheral.as_rgb_mut() {
             let capabilities = rgb.rgb_capabilities();
             if let Ok(snapshot) = rgb.read_rgb_state() {
                 let updated = RgbState {
@@ -1835,7 +2014,7 @@ impl PeripheralService for LiveHidService {
             }
         }
 
-        if let Some(kc) = target.peripheral.as_keyboard_config_mut() {
+        if let Some(kc) = peripheral.as_keyboard_config_mut() {
             let capabilities = kc.keyboard_config_capabilities();
             if let Ok(snapshot) = kc.read_keyboard_config() {
                 let updated = KeyboardConfigState {
@@ -1850,7 +2029,7 @@ impl PeripheralService for LiveHidService {
         }
 
         let mut profile_changed = false;
-        if let Some(pr) = target.peripheral.as_profiles_mut() {
+        if let Some(pr) = peripheral.as_profiles_mut() {
             let capabilities = pr.profile_capabilities();
             if let Ok(snapshot) = pr.read_profile_state() {
                 let updated = ProfileState {
@@ -1865,7 +2044,7 @@ impl PeripheralService for LiveHidService {
             }
         }
 
-        if profile_changed && let Some(pointer) = target.peripheral.as_pointer_mut() {
+        if profile_changed && let Some(pointer) = peripheral.as_pointer_mut() {
             let capabilities = pointer.pointer_capabilities();
             if let Ok(snapshot) = pointer.read_pointer_state() {
                 next.pointer = Some(PointerState {
@@ -2320,5 +2499,174 @@ mod tests {
             validate_change(&mouse, &SettingChange::Profile(ProfileSlot::new(1))),
             Err(CoreError::Validation(_))
         ));
+    }
+
+    struct DisconnectOnceTransport {
+        inner: MockHidTransport,
+        fail_writes: bool,
+    }
+
+    impl HidTransport for DisconnectOnceTransport {
+        fn descriptor(&self) -> &HidDeviceDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn send_output_report(&mut self, report: &[u8]) -> TransportResult<usize> {
+            if self.fail_writes {
+                return Err(TransportError::Io(
+                    "hidapi error: WriteFile: (0x0000048F) The device is not connected.".to_owned(),
+                ));
+            }
+            self.inner.send_output_report(report)
+        }
+
+        fn read_input_report(
+            &mut self,
+            buf: &mut [u8],
+            timeout: std::time::Duration,
+        ) -> TransportResult<usize> {
+            self.inner.read_input_report(buf, timeout)
+        }
+
+        fn drain_input_reports(&mut self) -> TransportResult<usize> {
+            self.inner.drain_input_reports()
+        }
+
+        fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()> {
+            self.inner.send_feature_report(report)
+        }
+
+        fn get_feature_report(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+            self.inner.get_feature_report(buf)
+        }
+    }
+
+    struct DisconnectAfterOpenTransport {
+        inner: MockHidTransport,
+        remaining_ok_writes: usize,
+    }
+
+    impl HidTransport for DisconnectAfterOpenTransport {
+        fn descriptor(&self) -> &HidDeviceDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn send_output_report(&mut self, report: &[u8]) -> TransportResult<usize> {
+            if self.remaining_ok_writes == 0 {
+                return Err(TransportError::Io(
+                    "hidapi error: WriteFile: (0x0000048F) The device is not connected.".to_owned(),
+                ));
+            }
+            self.remaining_ok_writes -= 1;
+            self.inner.send_output_report(report)
+        }
+
+        fn read_input_report(
+            &mut self,
+            buf: &mut [u8],
+            timeout: std::time::Duration,
+        ) -> TransportResult<usize> {
+            self.inner.read_input_report(buf, timeout)
+        }
+
+        fn drain_input_reports(&mut self) -> TransportResult<usize> {
+            self.inner.drain_input_reports()
+        }
+
+        fn send_feature_report(&mut self, report: &[u8]) -> TransportResult<()> {
+            self.inner.send_feature_report(report)
+        }
+
+        fn get_feature_report(&mut self, buf: &mut [u8]) -> TransportResult<usize> {
+            self.inner.get_feature_report(buf)
+        }
+    }
+
+    struct BoxedScriptedEnumerator {
+        descriptor: HidDeviceDescriptor,
+        transports: Mutex<VecDeque<Option<Box<dyn HidTransport>>>>,
+    }
+
+    impl HidEnumerator for BoxedScriptedEnumerator {
+        fn enumerate(&self) -> TransportResult<Vec<HidDeviceDescriptor>> {
+            Ok(vec![self.descriptor.clone()])
+        }
+
+        fn open_path(
+            &self,
+            _descriptor: &HidDeviceDescriptor,
+        ) -> TransportResult<Box<dyn HidTransport>> {
+            match lock(&self.transports).pop_front() {
+                Some(Some(transport)) => Ok(transport),
+                _ => Err(TransportError::OpenFailed {
+                    path: self.descriptor.path.clone(),
+                    reason: "device temporarily unavailable".to_owned(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn live_travel_recovers_automatically_from_windows_0x48f_disconnect() {
+        let desc = rs7_descriptor();
+
+        // 1. Initial transport succeeds through open + snapshot, then fails with 0x0000048F.
+        let mut stale = MockHidTransport::new(desc.clone());
+        push_rs7_open(&mut stale);
+        push_rs7_snapshot(&mut stale, 120);
+        // Count the exact writes consumed by open + snapshot:
+        // open(3) + deadzone(1) + actuation(8) + rt(24) + socd(20) + dks(20) + calib(4)
+        // + rgb(1) + logo(1) + keymap(28) + layer(1) + macro_sz(1) + config(4) = 116 writes.
+        let stale_transport: Box<dyn HidTransport> = Box::new(DisconnectAfterOpenTransport {
+            inner: stale,
+            remaining_ok_writes: 116,
+        });
+
+        // 2. First reopen attempt fails (e.g. keyboard mid-reset); second reopen succeeds
+        //    and returns live travel for key 33 (chunk 8, k = 1, 1.90 mm).
+        let mut recovered = MockHidTransport::new(desc.clone());
+        push_rs7_open(&mut recovered);
+        let mut focus_resp = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        focus_resp[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        focus_resp[8 + 5 + 2..8 + 5 + 4].copy_from_slice(&190u16.to_be_bytes());
+        recovered.push_input_response(focus_resp);
+        let mut scan_resp = vec![0u8; atk::RS7_PAYLOAD_LEN];
+        scan_resp[0] = atk::cmd::GET_KEYBOARD_VALUE;
+        recovered.push_input_response(scan_resp);
+        let recovered_transport: Box<dyn HidTransport> = Box::new(DisconnectOnceTransport {
+            inner: recovered,
+            fail_writes: false,
+        });
+
+        let enumerator = Arc::new(BoxedScriptedEnumerator {
+            descriptor: desc,
+            transports: Mutex::new(VecDeque::from([
+                Some(stale_transport),
+                None,
+                Some(recovered_transport),
+            ])),
+        });
+        let service = LiveHidService::with_enumerator_and_mode(enumerator, false);
+        let devices = service.refresh().unwrap();
+        let id = devices[0].id().clone();
+
+        // First call hits 0x0000048F, drops dead handle, and immediate reopen fails while device
+        // is still unavailable.
+        let first_err = service
+            .read_live_key_travel_focused(&id, Some(KeyIndex::new(33)))
+            .unwrap_err();
+        assert!(is_disconnect_message(&first_err.to_string()));
+
+        // Next call reopens automatically without calling `refresh()` and returns the sample.
+        let samples = service
+            .read_live_key_travel_focused(&id, Some(KeyIndex::new(33)))
+            .expect("live travel must self-recover without manual refresh");
+        assert_eq!(
+            samples,
+            vec![KeyTravelSample::new(
+                KeyIndex::new(33),
+                TravelHundredthsMm::from_hundredths(190),
+            )]
+        );
     }
 }

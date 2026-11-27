@@ -12,7 +12,7 @@ use agnoperiph::backend::{
 };
 use agnoperiph::draft::ChangeId;
 use agnoperiph::game_profiles::{DetectedGame, GameSource};
-use agnoperiph::key_tester::LIVE_POLL_INTERVAL;
+use agnoperiph::key_tester::{LIVE_POLL_INTERVAL, LIVE_RETRY_INTERVAL};
 use agnoperiph::quick_presets::QuickPreset;
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, Route, device_element_id};
 use agnoperiph_core::{
@@ -2247,6 +2247,54 @@ fn live_key_tester_polls_only_while_visible(cx: &mut TestAppContext) {
     // Leaving the device stops it too.
     click(cx, handle, device_element_id(&DeviceId::new(MOCK_MOUSE_ID)));
     assert!(!polling(cx));
+}
+
+#[gpui_kit::test]
+fn live_key_tester_recovers_from_disconnect_without_refresh(cx: &mut TestAppContext) {
+    let service = MockPeripheralService::new();
+    service.set_live_key_travel(
+        &keyboard(),
+        vec![KeyTravelSample::new(KeyIndex::new(KEY_E), travel(210))],
+    );
+    service.fail_live_key_travel(
+        &keyboard(),
+        2,
+        "HID I/O error: hidapi error: WriteFile: (0x0000048F) The device is not connected.",
+    );
+
+    let (handle, app) = open_app(cx, service);
+    click(cx, handle, device_element_id(&keyboard()));
+
+    // First poll hits the simulated 0x0000048F disconnect: polling must stay alive and show a
+    // clean reconnecting note instead of permanently stopping.
+    cx.executor().advance_clock(LIVE_POLL_INTERVAL);
+    settle(cx, handle);
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.is_live_polling(), "disconnect must not stop polling");
+        assert_eq!(app.tester_error(), Some("Reconnecting to keyboard…"));
+        assert_eq!(app.tester_depth(), 0);
+    });
+
+    // Second retry (after backoff) hits the second simulated failure, still stays alive.
+    cx.executor().advance_clock(LIVE_RETRY_INTERVAL);
+    settle(cx, handle);
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.is_live_polling());
+        assert_eq!(app.tester_error(), Some("Reconnecting to keyboard…"));
+    });
+
+    // Third retry (after 2x backoff) succeeds automatically without clicking Refresh.
+    cx.executor().advance_clock(LIVE_RETRY_INTERVAL * 2);
+    settle(cx, handle);
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.is_live_polling());
+        assert_eq!(app.tester_error(), None);
+        assert_eq!(app.tester_key(), KeyIndex::new(KEY_E));
+        assert_eq!(app.tester_depth(), 210);
+    });
 }
 
 #[gpui_kit::test]

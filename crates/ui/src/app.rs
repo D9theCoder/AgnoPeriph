@@ -30,7 +30,7 @@ use crate::battery_alerts::BatteryAlertTracker;
 use crate::controls::{Controls, InputRole, SliderRange, SliderRole};
 use crate::draft::{ChangeId, DeviceDraft, DraftHistory};
 use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
-use crate::key_tester::TesterUi;
+use crate::key_tester::{KeyTesterView, TesterUi};
 use crate::smooth_scroll::{ScrollIds, SmoothScroll};
 use crate::system::{DetachedSystem, SystemIntegration};
 use crate::updates::{GithubReleases, ReleaseSource, UpdateUi};
@@ -314,6 +314,7 @@ pub struct AgnoPeriphApp {
     pub(crate) is_changes_open: bool,
     pub(crate) is_shortcuts_open: bool,
     pub(crate) tester: TesterUi,
+    pub(crate) tester_view: Entity<KeyTesterView>,
     pub(crate) battery_alerts: BatteryAlertTracker,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) keyboard_tab: KeyboardTab,
@@ -373,6 +374,8 @@ impl AgnoPeriphApp {
         let check_updates = options.check_updates;
         crate::shortcuts::bind_keys(cx);
         let theme_subscription = cx.observe_global::<Theme>(|_, cx| cx.notify());
+        let app_entity = cx.entity();
+        let tester_view = cx.new(|cx| KeyTesterView::new(&app_entity, cx));
         let mut app = Self {
             service,
             system: options.system,
@@ -408,6 +411,7 @@ impl AgnoPeriphApp {
             is_changes_open: false,
             is_shortcuts_open: false,
             tester: TesterUi::default(),
+            tester_view,
             battery_alerts: BatteryAlertTracker::default(),
             focus_handle: cx.focus_handle(),
             keyboard_tab: KeyboardTab::Triggers,
@@ -469,6 +473,7 @@ impl AgnoPeriphApp {
         self.rebuild_controls(window, cx);
         self.sync_controls(window, cx);
         self.focus_handle.focus(window, cx);
+        self.tester.clear_error();
         self.update_live_polling(cx);
         cx.notify();
     }
@@ -478,6 +483,7 @@ impl AgnoPeriphApp {
         self.window_handle = None;
         self.is_changes_open = false;
         self.is_shortcuts_open = false;
+        self.tester.clear_error();
         self.update_live_polling(cx);
     }
 
@@ -802,6 +808,7 @@ impl AgnoPeriphApp {
                 });
             }
         }
+        self.tester.clear_error();
         self.update_live_polling(cx);
         self.request_sync(cx);
         self.pump_queue(cx);
@@ -1129,6 +1136,7 @@ impl AgnoPeriphApp {
             self.tester.reset();
         }
         self.smooth_scroll.reset();
+        self.tester.clear_error();
         self.update_live_polling(cx);
         self.request_sync(cx);
         cx.notify();
@@ -1156,6 +1164,7 @@ impl AgnoPeriphApp {
             self.route = Route::GameProfiles;
             self.is_changes_open = false;
             self.smooth_scroll.reset();
+            self.tester.clear_error();
             self.update_live_polling(cx);
             cx.notify();
         }
@@ -1166,6 +1175,7 @@ impl AgnoPeriphApp {
             self.keyboard_tab = tab;
             self.paired.cancel_pick();
             self.smooth_scroll.reset();
+            self.tester.clear_error();
             self.update_live_polling(cx);
             self.request_sync(cx);
             cx.notify();

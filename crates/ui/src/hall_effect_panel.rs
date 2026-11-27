@@ -1433,7 +1433,7 @@ fn render_deck(
     workspace_width: f32,
     cx: &mut Context<AgnoPeriphApp>,
 ) -> impl IntoElement + use<> {
-    let gauge = crate::key_tester::render(app, he, layout, cx);
+    let gauge = crate::key_tester::render(app, he);
     let travel = render_travel_column(app, he, layout, workspace_width, cx);
     let rapid = he
         .capabilities

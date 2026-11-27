@@ -4,23 +4,34 @@
 //!
 //! Live readings are polled only while the Triggers tab of a keyboard that advertises
 //! live travel is showing and the window is open, so an idle app sends no HID traffic.
+//! Rendering is isolated in [`KeyTesterView`] so native-refresh-rate animation frames
+//! (`window.request_animation_frame`) only re-render this column rather than the whole app.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use agnoperiph_core::{KeyIndex, KeyTravelSample, RapidTriggerConfig, TravelHundredthsMm};
-use gpui_kit::component::{ActiveTheme, Sizable, h_flex, tag::Tag, v_flex};
+use agnoperiph_core::{
+    CoreError, DeviceId, KeyIndex, KeyTravelSample, RapidTriggerConfig, TravelHundredthsMm,
+};
+use gpui_kit::component::{ActiveTheme, Sizable, Theme, h_flex, tag::Tag, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, KeyboardTab, Route, mm, muted_note};
-use crate::backend::HallEffectState;
+use crate::backend::{HallEffectState, PeripheralService};
 use crate::keymap::KeyLayout;
 
-/// Live travel read interval while the tester is showing.
-pub const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-/// Samples kept for the travel trace.
-const TRACE_LEN: usize = 48;
+/// Target live travel read cadence while the tester is showing (~166 Hz to feed 165 Hz+ displays).
+pub const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(6);
+/// Initial reconnect retry interval after a transient USB HID disconnect (`0x0000048F`).
+pub const LIVE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// Visible horizontal time span of the scrolling travel trace.
+const TRACE_WINDOW: Duration = Duration::from_millis(2400);
+/// Keep slightly more than `TRACE_WINDOW` so the sample entering the left edge stays anchored.
+const TRACE_RETENTION: Duration = Duration::from_millis(2800);
+/// Upper bound on retained timestamped samples.
+const MAX_TRACE_SAMPLES: usize = 2048;
 
 /// The values that decide when a key is pressed, all in hundredths of a millimetre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,18 +98,26 @@ pub fn is_pressed(trace: impl IntoIterator<Item = u16>, params: &TriggerParams) 
     pressed
 }
 
+enum PollAction {
+    Read(Arc<dyn PeripheralService>, DeviceId, Option<KeyIndex>),
+    Pause,
+    Stop,
+}
+
 /// Tester state owned by the app.
 #[derive(Default)]
 pub(crate) struct TesterUi {
-    trace: VecDeque<u16>,
+    trace: VecDeque<(Instant, u16)>,
     /// Key the live readings last moved; the tester follows it.
     live_key: Option<KeyIndex>,
     live_samples: Vec<KeyTravelSample>,
     pub(crate) live_polls: usize,
     live_error: Option<SharedString>,
+    consecutive_errors: u32,
+    /// Duration of the previous HID read, subtracted from the next sleep to avoid aliasing.
+    last_read_elapsed: Duration,
     /// Increments whenever polling starts or stops; replies from an older run are dropped.
     run: u64,
-    is_reading: bool,
     poll: Option<Task<()>>,
 }
 
@@ -106,23 +125,109 @@ impl std::fmt::Debug for TesterUi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TesterUi")
             .field("is_polling", &self.poll.is_some())
+            .field("consecutive_errors", &self.consecutive_errors)
             .finish_non_exhaustive()
     }
 }
 
 impl TesterUi {
-    fn push_trace(&mut self, depth: u16) {
-        if self.trace.len() == TRACE_LEN {
+    fn push_trace(&mut self, now: Instant, depth: u16) {
+        self.trace.push_back((now, depth));
+        while self.trace.len() > MAX_TRACE_SAMPLES {
             self.trace.pop_front();
         }
-        self.trace.push_back(depth);
+        // Keep one sample older than TRACE_RETENTION as a left-edge anchor if present.
+        while self.trace.len() >= 2
+            && now.saturating_duration_since(self.trace[1].0) > TRACE_RETENTION
+        {
+            self.trace.pop_front();
+        }
+    }
+
+    pub(crate) fn clear_error(&mut self) {
+        self.live_error = None;
+        self.consecutive_errors = 0;
+        self.last_read_elapsed = Duration::ZERO;
     }
 
     pub(crate) fn reset(&mut self) {
         self.trace.clear();
         self.live_key = None;
         self.live_samples.clear();
-        self.live_error = None;
+        self.clear_error();
+    }
+}
+
+/// Isolated GPUI view for the Key tester column so native-refresh-rate animation frames
+/// (`165 Hz`, `240 Hz`, etc.) only re-render this column instead of the whole workspace.
+pub(crate) struct KeyTesterView {
+    app: WeakEntity<AgnoPeriphApp>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl KeyTesterView {
+    pub(crate) fn new(app: &Entity<AgnoPeriphApp>, cx: &mut Context<Self>) -> Self {
+        let subscriptions = vec![
+            cx.observe(app, |_, _, cx| cx.notify()),
+            cx.observe_global::<Theme>(|_, cx| cx.notify()),
+        ];
+        Self {
+            app: app.downgrade(),
+            _subscriptions: subscriptions,
+        }
+    }
+}
+
+impl Render for KeyTesterView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(app_entity) = self.app.upgrade() else {
+            return div().into_any_element();
+        };
+        let app = app_entity.read(cx);
+        let Some(device) = app.selected_device() else {
+            return div().into_any_element();
+        };
+        let Some(he) = device.hall_effect.as_ref() else {
+            return div().into_any_element();
+        };
+        if !he.capabilities.has_live_travel() {
+            return div().into_any_element();
+        }
+
+        let layout = KeyLayout::for_device(&device.info, &he.capabilities);
+        let now = cx.background_executor().now();
+        let key = app.tester_key();
+        let depth = app.tester_depth();
+        let params = params_for(he, key);
+        let trace: Vec<(Instant, u16)> = app.tester.trace.iter().copied().collect();
+        let pressed = is_pressed(trace.iter().map(|&(_, d)| d), &params);
+
+        let has_visible_motion = depth > 0
+            || trace
+                .iter()
+                .any(|&(t, d)| d > 0 && now.saturating_duration_since(t) <= TRACE_WINDOW);
+        if app.is_live_polling()
+            && app.tester.live_error.is_none()
+            && has_visible_motion
+            && !cx.reduce_motion()
+        {
+            // Drive the meter and scrolling waveform at the monitor's native VSync refresh rate
+            // (e.g. 165 fps on a 165 Hz display), notifying only this lightweight view.
+            window.request_animation_frame();
+        }
+
+        render_column(
+            key,
+            depth,
+            pressed,
+            params,
+            trace,
+            now,
+            app.tester.live_key,
+            app.tester.live_error.as_ref(),
+            &layout,
+            cx.theme(),
+        )
     }
 }
 
@@ -143,6 +248,11 @@ impl AgnoPeriphApp {
         self.tester.live_polls
     }
 
+    /// Current live tester error/reconnecting status note, if any.
+    pub fn tester_error(&self) -> Option<&str> {
+        self.tester.live_error.as_deref()
+    }
+
     fn should_poll_live(&self) -> bool {
         self.route() == Route::Device
             && self.keyboard_tab() == KeyboardTab::Triggers
@@ -158,67 +268,99 @@ impl AgnoPeriphApp {
             return;
         }
         self.tester.run += 1;
-        self.tester.is_reading = false;
+        self.tester.last_read_elapsed = Duration::ZERO;
         if !wanted {
             self.tester.poll = None;
             return;
         }
+        self.tester.clear_error();
         let run = self.tester.run;
         self.tester.poll = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(LIVE_POLL_INTERVAL).await;
-                let Ok(keep) = this.update(cx, |this, cx| this.poll_live_once(run, cx)) else {
+                let Ok(Some(delay)) = this.read_with(cx, |this, _| this.live_poll_delay(run))
+                else {
                     break;
                 };
-                if !keep {
+                cx.background_executor().timer(delay).await;
+                let Ok(action) = this.update(cx, |this, _| this.prepare_live_read(run)) else {
                     break;
+                };
+                match action {
+                    PollAction::Stop => break,
+                    PollAction::Pause => {}
+                    PollAction::Read(service, device, focus_key) => {
+                        let started = cx.background_executor().now();
+                        let reply = cx
+                            .background_spawn(async move {
+                                service.read_live_key_travel_focused(&device, focus_key)
+                            })
+                            .await;
+                        let now = cx.background_executor().now();
+                        let elapsed = now.saturating_duration_since(started);
+                        let Ok(keep) = this.update(cx, |this, cx| {
+                            this.finish_live_read(run, reply, now, elapsed, cx)
+                        }) else {
+                            break;
+                        };
+                        if !keep {
+                            break;
+                        }
+                    }
                 }
             }
         }));
     }
 
-    /// Queues one live read; returns whether to keep polling.
-    fn poll_live_once(&mut self, run: u64, cx: &mut Context<Self>) -> bool {
+    fn live_poll_delay(&self, run: u64) -> Option<Duration> {
+        if run != self.tester.run || !self.should_poll_live() {
+            return None;
+        }
+        if self.tester.consecutive_errors > 0 {
+            let factor = 1u32 << self.tester.consecutive_errors.saturating_sub(1).min(2);
+            return Some(LIVE_RETRY_INTERVAL.saturating_mul(factor));
+        }
+        let remaining = LIVE_POLL_INTERVAL.saturating_sub(self.tester.last_read_elapsed);
+        Some(remaining.max(Duration::from_millis(1)))
+    }
+
+    fn prepare_live_read(&mut self, run: u64) -> PollAction {
         if run != self.tester.run {
-            return false;
+            return PollAction::Stop;
         }
         if !self.should_poll_live() {
             self.tester.poll = None;
             self.tester.run += 1;
-            return false;
+            return PollAction::Stop;
         }
-        // One read at a time, and none while a write or refresh holds the device.
-        if self.tester.is_reading || self.has_pending_writes() || self.is_loading() {
-            return true;
+        // None while a write or refresh holds the device.
+        if self.has_pending_writes() || self.is_loading() {
+            self.tester.last_read_elapsed = Duration::ZERO;
+            return PollAction::Pause;
         }
         let Some(device) = self.selected_device_id().cloned() else {
-            return true;
+            self.tester.last_read_elapsed = Duration::ZERO;
+            return PollAction::Pause;
         };
-        self.tester.is_reading = true;
-        let service = self.service.clone();
-        cx.spawn(async move |this, cx| {
-            let reply = cx
-                .background_spawn(async move { service.read_live_key_travel(&device) })
-                .await;
-            let _ = this.update(cx, |this, cx| this.finish_live_read(run, reply, cx));
-        })
-        .detach();
-        true
+        PollAction::Read(self.service.clone(), device, Some(self.tester_key()))
     }
 
     fn finish_live_read(
         &mut self,
         run: u64,
         reply: agnoperiph_core::CoreResult<Vec<KeyTravelSample>>,
+        now: Instant,
+        elapsed: Duration,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if run != self.tester.run {
-            return;
+            return false;
         }
-        self.tester.is_reading = false;
-        match reply {
+        self.tester.last_read_elapsed = elapsed;
+        let keep = match reply {
             Ok(samples) => {
                 self.tester.live_polls += 1;
+                self.tester.consecutive_errors = 0;
+                self.tester.live_error = None;
                 if let Some(deepest) = samples.iter().max_by_key(|s| s.travel.as_hundredths()) {
                     self.tester.live_key = Some(deepest.key);
                 }
@@ -229,16 +371,33 @@ impl AgnoPeriphApp {
                         .map_or(0, |s| s.travel.as_hundredths())
                 });
                 self.tester.live_samples = samples;
-                self.tester.push_trace(depth);
+                self.tester.push_trace(now, depth);
+                true
             }
-            Err(err) => {
+            Err(CoreError::UnsupportedCapability(_)) => {
                 self.tester.reset();
-                self.tester.live_error = Some(format!("Live travel stopped: {err}.").into());
+                self.tester.live_error = Some("Live travel unavailable.".into());
                 self.tester.poll = None;
                 self.tester.run += 1;
+                false
             }
-        }
-        cx.notify();
+            Err(_) => {
+                // Keep polling with gentle backoff so a stale/suspended HID handle or brief
+                // USB reset (`0x0000048F`) recovers automatically without a manual refresh.
+                self.tester.live_samples.clear();
+                self.tester.consecutive_errors = self.tester.consecutive_errors.saturating_add(1);
+                let note: SharedString = if self.tester.consecutive_errors <= 2 {
+                    "Reconnecting to keyboard…".into()
+                } else {
+                    "Keyboard disconnected — waiting to reconnect…".into()
+                };
+                self.tester.live_error = Some(note);
+                true
+            }
+        };
+        // Only invalidate the lightweight KeyTesterView so 165 Hz updates never rebuild the app.
+        self.tester_view.update(cx, |_, cx| cx.notify());
+        keep
     }
 
     pub fn tester_key(&self) -> KeyIndex {
@@ -278,22 +437,28 @@ fn hundredths(value: u16) -> String {
     mm(TravelHundredthsMm::from_hundredths(value))
 }
 
-/// The tester column of the Triggers deck. `he` already carries unsaved edits.
-pub(crate) fn render(
-    app: &AgnoPeriphApp,
-    he: &HallEffectState,
-    layout: &KeyLayout,
-    cx: &mut Context<AgnoPeriphApp>,
-) -> AnyElement {
-    // Boards without live travel have nothing to show: drop the column entirely.
+/// Returns the tester column for the Triggers deck, or an empty placeholder on keyboards
+/// that do not report live travel.
+pub(crate) fn render(app: &AgnoPeriphApp, he: &HallEffectState) -> AnyElement {
     if !he.capabilities.has_live_travel() {
         return div().into_any_element();
     }
-    let key = app.tester_key();
-    let depth = app.tester_depth();
-    let params = params_for(he, key);
-    let trace: Vec<u16> = app.tester.trace.iter().copied().collect();
-    let pressed = is_pressed(trace.iter().copied(), &params);
+    app.tester_view.clone().into_any_element()
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn render_column(
+    key: KeyIndex,
+    depth: u16,
+    pressed: bool,
+    params: TriggerParams,
+    trace: Vec<(Instant, u16)>,
+    now: Instant,
+    live_key: Option<KeyIndex>,
+    live_error: Option<&SharedString>,
+    layout: &KeyLayout,
+    theme: &Theme,
+) -> AnyElement {
     let max = f32::from(params.max_travel);
     let frac = |v: u16| (f32::from(v) / max).clamp(0.0, 1.0);
     let rt = params.rapid_trigger;
@@ -304,8 +469,6 @@ pub(crate) fn render(
         let end = params.actuation + rt.press_sensitivity.as_hundredths();
         (frac(start), frac(end))
     });
-    let live_error = app.tester.live_error.clone();
-    let theme = cx.theme();
 
     let bar = div()
         .id("tester-meter")
@@ -389,24 +552,26 @@ pub(crate) fn render(
             Tag::secondary().xsmall().child("Released")
         }));
 
-    let trace_view = h_flex()
+    let trace_color = theme.primary.opacity(0.5);
+    let max_travel = params.max_travel;
+    let trace_canvas = canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            paint_trace(bounds, &trace, now, max_travel, trace_color, window);
+        },
+    )
+    .size_full();
+
+    let trace_view = div()
         .id("tester-trace")
         .relative()
         .w_full()
         .h_6()
-        .items_start()
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.border)
         .overflow_hidden()
-        .children((0..TRACE_LEN).map(|ix| {
-            let offset = TRACE_LEN - trace.len();
-            let value = ix.checked_sub(offset).and_then(|i| trace.get(i)).copied();
-            div()
-                .flex_1()
-                .h(relative(value.map_or(0.0, frac)))
-                .bg(theme.primary.opacity(0.5))
-        }))
+        .child(trace_canvas)
         .child(
             div()
                 .absolute()
@@ -427,8 +592,8 @@ pub(crate) fn render(
     } else {
         format!("Actuates at {} mm · RT off", hundredths(params.actuation))
     };
-    // One note line: a read error wins, then the live prompt, then the trigger summary.
-    let note: SharedString = match (&live_error, app.tester.live_key) {
+    // One note line: a reconnect/error state wins, then the live prompt, then the trigger summary.
+    let note: SharedString = match (live_error, live_key) {
         (Some(err), _) => err.clone(),
         (None, None) => "Press any key on the keyboard.".into(),
         (None, Some(_)) => legend.into(),
@@ -441,17 +606,12 @@ pub(crate) fn render(
         .gap_2()
         .test_support()
         .child(
-            h_flex()
-                .min_h_6()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Key tester"),
-                )
-                .child(Tag::secondary().xsmall().child("Live")),
+            h_flex().min_h_6().justify_between().gap_2().child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Key tester"),
+            ),
         )
         .child(
             h_flex()
@@ -473,6 +633,81 @@ pub(crate) fn render(
         .child(trace_view)
         .child(muted_note(note, theme).id("tester-note"))
         .into_any_element()
+}
+
+/// Paints the continuous time-mapped travel waveform as a single GPU filled path.
+fn paint_trace(
+    bounds: Bounds<Pixels>,
+    samples: &[(Instant, u16)],
+    now: Instant,
+    max_travel: u16,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let width: f32 = bounds.size.width.into();
+    let height: f32 = bounds.size.height.into();
+    if width <= 0.0 || height <= 0.0 || samples.is_empty() {
+        return;
+    }
+
+    let window_secs = TRACE_WINDOW.as_secs_f32();
+    let max = f32::from(max_travel.max(1));
+    let depth_y = |d: u16| (f32::from(d) / max).clamp(0.0, 1.0) * height;
+
+    let mut anchor: Option<u16> = None;
+    let mut points: Vec<(f32, f32)> = Vec::with_capacity(samples.len() + 2);
+    let mut any_nonzero = false;
+
+    for &(t, d) in samples {
+        let age = now.saturating_duration_since(t).as_secs_f32();
+        if age >= window_secs {
+            anchor = Some(d);
+            continue;
+        }
+        if d > 0 {
+            any_nonzero = true;
+        }
+        let x = ((1.0 - age / window_secs).clamp(0.0, 1.0)) * width;
+        let y = depth_y(d);
+        if points
+            .last()
+            .is_some_and(|&(px, py)| (px - x).abs() < 0.1 && (py - y).abs() < 0.1)
+        {
+            continue;
+        }
+        points.push((x, y));
+    }
+
+    if let Some(d) = anchor {
+        if d > 0 {
+            any_nonzero = true;
+        }
+        points.insert(0, (0.0, depth_y(d)));
+    }
+
+    if !any_nonzero || points.is_empty() {
+        return;
+    }
+
+    let (first_x, first_y) = points[0];
+    let x_start = first_x.min((width - 1.5).max(0.0)).max(0.0);
+    let last_y = points.last().map_or(first_y, |&(_, y)| y);
+    let left = bounds.left();
+    let top = bounds.top();
+
+    let mut builder = PathBuilder::fill();
+    builder.move_to(point(left + px(x_start), top));
+    builder.line_to(point(left + px(x_start), top + px(first_y)));
+    for &(x, y) in &points {
+        builder.line_to(point(left + px(x.max(x_start)), top + px(y)));
+    }
+    builder.line_to(point(left + px(width), top + px(last_y)));
+    builder.line_to(point(left + px(width), top));
+    builder.close();
+
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
 }
 
 #[cfg(test)]

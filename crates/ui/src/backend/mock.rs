@@ -429,6 +429,9 @@ struct MockDevice {
     presented: DeviceSnapshot,
     /// Simulated live Hall Effect key-travel samples for offline testing.
     live_travel: Vec<KeyTravelSample>,
+    /// Remaining simulated live-travel disconnect errors before succeeding again.
+    live_travel_error_count: usize,
+    live_travel_error_message: Option<String>,
     transport: GuardedTransport<MockHidTransport>,
 }
 
@@ -447,6 +450,8 @@ impl MockDevice {
             presented: snapshot.clone(),
             stored: snapshot,
             live_travel: Vec::new(),
+            live_travel_error_count: 0,
+            live_travel_error_message: None,
             transport,
         }
     }
@@ -589,6 +594,25 @@ impl MockPeripheralService {
         }
     }
 
+    /// Causes the next `count` live travel reads on `device` to fail with `message`,
+    /// simulating a transient USB disconnect (`0x0000048F`) for self-recovery tests.
+    pub fn fail_live_key_travel(
+        &self,
+        device: &DeviceId,
+        count: usize,
+        message: impl Into<String>,
+    ) {
+        let mut state = lock(&self.state);
+        if let Some(target) = state
+            .devices
+            .iter_mut()
+            .find(|d| d.presented.info.id == *device)
+        {
+            target.live_travel_error_count = count;
+            target.live_travel_error_message = Some(message.into());
+        }
+    }
+
     /// Mutates a mock device's stored onboard state as if changed directly via hardware
     /// shortcuts (e.g. `Fn + RGB` on a keyboard), without updating `presented` until synced.
     pub fn simulate_hardware_change(
@@ -685,10 +709,10 @@ impl PeripheralService for MockPeripheralService {
     }
 
     fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
         let target = state
             .devices
-            .iter()
+            .iter_mut()
             .find(|d| d.presented.info.id == *device)
             .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
         let Some(he) = target.presented.hall_effect.as_ref() else {
@@ -696,6 +720,14 @@ impl PeripheralService for MockPeripheralService {
         };
         if !he.capabilities.has_live_travel() {
             return Err(CoreError::UnsupportedCapability("live_key_travel"));
+        }
+        if target.live_travel_error_count > 0 {
+            target.live_travel_error_count -= 1;
+            let message = target
+                .live_travel_error_message
+                .clone()
+                .unwrap_or_else(|| "The device is not connected.".to_owned());
+            return Err(CoreError::Transport(message));
         }
         Ok(target.live_travel.clone())
     }

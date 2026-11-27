@@ -350,6 +350,8 @@ pub struct AtkRs7Device<T: HidTransport> {
     reserved_rs_slots: Vec<u8>,
     /// Last read `rgbArea` byte from feature flags so writes preserve it.
     rgb_area: u8,
+    /// Rotating 4-key chunk cursor for interleaved high-rate live travel polling.
+    live_scan_chunk: u16,
 }
 
 impl<T: HidTransport> fmt::Debug for AtkRs7Device<T> {
@@ -423,6 +425,7 @@ impl<T: HidTransport> AtkRs7Device<T> {
             rs_slots: None,
             reserved_rs_slots: Vec::new(),
             rgb_area: 0,
+            live_scan_chunk: 0,
         };
 
         dev.discover_readonly()?;
@@ -454,13 +457,22 @@ impl<T: HidTransport> AtkRs7Device<T> {
         payload: [u8; RS7_PAYLOAD_LEN],
         mutating: bool,
     ) -> CoreResult<[u8; RS7_PAYLOAD_LEN]> {
+        self.exchange_with_drain(payload, mutating, true)
+    }
+
+    fn exchange_with_drain(
+        &mut self,
+        payload: [u8; RS7_PAYLOAD_LEN],
+        mutating: bool,
+        drain: bool,
+    ) -> CoreResult<[u8; RS7_PAYLOAD_LEN]> {
         let tx = wrap_tx(payload);
         let expected_cmd = payload[0];
 
         // Flush any stale or unsolicited input reports accumulated in the OS HID ring
         // buffer while the handle sat idle (e.g. onboard Fn+RGB/WinLock notifications),
         // so the real reply is never buried behind older frames.
-        if !mutating || !self.transport.is_dry_run() {
+        if drain && (!mutating || !self.transport.is_dry_run()) {
             let _ = self.transport.drain_input_reports();
         }
 
@@ -544,6 +556,29 @@ impl<T: HidTransport> AtkRs7Device<T> {
             rs_slots,
             other_reserved,
         })
+    }
+
+    fn read_live_travel_chunk(
+        &mut self,
+        chunk_ix: u16,
+        drain: bool,
+        samples: &mut Vec<KeyTravelSample>,
+    ) -> CoreResult<()> {
+        let offset = chunk_ix * 4;
+        let resp =
+            self.exchange_with_drain(req_calibration_live_status_get(offset, 4), false, drain)?;
+        for k in 0..4usize {
+            let base = 8 + k * 5;
+            let travel_raw = u16::from_be_bytes([resp[base + 2], resp[base + 3]]);
+            if travel_raw > 0 {
+                let key_ix = offset + u16::try_from(k).unwrap_or(0);
+                samples.push(KeyTravelSample::new(
+                    KeyIndex::new(key_ix),
+                    TravelHundredthsMm::from_hundredths(travel_raw),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn read_calibrated_keys_init(&mut self) -> CoreResult<Vec<bool>> {
@@ -1071,21 +1106,43 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
     }
 
     fn read_live_key_travel(&mut self) -> CoreResult<Vec<KeyTravelSample>> {
-        let key_count = self.spec.key_count();
+        let chunk_count = self.spec.key_count() / 4;
         let mut samples = Vec::new();
-        for chunk_ix in 0..(key_count / 4) {
-            let offset = chunk_ix * 4;
-            let resp = self.exchange(req_calibration_live_status_get(offset, 4), false)?;
-            for k in 0..4usize {
-                let base = 8 + k * 5;
-                let travel_raw = u16::from_be_bytes([resp[base + 2], resp[base + 3]]);
-                if travel_raw > 0 {
-                    let key_ix = offset + u16::try_from(k).unwrap_or(0);
-                    samples.push(KeyTravelSample::new(
-                        KeyIndex::new(key_ix),
-                        TravelHundredthsMm::from_hundredths(travel_raw),
-                    ));
-                }
+        for chunk_ix in 0..chunk_count {
+            self.read_live_travel_chunk(chunk_ix, chunk_ix == 0, &mut samples)?;
+        }
+        Ok(samples)
+    }
+
+    fn read_live_key_travel_focused(
+        &mut self,
+        focus_key: Option<KeyIndex>,
+    ) -> CoreResult<Vec<KeyTravelSample>> {
+        let chunk_count = (self.spec.key_count() / 4).max(1);
+        let focus_chunk = focus_key
+            .filter(|k| k.value() < self.spec.key_count())
+            .map(|k| k.value() / 4);
+        let mut samples = Vec::new();
+
+        if let Some(fc) = focus_chunk {
+            self.read_live_travel_chunk(fc, true, &mut samples)?;
+            let mut scan_chunk = self.live_scan_chunk % chunk_count;
+            self.live_scan_chunk = (scan_chunk + 1) % chunk_count;
+            if scan_chunk == fc && chunk_count > 1 {
+                scan_chunk = self.live_scan_chunk % chunk_count;
+                self.live_scan_chunk = (scan_chunk + 1) % chunk_count;
+            }
+            if scan_chunk != fc {
+                self.read_live_travel_chunk(scan_chunk, false, &mut samples)?;
+            }
+        } else {
+            let first = self.live_scan_chunk % chunk_count;
+            self.live_scan_chunk = (first + 1) % chunk_count;
+            self.read_live_travel_chunk(first, true, &mut samples)?;
+            if chunk_count > 1 {
+                let second = self.live_scan_chunk % chunk_count;
+                self.live_scan_chunk = (second + 1) % chunk_count;
+                self.read_live_travel_chunk(second, false, &mut samples)?;
             }
         }
         Ok(samples)
@@ -1872,5 +1929,69 @@ mod tests {
         let mut dev2 = AtkRs7Device::open(mock2, false, None).unwrap();
         dev2.set_key_actuation(KeyIndex::new(33), TravelHundredthsMm::from_hundredths(40))
             .unwrap();
+    }
+
+    #[test]
+    fn focused_live_key_travel_reads_focus_chunk_plus_one_rotating_scan_chunk() {
+        let mut mock = MockHidTransport::new(rs7_descriptor());
+        push_open_replies(&mut mock, true);
+
+        // Call 1: focus_key = 33 (chunk 8) + scan chunk 0.
+        let mut focus_resp = vec![0u8; RS7_PAYLOAD_LEN];
+        focus_resp[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        focus_resp[8 + 5 + 2..8 + 5 + 4].copy_from_slice(&210u16.to_be_bytes());
+        mock.push_input_response(focus_resp);
+
+        let mut scan0_resp = vec![0u8; RS7_PAYLOAD_LEN];
+        scan0_resp[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        mock.push_input_response(scan0_resp);
+
+        // Call 2: focus_key = 33 (chunk 8) + scan chunk 1 (discovers key 5 = chunk 1, k = 1).
+        let mut focus_resp2 = vec![0u8; RS7_PAYLOAD_LEN];
+        focus_resp2[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        mock.push_input_response(focus_resp2);
+
+        let mut scan1_resp = vec![0u8; RS7_PAYLOAD_LEN];
+        scan1_resp[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        scan1_resp[8 + 5 + 2..8 + 5 + 4].copy_from_slice(&145u16.to_be_bytes());
+        mock.push_input_response(scan1_resp);
+
+        let mut dev = AtkRs7Device::open(mock, false, None).unwrap();
+        let first = dev
+            .read_live_key_travel_focused(Some(KeyIndex::new(33)))
+            .unwrap();
+        assert_eq!(
+            first,
+            vec![KeyTravelSample::new(
+                KeyIndex::new(33),
+                TravelHundredthsMm::from_hundredths(210),
+            )]
+        );
+
+        let second = dev
+            .read_live_key_travel_focused(Some(KeyIndex::new(33)))
+            .unwrap();
+        assert_eq!(
+            second,
+            vec![KeyTravelSample::new(
+                KeyIndex::new(5),
+                TravelHundredthsMm::from_hundredths(145),
+            )]
+        );
+
+        // Verify the two focused calls only sent 4 total live-travel packets (2 per call)
+        // with offsets 32, 0, 32, 4 instead of 48 packets for two full-matrix scans.
+        let sent = dev.transport().inner().recorded_writes();
+        let live_offsets: Vec<u16> = sent
+            .iter()
+            .filter(|w| {
+                w.bytes.len() == RS7_TX_REPORT_LEN
+                    && w.bytes[1] == protocol::cmd::GET_KEYBOARD_VALUE
+                    && w.bytes[2] == protocol::sub::CUSTOM_ID
+                    && w.bytes[3] == protocol::sub::CALIBRATION_LIVE_BUFFER
+            })
+            .map(|w| u16::from_be_bytes([w.bytes[6], w.bytes[7]]))
+            .collect();
+        assert_eq!(live_offsets, vec![32, 0, 32, 4]);
     }
 }

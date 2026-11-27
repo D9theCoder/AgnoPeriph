@@ -733,4 +733,19 @@ pub trait HallEffectKeyboard: Send + Sync {
     fn read_live_key_travel(&mut self) -> CoreResult<Vec<KeyTravelSample>> {
         Err(CoreError::UnsupportedCapability("live_key_travel"))
     }
+
+    /// Polls live per-key analog travel depth with an optional focus key hint for high-rate
+    /// key tester rendering.
+    ///
+    /// Drivers that query the key matrix in fixed-size HID chunks can sample `focus_key`'s
+    /// chunk on every call while interleaving background scan chunks across the rest of the
+    /// matrix, achieving much higher update rates on the active key without missing presses
+    /// on other keys. Defaults to [`Self::read_live_key_travel`].
+    fn read_live_key_travel_focused(
+        &mut self,
+        focus_key: Option<KeyIndex>,
+    ) -> CoreResult<Vec<KeyTravelSample>> {
+        let _ = focus_key;
+        self.read_live_key_travel()
+    }
 }
