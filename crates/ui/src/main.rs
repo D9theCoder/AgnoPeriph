@@ -49,8 +49,8 @@ fn main() {
 
     let application = gpui_kit::application().with_assets(agnoperiph::icons::AppAssets);
     let application = if start_minimized {
-        // Initialize DirectX only on the first open. Recreating it on each reopen
-        // can accumulate allocations inside the Windows graphics stack.
+        // Create the DirectX devices on the first open, then keep them: releasing them
+        // on close returns no memory (the driver keeps its pools) and slows every reopen.
         application.with_windowing(WindowingRequest::Headless)
     } else {
         application
@@ -146,17 +146,22 @@ impl Shell {
         let opened = gpui_kit::open_window(options, cx, move |window, cx| {
             app.update(cx, |app, cx| app.attach_window(window, cx));
             let app_for_close = app.clone();
-            window.on_window_should_close(cx, move |_, cx| {
+            window.on_window_should_close(cx, move |window, cx| {
                 let keep_running = has_tray && app_for_close.read(cx).config().close_to_tray;
                 if keep_running {
                     if let Some(shell) = close_shell.upgrade() {
                         shell.borrow_mut().window = None;
                     }
                     app_for_close.update(cx, AgnoPeriphApp::detach_window);
+                    // gpui must tear the window down while its HWND still exists. When
+                    // Windows destroys it first, gpui-fast never frees the native window
+                    // and its DirectX renderer, leaking about 15 MB per reopen.
+                    window.remove_window();
+                    false
                 } else {
                     cx.quit();
+                    true
                 }
-                true
             });
             app
         });
