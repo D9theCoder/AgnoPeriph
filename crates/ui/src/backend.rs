@@ -1997,7 +1997,7 @@ impl PeripheralService for LiveHidService {
             .as_deref_mut()
             .expect("checked Some above");
 
-        let mut next = target.snapshot.clone();
+        let next = &mut target.snapshot;
         let mut changed = false;
 
         if let Some(rgb) = peripheral.as_rgb_mut() {
@@ -2054,12 +2054,7 @@ impl PeripheralService for LiveHidService {
             }
         }
 
-        if changed {
-            target.snapshot = next.clone();
-            Ok(Some(next))
-        } else {
-            Ok(None)
-        }
+        Ok(changed.then(|| next.clone()))
     }
 }
 

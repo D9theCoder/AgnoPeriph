@@ -33,6 +33,7 @@ use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
 use crate::key_tester::{KeyTesterView, TesterUi};
 use crate::smooth_scroll::{ScrollIds, SmoothScroll};
 use crate::system::{DetachedSystem, SystemIntegration};
+use crate::tray_model::TrayChanged;
 use crate::updates::{GithubReleases, ReleaseSource, UpdateUi};
 use crate::{
     calibration, game_profiles_view, hall_effect_panel, inspector_drawer, keyboard_config_panel,
@@ -204,6 +205,12 @@ impl Default for AppOptions {
     }
 }
 
+#[derive(Default)]
+struct ConfigSave {
+    pending: Option<AppConfig>,
+    worker_running: bool,
+}
+
 impl AppOptions {
     /// Options for the real desktop app: config on disk, installed game scan, process watcher.
     pub fn live(system: Arc<dyn SystemIntegration>, config: AppConfig) -> Self {
@@ -338,8 +345,7 @@ pub struct AgnoPeriphApp {
     pub(crate) controls: Option<Controls>,
     pub(crate) window_handle: Option<AnyWindowHandle>,
     pub(crate) smooth_scroll: SmoothScroll,
-    pending_save: Arc<Mutex<Option<AppConfig>>>,
-    save_lock: Arc<Mutex<()>>,
+    config_save: Arc<Mutex<ConfigSave>>,
     syncing_hardware: bool,
     watcher: Option<Task<()>>,
     hardware_watcher: Option<Task<()>>,
@@ -431,8 +437,7 @@ impl AgnoPeriphApp {
             controls: None,
             window_handle: None,
             smooth_scroll: SmoothScroll::default(),
-            pending_save: Arc::new(Mutex::new(None)),
-            save_lock: Arc::new(Mutex::new(())),
+            config_save: Arc::default(),
             syncing_hardware: false,
             watcher: None,
             hardware_watcher: None,
@@ -470,6 +475,7 @@ impl AgnoPeriphApp {
     /// called again whenever the window is reopened.
     pub fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_handle = Some(window.window_handle());
+        self.refresh_packet_rows();
         self.rebuild_controls(window, cx);
         self.sync_controls(window, cx);
         self.focus_handle.focus(window, cx);
@@ -481,6 +487,10 @@ impl AgnoPeriphApp {
     /// Called when the window closes but the app keeps running in the notification area.
     pub fn detach_window(&mut self, cx: &mut Context<Self>) {
         self.window_handle = None;
+        self.control_subscriptions.clear();
+        self.controls = None;
+        self.smooth_scroll.detach();
+        self.refresh_packet_rows();
         self.is_changes_open = false;
         self.is_shortcuts_open = false;
         self.tester.clear_error();
@@ -725,7 +735,16 @@ impl AgnoPeriphApp {
             .iter()
             .filter(|p| p.outcome == PacketOutcome::DryRunSuppressed)
             .count();
-        self.formatted_packets = Arc::new(inspector_drawer::format_packets(&self.packets));
+        self.refresh_packet_rows();
+    }
+
+    fn refresh_packet_rows(&mut self) {
+        self.formatted_packets =
+            if self.show_dev_tools && self.is_inspector_open && self.has_window() {
+                Arc::new(inspector_drawer::format_packets(&self.packets))
+            } else {
+                Arc::default()
+            };
     }
 
     /// Clears panel-local edits (paired-key flow, lighting drag, macros). The unsaved
@@ -812,6 +831,7 @@ impl AgnoPeriphApp {
         self.update_live_polling(cx);
         self.request_sync(cx);
         self.pump_queue(cx);
+        cx.emit(TrayChanged);
         cx.notify();
     }
 
@@ -941,6 +961,7 @@ impl AgnoPeriphApp {
         }
         self.request_sync(cx);
         self.pump_queue(cx);
+        cx.emit(TrayChanged);
         cx.notify();
     }
 
@@ -1338,6 +1359,7 @@ impl AgnoPeriphApp {
 
     pub fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.is_inspector_open = !self.is_inspector_open;
+        self.refresh_packet_rows();
         cx.notify();
     }
 
@@ -1355,14 +1377,26 @@ impl AgnoPeriphApp {
 
     /// Persists the configuration off the UI thread. The newest snapshot always wins.
     pub(crate) fn save_config(&self) {
-        let pending = self.pending_save.clone();
-        let lock = self.save_lock.clone();
+        let queue = self.config_save.clone();
+        {
+            let mut state = crate::backend_lock(&queue);
+            state.pending = Some(self.config.clone());
+            if state.worker_running {
+                return;
+            }
+            state.worker_running = true;
+        }
         let system = self.system.clone();
-        *crate::backend_lock(&pending) = Some(self.config.clone());
         std::thread::spawn(move || {
-            let _guard = crate::backend_lock(&lock);
-            let next = crate::backend_lock(&pending).take();
-            if let Some(config) = next {
+            loop {
+                let config = {
+                    let mut state = crate::backend_lock(&queue);
+                    let Some(config) = state.pending.take() else {
+                        state.worker_running = false;
+                        break;
+                    };
+                    config
+                };
                 let _ = system.save_config(&config);
             }
         });
@@ -1402,14 +1436,40 @@ impl AgnoPeriphApp {
     // ---- Game Profile switcher -------------------------------------------------------
 
     fn spawn_process_watcher(cx: &mut Context<Self>) -> Task<()> {
-        let watcher = Arc::new(Mutex::new(ActiveProcessWatcher::new()));
         cx.spawn(async move |this, cx| {
+            let mut watcher = None;
             loop {
                 cx.background_executor().timer(PROCESS_POLL_INTERVAL).await;
-                let watcher = watcher.clone();
-                let exes = cx
-                    .background_spawn(async move { crate::backend_lock(&watcher).running_exes() })
-                    .await;
+                let Ok((enabled, has_games, has_defaults)) = this.read_with(cx, |this, _| {
+                    (
+                        this.config.auto_switch_enabled,
+                        this.config
+                            .game_profiles
+                            .iter()
+                            .any(|profile| profile.enabled),
+                        this.active_game.is_some() || !this.config.default_targets.is_empty(),
+                    )
+                }) else {
+                    break;
+                };
+                let exes = if enabled && has_games {
+                    let mut process_table =
+                        watcher.take().unwrap_or_else(ActiveProcessWatcher::new);
+                    let (process_table, exes) = cx
+                        .background_spawn(async move {
+                            let exes = process_table.running_exes();
+                            (process_table, exes)
+                        })
+                        .await;
+                    watcher = Some(process_table);
+                    exes
+                } else {
+                    watcher = None;
+                    if !enabled || !has_defaults {
+                        continue;
+                    }
+                    HashSet::new()
+                };
                 if this
                     .update(cx, |this, cx| this.handle_running_exes(&exes, cx))
                     .is_err()
@@ -1528,6 +1588,7 @@ impl AgnoPeriphApp {
             if selected_updated {
                 self.request_sync(cx);
             }
+            cx.emit(TrayChanged);
             cx.notify();
         }
     }
@@ -1567,33 +1628,31 @@ impl AgnoPeriphApp {
         }
         if !self.config.auto_switch_enabled || self.is_loading {
             if changed {
+                cx.emit(TrayChanged);
                 cx.notify();
             }
             return;
         }
         let targets = match self.active_game.as_deref() {
-            Some(id) => self
-                .config
-                .game_profile(id)
-                .map_or_default(|p| p.device_targets.clone()),
-            None => self.config.default_targets.clone(),
+            Some(id) => self.config.game_profile(id).map(|p| &p.device_targets),
+            None => Some(&self.config.default_targets),
         };
-        let device_ids: Vec<DeviceId> = self
+        let switches: Vec<(DeviceId, u8)> = self
             .devices
             .iter()
-            .map(|d| d.id().clone())
+            .map(DeviceSnapshot::id)
             // A device with unsaved edits switches once they are applied or discarded.
-            .filter(|id| !(self.is_dirty() && self.draft_device.as_ref() == Some(id)))
+            .filter(|&id| !(self.is_dirty() && self.draft_device.as_ref() == Some(id)))
+            .filter_map(|id| {
+                let key = id.as_str();
+                let &slot = targets?.get(key)?;
+                (self.applied_targets.get(key) != Some(&slot)
+                    && !self.pending_targets.contains(key))
+                .then(|| (id.clone(), slot))
+            })
             .collect();
-        for device in device_ids {
+        for (device, slot) in switches {
             let key = device.as_str().to_owned();
-            let Some(&slot) = targets.get(&key) else {
-                continue;
-            };
-            if self.applied_targets.get(&key) == Some(&slot) || self.pending_targets.contains(&key)
-            {
-                continue;
-            }
             if self.current_slot(&device) == Some(slot) {
                 self.applied_targets.insert(key, slot);
                 continue;
@@ -1605,11 +1664,13 @@ impl AgnoPeriphApp {
             } else {
                 self.record_auto_switch(&device, slot);
                 self.applied_targets.insert(key, slot);
+                changed = true;
             }
         }
         self.maybe_flush_switch_notification(cx);
         if changed {
             self.pump_queue(cx);
+            cx.emit(TrayChanged);
             cx.notify();
         }
     }

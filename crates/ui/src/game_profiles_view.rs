@@ -147,6 +147,7 @@ impl AgnoPeriphApp {
         self.pending_switch_notice = None;
         if !enabled {
             self.active_game = None;
+            cx.emit(crate::tray_model::TrayChanged);
         }
         self.save_config();
         cx.notify();
@@ -194,6 +195,9 @@ impl AgnoPeriphApp {
     pub fn rename_game_profile(&mut self, id: &str, name: &str, cx: &mut Context<Self>) {
         self.config.rename_game_profile(id, name);
         self.save_config();
+        if self.active_game.as_deref() == Some(id) {
+            cx.emit(crate::tray_model::TrayChanged);
+        }
         cx.notify();
     }
 
@@ -213,6 +217,7 @@ impl AgnoPeriphApp {
         }
         if self.active_game.as_deref() == Some(id) {
             self.active_game = None;
+            cx.emit(crate::tray_model::TrayChanged);
         }
         self.applied_targets.clear();
         self.save_config();

@@ -110,7 +110,8 @@ pub(crate) struct TesterUi {
     trace: VecDeque<(Instant, u16)>,
     /// Key the live readings last moved; the tester follows it.
     live_key: Option<KeyIndex>,
-    live_samples: Vec<KeyTravelSample>,
+    depth: u16,
+    last_depth_change: Option<Instant>,
     pub(crate) live_polls: usize,
     live_error: Option<SharedString>,
     consecutive_errors: u32,
@@ -131,7 +132,12 @@ impl std::fmt::Debug for TesterUi {
 }
 
 impl TesterUi {
-    fn push_trace(&mut self, now: Instant, depth: u16) {
+    /// Returns whether the starting depth for trigger replay changed as samples expired.
+    fn push_trace(&mut self, now: Instant, depth: u16) -> bool {
+        let first = self.trace.front().map(|&(_, depth)| depth);
+        if self.trace.back().map_or(0, |&(_, depth)| depth) != depth {
+            self.last_depth_change = Some(now);
+        }
         self.trace.push_back((now, depth));
         while self.trace.len() > MAX_TRACE_SAMPLES {
             self.trace.pop_front();
@@ -142,6 +148,12 @@ impl TesterUi {
         {
             self.trace.pop_front();
         }
+        first != self.trace.front().map(|&(_, depth)| depth)
+    }
+
+    fn trace_is_moving(&self, now: Instant) -> bool {
+        self.last_depth_change
+            .is_some_and(|last| now.saturating_duration_since(last) <= TRACE_WINDOW)
     }
 
     pub(crate) fn clear_error(&mut self) {
@@ -153,7 +165,8 @@ impl TesterUi {
     pub(crate) fn reset(&mut self) {
         self.trace.clear();
         self.live_key = None;
-        self.live_samples.clear();
+        self.depth = 0;
+        self.last_depth_change = None;
         self.clear_error();
     }
 }
@@ -199,16 +212,17 @@ impl Render for KeyTesterView {
         let key = app.tester_key();
         let depth = app.tester_depth();
         let params = params_for(he, key);
-        let trace: Vec<(Instant, u16)> = app.tester.trace.iter().copied().collect();
-        let pressed = is_pressed(trace.iter().map(|&(_, d)| d), &params);
-
-        let has_visible_motion = depth > 0
-            || trace
-                .iter()
-                .any(|&(t, d)| d > 0 && now.saturating_duration_since(t) <= TRACE_WINDOW);
+        let pressed = if params.rapid_trigger.is_enabled() {
+            is_pressed(app.tester.trace.iter().map(|&(_, d)| d), &params)
+        } else {
+            is_pressed(
+                [app.tester.trace.back().map_or(0, |&(_, depth)| depth)],
+                &params,
+            )
+        };
         if app.is_live_polling()
             && app.tester.live_error.is_none()
-            && has_visible_motion
+            && app.tester.trace_is_moving(now)
             && !cx.reduce_motion()
         {
             // Drive the meter and scrolling waveform at the monitor's native VSync refresh rate
@@ -221,7 +235,7 @@ impl Render for KeyTesterView {
             depth,
             pressed,
             params,
-            trace,
+            self.app.clone(),
             now,
             app.tester.live_key,
             app.tester.live_error.as_ref(),
@@ -289,6 +303,7 @@ impl AgnoPeriphApp {
                     PollAction::Stop => break,
                     PollAction::Pause => {}
                     PollAction::Read(service, device, focus_key) => {
+                        let requested_device = device.clone();
                         let started = cx.background_executor().now();
                         let reply = cx
                             .background_spawn(async move {
@@ -298,6 +313,9 @@ impl AgnoPeriphApp {
                         let now = cx.background_executor().now();
                         let elapsed = now.saturating_duration_since(started);
                         let Ok(keep) = this.update(cx, |this, cx| {
+                            if this.selected_device_id() != Some(&requested_device) {
+                                return run == this.tester.run;
+                            }
                             this.finish_live_read(run, reply, now, elapsed, cx)
                         }) else {
                             break;
@@ -356,22 +374,32 @@ impl AgnoPeriphApp {
             return false;
         }
         self.tester.last_read_elapsed = elapsed;
+        let was = (
+            self.tester.live_key,
+            self.tester.depth,
+            self.tester.live_error.clone(),
+        );
+        let mut trace_changed = false;
         let keep = match reply {
             Ok(samples) => {
                 self.tester.live_polls += 1;
                 self.tester.consecutive_errors = 0;
                 self.tester.live_error = None;
-                if let Some(deepest) = samples.iter().max_by_key(|s| s.travel.as_hundredths()) {
+                let deepest = samples.iter().max_by_key(|s| s.travel.as_hundredths());
+                if let Some(deepest) = deepest {
                     self.tester.live_key = Some(deepest.key);
                 }
-                let depth = self.tester.live_key.map_or(0, |key| {
-                    samples
-                        .iter()
-                        .find(|s| s.key == key)
-                        .map_or(0, |s| s.travel.as_hundredths())
-                });
-                self.tester.live_samples = samples;
-                self.tester.push_trace(now, depth);
+                self.tester.depth = deepest.map_or(0, |sample| sample.travel.as_hundredths());
+                let replay_start_changed = self.tester.push_trace(now, self.tester.depth);
+                trace_changed = (cx.reduce_motion() && self.tester.trace_is_moving(now))
+                    || self.hall_effect_state().is_some_and(|he| {
+                        let rt = params_for(he, self.tester_key()).rapid_trigger;
+                        rt.is_enabled()
+                            && (replay_start_changed
+                                || (self.tester.depth > 0
+                                    && (rt.press_sensitivity.as_hundredths() == 0
+                                        || rt.release_sensitivity.as_hundredths() == 0)))
+                    });
                 true
             }
             Err(CoreError::UnsupportedCapability(_)) => {
@@ -384,7 +412,7 @@ impl AgnoPeriphApp {
             Err(_) => {
                 // Keep polling with gentle backoff so a stale/suspended HID handle or brief
                 // USB reset (`0x0000048F`) recovers automatically without a manual refresh.
-                self.tester.live_samples.clear();
+                self.tester.depth = 0;
                 self.tester.consecutive_errors = self.tester.consecutive_errors.saturating_add(1);
                 let note: SharedString = if self.tester.consecutive_errors <= 2 {
                     "Reconnecting to keyboard…".into()
@@ -395,8 +423,16 @@ impl AgnoPeriphApp {
                 true
             }
         };
-        // Only invalidate the lightweight KeyTesterView so 165 Hz updates never rebuild the app.
-        self.tester_view.update(cx, |_, cx| cx.notify());
+        // Visible motion schedules its own frames. Identical readings need no extra redraw.
+        if trace_changed
+            || (
+                self.tester.live_key,
+                self.tester.depth,
+                &self.tester.live_error,
+            ) != (was.0, was.1, &was.2)
+        {
+            self.tester_view.update(cx, |_, cx| cx.notify());
+        }
         keep
     }
 
@@ -405,12 +441,7 @@ impl AgnoPeriphApp {
     }
 
     pub fn tester_depth(&self) -> u16 {
-        let key = self.tester_key();
-        self.tester
-            .live_samples
-            .iter()
-            .find(|s| s.key == key)
-            .map_or(0, |s| s.travel.as_hundredths())
+        self.tester.depth
     }
 }
 
@@ -452,7 +483,7 @@ fn render_column(
     depth: u16,
     pressed: bool,
     params: TriggerParams,
-    trace: Vec<(Instant, u16)>,
+    app: WeakEntity<AgnoPeriphApp>,
     now: Instant,
     live_key: Option<KeyIndex>,
     live_error: Option<&SharedString>,
@@ -556,8 +587,17 @@ fn render_column(
     let max_travel = params.max_travel;
     let trace_canvas = canvas(
         |_, _, _| (),
-        move |bounds, (), window, _| {
-            paint_trace(bounds, &trace, now, max_travel, trace_color, window);
+        move |bounds, (), window, cx| {
+            if let Some(app) = app.upgrade() {
+                paint_trace(
+                    bounds,
+                    &app.read(cx).tester.trace,
+                    now,
+                    max_travel,
+                    trace_color,
+                    window,
+                );
+            }
         },
     )
     .size_full();
@@ -638,7 +678,7 @@ fn render_column(
 /// Paints the continuous time-mapped travel waveform as a single GPU filled path.
 fn paint_trace(
     bounds: Bounds<Pixels>,
-    samples: &[(Instant, u16)],
+    samples: &VecDeque<(Instant, u16)>,
     now: Instant,
     max_travel: u16,
     color: Hsla,
@@ -654,54 +694,34 @@ fn paint_trace(
     let max = f32::from(max_travel.max(1));
     let depth_y = |d: u16| (f32::from(d) / max).clamp(0.0, 1.0) * height;
 
-    let mut anchor: Option<u16> = None;
-    let mut points: Vec<(f32, f32)> = Vec::with_capacity(samples.len() + 2);
-    let mut any_nonzero = false;
-
-    for &(t, d) in samples {
-        let age = now.saturating_duration_since(t).as_secs_f32();
-        if age >= window_secs {
-            anchor = Some(d);
-            continue;
-        }
-        if d > 0 {
-            any_nonzero = true;
-        }
-        let x = ((1.0 - age / window_secs).clamp(0.0, 1.0)) * width;
-        let y = depth_y(d);
-        if points
-            .last()
-            .is_some_and(|&(px, py)| (px - x).abs() < 0.1 && (py - y).abs() < 0.1)
-        {
-            continue;
-        }
-        points.push((x, y));
-    }
-
-    if let Some(d) = anchor {
-        if d > 0 {
-            any_nonzero = true;
-        }
-        points.insert(0, (0.0, depth_y(d)));
-    }
-
-    if !any_nonzero || points.is_empty() {
+    let start = samples
+        .partition_point(|&(time, _)| now.saturating_duration_since(time) >= TRACE_WINDOW)
+        .saturating_sub(1);
+    if !samples.iter().skip(start).any(|&(_, depth)| depth > 0) {
         return;
     }
-
-    let (first_x, first_y) = points[0];
-    let x_start = first_x.min((width - 1.5).max(0.0)).max(0.0);
-    let last_y = points.last().map_or(first_y, |&(_, y)| y);
+    let sample_x = |time| {
+        let age = now.saturating_duration_since(time).as_secs_f32();
+        (1.0 - age / window_secs).clamp(0.0, 1.0) * width
+    };
+    let (first_time, first_depth) = samples[start];
+    let x_start = sample_x(first_time).min((width - 1.5).max(0.0));
     let left = bounds.left();
     let top = bounds.top();
 
     let mut builder = PathBuilder::fill();
     builder.move_to(point(left + px(x_start), top));
-    builder.line_to(point(left + px(x_start), top + px(first_y)));
-    for &(x, y) in &points {
-        builder.line_to(point(left + px(x.max(x_start)), top + px(y)));
+    builder.line_to(point(left + px(x_start), top + px(depth_y(first_depth))));
+    let mut previous = first_depth;
+    let mut remaining = samples.iter().skip(start + 1).peekable();
+    while let Some(&(time, depth)) = remaining.next() {
+        // Interior points on a flat segment do not change the path.
+        if depth != previous || remaining.peek().is_some_and(|&&(_, next)| next != depth) {
+            builder.line_to(point(left + px(sample_x(time)), top + px(depth_y(depth))));
+        }
+        previous = depth;
     }
-    builder.line_to(point(left + px(width), top + px(last_y)));
+    builder.line_to(point(left + px(width), top + px(depth_y(previous))));
     builder.line_to(point(left + px(width), top));
     builder.close();
 
@@ -713,8 +733,58 @@ fn paint_trace(
 #[cfg(test)]
 mod tests {
     use agnoperiph_core::{RapidTriggerConfig, TravelHundredthsMm};
+    use gpui_kit::AppContext;
 
     use super::{TriggerParams, is_pressed};
+
+    #[gpui_kit::test]
+    fn steady_travel_samples_do_not_invalidate_the_view(cx: &mut gpui_kit::TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        use crate::backend::MockPeripheralService;
+
+        use super::{
+            AgnoPeriphApp, Arc, Duration, KeyIndex, KeyTravelSample, LIVE_POLL_INTERVAL,
+            TRACE_WINDOW,
+        };
+
+        cx.update(gpui_kit::init);
+        let app = cx.update(|cx| {
+            cx.new(|cx| AgnoPeriphApp::new(Arc::new(MockPeripheralService::new()), cx))
+        });
+        cx.run_until_parked();
+        let invalidations = Rc::new(Cell::new(0));
+        let _observe = cx.update(|cx| {
+            let tester = app.read(cx).tester_view.clone();
+            let count = invalidations.clone();
+            cx.observe(&tester, move |_, _| count.set(count.get() + 1))
+        });
+        let start = cx.executor().now();
+        let apply_sample = |cx: &mut gpui_kit::TestAppContext, offset, depth| {
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    let sample = KeyTravelSample::new(
+                        KeyIndex::new(35),
+                        TravelHundredthsMm::from_hundredths(depth),
+                    );
+                    app.finish_live_read(0, Ok(vec![sample]), start + offset, Duration::ZERO, cx);
+                });
+            });
+        };
+        apply_sample(cx, Duration::ZERO, 0);
+        apply_sample(cx, LIVE_POLL_INTERVAL, 0);
+        assert_eq!(invalidations.get(), 1);
+        apply_sample(cx, LIVE_POLL_INTERVAL * 2, 150);
+        assert_eq!(invalidations.get(), 2);
+        let steady_at = TRACE_WINDOW + LIVE_POLL_INTERVAL * 3;
+        apply_sample(cx, steady_at, 150);
+        cx.update(|cx| {
+            let tester = &app.read(cx).tester;
+            assert!(!tester.trace_is_moving(start + steady_at));
+            assert_eq!(tester.live_polls, 4);
+        });
+        assert_eq!(invalidations.get(), 2);
+    }
 
     fn params(rt: RapidTriggerConfig) -> TriggerParams {
         TriggerParams {

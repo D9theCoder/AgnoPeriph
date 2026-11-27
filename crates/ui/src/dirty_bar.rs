@@ -409,6 +409,7 @@ impl AgnoPeriphApp {
         if self.config.low_battery_alerts != enabled {
             self.config.low_battery_alerts = enabled;
             self.save_config();
+            cx.emit(crate::tray_model::TrayChanged);
             cx.notify();
         }
     }

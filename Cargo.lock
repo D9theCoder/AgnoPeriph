@@ -127,6 +127,7 @@ dependencies = [
  "agnoperiph-driver-wooting",
  "agnoperiph-transport",
  "anyhow",
+ "async-channel",
  "gpui-fast-wgpu",
  "gpui-kit",
  "image",
@@ -299,7 +300,6 @@ name = "agnoperiph-transport"
 version = "0.1.0"
 dependencies = [
  "agnoperiph-core",
- "hex",
  "hidapi",
  "serde",
  "thiserror 2.0.21",

@@ -30,6 +30,7 @@ const SNAP_DISTANCE: Pixels = px(0.75);
 struct Easing {
     target: Option<Pixels>,
     last_frame: Option<Instant>,
+    frame_pending: bool,
 }
 
 /// Element ids for one scrolling viewport; static so rendering allocates nothing.
@@ -54,9 +55,16 @@ impl std::fmt::Debug for SmoothScroll {
 }
 
 impl SmoothScroll {
+    /// Discards callbacks queued for a window that is closing.
+    pub(crate) fn detach(&mut self) {
+        self.easing = Rc::default();
+    }
+
     /// Returns to the top, e.g. when the workspace shows a different object.
     pub(crate) fn reset(&self) {
-        self.easing.borrow_mut().target = None;
+        let mut state = self.easing.borrow_mut();
+        state.target = None;
+        state.last_frame = None;
         self.handle.set_offset(point(px(0.), px(0.)));
     }
 
@@ -97,7 +105,7 @@ impl SmoothScroll {
                     if was_idle {
                         state.last_frame = Some(Instant::now());
                     }
-                    was_idle
+                    !state.frame_pending
                 };
                 cx.stop_propagation();
                 if start_ticking {
@@ -139,6 +147,7 @@ fn schedule_frame(
     view: EntityId,
     window: &Window,
 ) {
+    easing.borrow_mut().frame_pending = true;
     window.on_next_frame(move |window, cx| step(&handle, &easing, view, window, cx));
 }
 
@@ -152,6 +161,7 @@ fn step(
     let now = Instant::now();
     let (moved, next_frame) = {
         let mut state = easing.borrow_mut();
+        state.frame_pending = false;
         let Some(target) = state.target else {
             return;
         };

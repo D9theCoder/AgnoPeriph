@@ -7,7 +7,6 @@ authors.workspace = true
 
 [dependencies]
 agnoperiph-core = { workspace = true }
-hex = { workspace = true }
 hidapi = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

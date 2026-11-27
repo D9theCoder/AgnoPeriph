@@ -11,12 +11,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use agnoperiph::backend::{LiveHidService, MockPeripheralService, PeripheralService};
 use agnoperiph::game_profiles::AppConfig;
 use agnoperiph::system::{MINIMIZED_FLAG, WindowsSystem};
-use agnoperiph::tray_model::TrayModel;
+use agnoperiph::tray_model::{TrayChanged, TrayModel};
 use agnoperiph::{AgnoPeriphApp, AppOptions};
 use agnoperiph_core::DeviceId;
 use gpui_kit::*;
@@ -25,9 +24,12 @@ use tray_icon::menu::{
 };
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-/// How often tray clicks and menu choices are picked up.
-const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(120);
 const TRAY_ICON_SIZE: u32 = 32;
+
+enum TrayAction {
+    Show,
+    Menu(MenuEvent),
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -45,40 +47,43 @@ fn main() {
     let config = AppConfig::load_or_default(config_path.as_deref());
     let system = Arc::new(WindowsSystem::new(config_path));
 
-    gpui_kit::application()
-        .with_assets(agnoperiph::icons::AppAssets)
-        .run(move |cx| {
-            gpui_kit::init(cx);
-            // The process outlives its window while it sits in the notification area.
-            cx.set_quit_mode(QuitMode::Explicit);
-            let options = AppOptions::live(system, config).with_dev_tools(dev_tools);
-            let app = cx.new(|cx| AgnoPeriphApp::with_options(service, options, cx));
-            let shell = Rc::new(RefCell::new(Shell {
-                app,
-                window: None,
-                tray: Tray::new(),
-            }));
-            let has_tray = shell.borrow().tray.is_some();
-            if !start_minimized || !has_tray {
-                Shell::show(&shell, cx);
-            }
-            if has_tray {
-                cx.spawn(async move |cx| {
-                    loop {
-                        cx.background_executor().timer(TRAY_POLL_INTERVAL).await;
-                        let shell = shell.clone();
-                        let () = cx.update(move |cx| Shell::poll_tray(&shell, cx));
-                    }
-                })
-                .detach();
-            }
-        });
+    let application = gpui_kit::application().with_assets(agnoperiph::icons::AppAssets);
+    let application = if start_minimized {
+        // Initialize DirectX only on the first open. Recreating it on each reopen
+        // can accumulate allocations inside the Windows graphics stack.
+        application.with_windowing(WindowingRequest::Headless)
+    } else {
+        application
+    };
+    application.run(move |cx| {
+        gpui_kit::init(cx);
+        // The process outlives its window while it sits in the notification area.
+        cx.set_quit_mode(QuitMode::Explicit);
+        let options = AppOptions::live(system, config).with_dev_tools(dev_tools);
+        let app = cx.new(|cx| AgnoPeriphApp::with_options(service, options, cx));
+        let shell = Rc::new(RefCell::new(Shell {
+            app,
+            window: None,
+            opening: false,
+            pending_profile: None,
+            tray: Tray::new(),
+        }));
+        let has_tray = shell.borrow().tray.is_some();
+        if !start_minimized || !has_tray {
+            Shell::show(&shell, cx);
+        }
+        if has_tray {
+            Shell::listen_to_tray(shell, cx);
+        }
+    });
 }
 
 /// Owns the app state across window close / reopen cycles and the tray icon.
 struct Shell {
     app: Entity<AgnoPeriphApp>,
     window: Option<AnyWindowHandle>,
+    opening: bool,
+    pending_profile: Option<(DeviceId, u8)>,
     tray: Option<Tray>,
 }
 
@@ -91,8 +96,41 @@ impl Shell {
                 .is_ok()
         {
             cx.activate(true);
+            Self::apply_pending_profile(shell, handle, cx);
             return;
         }
+        if shell.borrow().opening {
+            return;
+        }
+        if cx.graphical_environment().is_none() {
+            shell.borrow_mut().opening = true;
+            let attach =
+                cx.request_windowing(WindowingRequest::Windowed(GraphicalEnvironment::detect()));
+            let shell = shell.clone();
+            cx.spawn(async move |cx| {
+                let result = attach.await;
+                cx.update(|cx| {
+                    shell.borrow_mut().opening = false;
+                    match result {
+                        Ok(()) => Self::open(&shell, cx),
+                        Err(err) => {
+                            eprintln!("failed to initialize AgnoPeriph graphics: {err}");
+                            let mut shell = shell.borrow_mut();
+                            shell.pending_profile = None;
+                            if shell.tray.is_none() {
+                                cx.quit();
+                            }
+                        }
+                    }
+                });
+            })
+            .detach();
+        } else {
+            Self::open(shell, cx);
+        }
+    }
+
+    fn open(shell: &Rc<RefCell<Self>>, cx: &mut App) {
         let app = shell.borrow().app.clone();
         let has_tray = shell.borrow().tray.is_some();
         let options = WindowOptions {
@@ -126,6 +164,7 @@ impl Shell {
             Ok((handle, _)) => {
                 shell.borrow_mut().window = Some(handle);
                 cx.activate(true);
+                Self::apply_pending_profile(shell, handle, cx);
             }
             Err(err) => {
                 eprintln!("failed to open the AgnoPeriph window: {err}");
@@ -134,66 +173,89 @@ impl Shell {
         }
     }
 
-    fn poll_tray(shell: &Rc<RefCell<Self>>, cx: &mut App) {
-        let mut show = false;
-        let mut quit = false;
-        let mut toggle_alerts = false;
-        let mut switch: Option<(DeviceId, u8)> = None;
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            match event {
-                TrayIconEvent::DoubleClick { .. }
-                | TrayIconEvent::Click {
+    fn listen_to_tray(shell: Rc<RefCell<Self>>, cx: &mut App) {
+        let app = shell.borrow().app.clone();
+        let weak_shell = Rc::downgrade(&shell);
+        cx.subscribe(&app, move |_, _: &TrayChanged, cx| {
+            if let Some(shell) = weak_shell.upgrade() {
+                shell.borrow_mut().sync_tray(cx);
+            }
+        })
+        .detach();
+        shell.borrow_mut().sync_tray(cx);
+
+        let (sender, receiver) = async_channel::unbounded();
+        let icon_sender = sender.clone();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
                     button: MouseButton::Left,
                     button_state: MouseButtonState::Up,
                     ..
-                } => show = true,
-                _ => {}
+                } | TrayIconEvent::DoubleClick { .. }
+            ) {
+                let _ = icon_sender.try_send(TrayAction::Show);
             }
-        }
-        {
-            let mut this = shell.borrow_mut();
-            let model = this.app.read(cx).tray_model();
-            let alerts_on = this.app.read(cx).config().low_battery_alerts;
-            let Some(tray) = this.tray.as_mut() else {
-                return;
-            };
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                if event.id == *tray.show.id() {
-                    show = true;
-                } else if event.id == *tray.quit.id() {
-                    quit = true;
-                } else if event.id == *tray.low_battery.id() {
-                    toggle_alerts = true;
-                } else if let Some(target) = tray.slot_for(&event.id) {
-                    switch = Some(target);
-                }
+        }));
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = sender.try_send(TrayAction::Menu(event));
+        }));
+        cx.spawn(async move |cx| {
+            while let Ok(action) = receiver.recv().await {
+                cx.update(|cx| Self::handle_tray_action(&shell, action, cx));
             }
-            tray.sync(&model, alerts_on);
+        })
+        .detach();
+    }
+
+    fn sync_tray(&mut self, cx: &App) {
+        if let Some(tray) = &mut self.tray {
+            let app = self.app.read(cx);
+            tray.sync(app.tray_model(), app.config().low_battery_alerts);
         }
-        if quit {
-            cx.quit();
+    }
+
+    fn handle_tray_action(shell: &Rc<RefCell<Self>>, action: TrayAction, cx: &mut App) {
+        let TrayAction::Menu(event) = action else {
+            Self::show(shell, cx);
             return;
-        }
-        let app = shell.borrow().app.clone();
-        if toggle_alerts {
+        };
+        let this = shell.borrow();
+        let Some(tray) = this.tray.as_ref() else {
+            return;
+        };
+        if event.id == *tray.quit.id() {
+            cx.quit();
+        } else if event.id == *tray.show.id() {
+            drop(this);
+            Self::show(shell, cx);
+        } else if event.id == *tray.low_battery.id() {
+            let app = this.app.clone();
+            drop(this);
             app.update(cx, |app, cx| {
                 let enabled = !app.config().low_battery_alerts;
                 app.set_low_battery_alerts(enabled, cx);
             });
+        } else if let Some((device, slot)) = tray.slot_for(&event.id) {
+            drop(this);
+            shell.borrow_mut().pending_profile = Some((device, slot));
+            Self::show(shell, cx);
         }
-        if let Some((device, slot)) = switch {
-            // Unsaved edits on that device are confirmed in the window, so open it first.
-            Self::show(shell, cx);
-            let handle = shell.borrow().window;
-            if let Some(handle) = handle {
-                let _ = handle.update(cx, |_, window, cx| {
-                    app.update(cx, |app, cx| {
-                        app.request_tray_profile_switch(&device, slot, window, cx);
-                    });
+    }
+
+    fn apply_pending_profile(shell: &Rc<RefCell<Self>>, handle: AnyWindowHandle, cx: &mut App) {
+        let (app, pending) = {
+            let mut shell = shell.borrow_mut();
+            (shell.app.clone(), shell.pending_profile.take())
+        };
+        // Unsaved edits on that device are confirmed in the window.
+        if let Some((device, slot)) = pending {
+            let _ = handle.update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| {
+                    app.request_tray_profile_switch(&device, slot, window, cx);
                 });
-            }
-        } else if show {
-            Self::show(shell, cx);
+            });
         }
     }
 }
@@ -296,13 +358,13 @@ impl Tray {
     }
 
     /// Brings the menu, checks and tooltip in line with `model`.
-    fn sync(&mut self, model: &TrayModel, alerts_on: bool) {
-        let needs_rebuild = model.structure_key() != self.shown.structure_key()
-            || self.devices.len() != model.devices.len();
-        if needs_rebuild && self.rebuild(model).is_none() {
+    fn sync(&mut self, model: TrayModel, alerts_on: bool) {
+        if model == self.shown && self.low_battery.is_checked() == alerts_on {
             return;
         }
-        if *model == self.shown && self.low_battery.is_checked() == alerts_on {
+        let needs_rebuild =
+            !model.has_same_structure(&self.shown) || self.devices.len() != model.devices.len();
+        if needs_rebuild && self.rebuild(&model).is_none() {
             return;
         }
         for (menu, device) in self.devices.iter().zip(&model.devices) {
@@ -319,7 +381,7 @@ impl Tray {
             let _ = self.icon.set_tooltip(Some(&tooltip));
             self.tooltip = tooltip;
         }
-        self.shown = model.clone();
+        self.shown = model;
     }
 
     /// The device and slot a profile item stands for.

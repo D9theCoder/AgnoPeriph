@@ -117,13 +117,14 @@ impl PacketTraceEntry {
 
 /// Formats a byte slice as uppercase space-separated hex (e.g. `10 FF 00 1A`).
 pub fn format_hex_spaced(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().saturating_mul(3));
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
     for (ix, byte) in bytes.iter().enumerate() {
         if ix > 0 {
             out.push(' ');
         }
-        let encoded = hex::encode_upper([*byte]);
-        out.push_str(&encoded);
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     out
 }

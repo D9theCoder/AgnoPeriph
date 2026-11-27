@@ -2,12 +2,18 @@
 //! active Game Profile. `main.rs` maps this model onto the native menu.
 
 use agnoperiph_core::{ChargingState, ConnectionKind, DeviceId};
-use gpui_kit::{Context, Window};
+use gpui_kit::{Context, EventEmitter, Window};
 
 use crate::app::AgnoPeriphApp;
 
 /// Windows truncates tray tooltips at 127 characters.
 pub const TOOLTIP_LIMIT: usize = 127;
+
+/// The native tray should refresh its device, profile, or alert state.
+#[derive(Debug)]
+pub struct TrayChanged;
+
+impl EventEmitter<TrayChanged> for AgnoPeriphApp {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayDevice {
@@ -58,6 +64,18 @@ impl TrayModel {
             .map(|d| format!("{}:{}", d.id, d.slots.len()))
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    /// Whether the existing native menu items still map to the same devices and slots.
+    pub fn has_same_structure(&self, other: &Self) -> bool {
+        self.devices.len() == other.devices.len()
+            && self.devices.iter().zip(&other.devices).all(|(a, b)| {
+                a.id == b.id
+                    && a.slots
+                        .iter()
+                        .map(|(id, _)| id)
+                        .eq(b.slots.iter().map(|(id, _)| id))
+            })
     }
 }
 
@@ -170,6 +188,9 @@ mod tests {
         b.devices[0].power = Some("14%".into());
         b.devices[0].active_slot = Some(2);
         assert_eq!(a.structure_key(), b.structure_key());
+        assert!(a.has_same_structure(&b));
+        b.devices[0].slots.swap(0, 1);
+        assert!(!a.has_same_structure(&b));
         b.devices[0].slots.pop();
         assert_ne!(a.structure_key(), b.structure_key());
     }

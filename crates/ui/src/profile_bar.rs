@@ -364,6 +364,7 @@ impl AgnoPeriphApp {
         if let Some(job) = self.profile_switch_job(device, slot, false) {
             self.enqueue(job, cx);
         } else {
+            cx.emit(crate::tray_model::TrayChanged);
             cx.notify();
         }
     }
@@ -385,10 +386,12 @@ impl AgnoPeriphApp {
         let preset = capture_preset(snapshot);
         let profiles = self.config.ensure_software_profiles(device);
         let active = profiles.active_slot;
-        if let Some(entry) = profiles.slots.iter_mut().find(|s| s.slot == active) {
+        if let Some(entry) = profiles.slots.iter_mut().find(|s| s.slot == active)
+            && entry.saved != preset
+        {
             entry.saved = preset;
+            self.save_config();
         }
-        self.save_config();
     }
 
     pub(crate) fn rename_preset(
@@ -404,6 +407,7 @@ impl AgnoPeriphApp {
         self.config
             .set_preset_name(device, ProfileSlot::new(slot), name);
         self.save_config();
+        cx.emit(crate::tray_model::TrayChanged);
         cx.notify();
     }
 
