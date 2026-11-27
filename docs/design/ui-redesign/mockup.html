@@ -159,12 +159,11 @@ html,body{margin:0}
 .brow{display:flex;gap:16px;align-items:stretch}
 .bcol{width:656px;flex:none}
 .case{background:var(--case);border-radius:14px;padding:10px 8px 0;box-shadow:inset 0 1px 0 var(--case-hi),0 16px 30px -18px var(--case-shadow)}
-.plate{position:relative;width:640px;height:246px}
-.lip{display:flex;align-items:center;gap:16px;height:30px;padding:0 6px;color:var(--lip-fg);font-size:11.5px;white-space:nowrap}
+.plate{position:relative;margin:0 auto}
+.lip{display:flex;align-items:center;gap:12px;height:30px;padding:0 6px;color:var(--lip-fg);font-size:11.5px;white-space:nowrap}
 .lg-i{display:inline-flex;align-items:center;gap:6px}
 .g-bar{width:14px;height:2px;border-radius:2px;background:currentColor;display:inline-block}
 .g-dot{width:5px;height:5px;border-radius:50%;background:var(--accent);display:inline-block}
-.lip svg{width:10px;height:10px}
 
 .key{position:absolute;height:37px;padding:1px 2px 4px;border:0;border-radius:6px;background:var(--key-skirt);display:block}
 .key .face{position:relative;display:block;height:100%;border-radius:5px;background:var(--key-face);box-shadow:inset 0 1px 0 var(--key-hi);overflow:hidden;transition:background-color .12s}
@@ -174,16 +173,17 @@ html,body{margin:0}
 .key .bar{position:absolute;left:5px;right:5px;bottom:3px;height:2px;border-radius:2px;background:var(--key-track)}
 .key .bar i{display:block;height:100%;border-radius:2px;background:var(--key-sub);opacity:.45}
 .key.diff .bar i{background:var(--fg);opacity:.85}
-.key .tr{position:absolute;right:4px;top:4px;display:flex;align-items:center;gap:3px;height:10px}
-.key .rt{width:5px;height:5px;border-radius:50%;background:var(--accent)}
-.key .pair{color:var(--muted);display:flex}
-.key .pair svg{width:9px;height:9px}
+
+.key .rt{position:absolute;right:4px;bottom:1.5px;width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.key.rtk .bar{right:12px}
+.lg-i .advs{display:inline-flex;gap:4px}
+.key .tr{position:absolute;right:-6px;top:-6px;z-index:2;width:19px;height:19px;border-radius:50%;display:grid;place-items:center;background:var(--key-face);box-shadow:0 0 0 1.5px var(--case),0 1px 3px rgba(0,0,0,.45);color:var(--key-legend)}
+.key.sel .tr{background:var(--accent);color:var(--accent-ink)}
 .win .key.pending{background:var(--warn)}
 .g-pend{width:14px;height:4px;border-radius:2px;background:var(--warn);display:inline-block}
 .key .depth{position:absolute;left:0;right:0;top:0;background:var(--accent);opacity:.3}
 .key.sel{background:color-mix(in srgb,var(--accent) 55%,var(--key-skirt))}
 .key.sel .face{background:color-mix(in srgb,var(--accent) 24%,var(--key-face));box-shadow:inset 0 0 0 1.5px var(--accent)}
-.plate.hl-pair .key.paired{outline:1.5px dashed var(--accent);outline-offset:2px}
 .key.lit{background:color-mix(in srgb,var(--led) 45%,var(--key-skirt));box-shadow:0 0 14px -5px var(--led)}
 .key.lit .face{background:var(--led);box-shadow:inset 0 1px 0 rgba(255,255,255,.28)}
 .key.lit .lg{color:var(--lg)}
@@ -199,7 +199,8 @@ html,body{margin:0}
 .selwrap{position:relative}
 .select{width:100%;height:32px;display:flex;align-items:center;gap:8px;padding:0 8px 0 10px;border:1px solid var(--line-strong);border-radius:8px;background:transparent;font-weight:600;text-align:left}
 .select:hover{background:var(--raised)}
-.select .cnt{margin-left:auto;color:var(--muted);font-weight:500;font-size:12px}
+.select .cnt{margin-left:auto;color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}
+.select>span:not(.cnt){white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .select.open{background:var(--raised)}
 .menu{position:absolute;left:0;right:0;top:36px;z-index:5;background:var(--popover);border:1px solid var(--line-strong);border-radius:9px;padding:4px;box-shadow:var(--shadow)}
 .mi{display:flex;width:100%;height:28px;align-items:center;gap:8px;padding:0 8px;border:0;background:transparent;border-radius:6px;text-align:left}
@@ -272,6 +273,7 @@ html,body{margin:0}
 .hexsw{width:28px;height:28px;border-radius:7px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
 .hexin{height:28px;width:110px;border-radius:7px;border:1px solid var(--line-strong);background:transparent;color:var(--fg);font:600 13px 'Saira';padding:0 9px;letter-spacing:.04em;text-transform:uppercase}
 .cp-off{opacity:.4;pointer-events:none}
+.lamp .seg button{flex:1 1 auto}
 .lamp .srow2{margin-top:12px}
 .lamp .srow2>.val{flex:none;font-family:'Saira';font-weight:600;font-variant-numeric:tabular-nums}
 
@@ -316,6 +318,128 @@ html,body{margin:0}
 .dry{color:var(--muted);font-size:12px;background:var(--raised);height:24px;display:inline-flex;align-items:center;padding:0 9px;border-radius:999px;margin-right:6px}
 .toast{position:absolute;top:14px;right:24px;display:flex;align-items:center;gap:8px;height:36px;padding:0 14px 0 12px;background:var(--popover);border:1px solid var(--line-strong);border-radius:10px;box-shadow:var(--shadow);font-weight:500}
 .toast svg{color:var(--accent)}
+
+/* advanced-key type icons (the script injects their mask images) */
+.adv{display:inline-block;width:12px;height:12px;flex:none;background:currentColor;-webkit-mask:center/contain no-repeat;mask:center/contain no-repeat}
+.adv.lg{width:17px;height:17px}
+.key .tr .adv{width:13px;height:13px}
+.key.hl{outline:1.5px dashed var(--accent);outline-offset:2px}
+.select .adv{color:var(--accent)}
+.mi{height:auto;min-height:28px;padding:6px 8px;align-items:flex-start}
+.mi .adv{margin-top:1px;color:var(--muted)}
+.mi.on{background:var(--accent-soft)}
+.mi.on .adv{color:var(--accent)}
+.mi-t{display:flex;flex-direction:column;gap:1px;min-width:0;text-align:left}
+.mi-t b{font-weight:600}
+.mi-t small{font-size:11.5px;color:var(--muted);font-weight:400;line-height:1.3}
+.pdesc.tight{margin:6px 0 0}
+.win .note-sm{color:var(--muted);font-size:12px;margin-top:8px}
+.dks{display:flex;flex-direction:column;gap:1px}
+.dk-r{display:flex;align-items:center;gap:8px;height:27px}
+.dk-a{width:18px;height:18px;border-radius:5px;background:var(--raised);display:grid;place-items:center;font-size:11px;color:var(--muted);flex:none}
+.dk-n{font-size:12.5px}
+.dk-v{margin-left:auto;font-family:'Saira';font-weight:600;font-size:12px;padding:0 7px;height:22px;display:inline-flex;align-items:center;border-radius:5px;background:var(--raised)}
+.dk-v.none{font-family:'Figtree';font-weight:400;color:var(--faint);background:transparent}
+.tools.two{grid-template-columns:repeat(2,1fr)}
+.rng-ends{display:flex;justify-content:space-between;margin-top:4px;font-family:'Saira';font-weight:500;font-size:10px;color:var(--faint)}
+.btn.icon.sm{width:26px}
+.key.knob,.key.knob .face{border-radius:50%}
+.key.knob .lg{left:50%;top:50%;transform:translate(-50%,-62%);font-size:9.5px}
+
+/* keybinds */
+.key.remap .face{background:color-mix(in srgb,var(--accent) 16%,var(--key-face))}
+.key.remap.sel .face{background:color-mix(in srgb,var(--accent) 30%,var(--key-face))}
+.key.remap .lg{color:var(--accent)}
+.key.thru .lg{opacity:.32}
+.key .sub{position:absolute;left:5px;bottom:5px;font-family:'Saira';font-weight:500;font-size:9px;line-height:1;color:var(--key-sub);white-space:nowrap}
+.g-remap{width:12px;height:9px;border-radius:2px;display:inline-block;background:color-mix(in srgb,var(--accent) 35%,transparent);box-shadow:inset 0 0 0 1px var(--accent)}
+.g-thru{width:12px;height:9px;border-radius:2px;display:inline-block;box-shadow:inset 0 0 0 1px var(--lip-fg);opacity:.6}
+.selbar .plabel{margin-right:2px}
+.kmap{display:flex;align-items:center;gap:10px;margin:2px 0 10px}
+.kmap>svg{color:var(--faint)}
+.kcap.acc{background:var(--accent-soft);color:var(--accent);box-shadow:inset 0 -5px 0 color-mix(in srgb,var(--accent) 28%,transparent),0 0 0 1.5px var(--accent)}
+.kcap.thru{color:var(--faint)}
+.rlist{display:flex;flex-wrap:wrap;gap:5px}
+.rchip{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border:0;border-radius:6px;background:var(--raised);font-size:12px;color:var(--muted)}
+.rchip b{font-family:'Saira';font-weight:600;color:var(--fg)}
+.rchip:hover{background:var(--hover)}
+.rchip.on{box-shadow:inset 0 0 0 1.5px var(--accent);color:var(--fg)}
+.picker{margin-top:14px}
+.picker .phead .pnote{margin-left:2px}
+.pk-top{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.search{flex:1;display:flex;align-items:center;gap:7px;height:30px;padding:0 10px;border-radius:7px;background:var(--raised);color:var(--muted);min-width:0}
+.search input{flex:1;min-width:0;border:0;background:transparent;color:var(--fg);font:inherit;outline:none;padding:0}
+.search input::placeholder{color:var(--faint)}
+.search:focus-within{box-shadow:0 0 0 2px var(--accent)}
+.kchips{display:flex;flex-wrap:wrap;gap:6px;max-height:100px;overflow:auto;padding:2px}
+.kchip{height:28px;min-width:38px;padding:0 10px 2px;border:0;border-radius:6px;background:var(--key-face);box-shadow:inset 0 -3px 0 var(--key-skirt),0 0 0 1px var(--line);font-family:'Saira';font-weight:600;font-size:12px;white-space:nowrap}
+.kchip:hover{background:var(--key-face-hi)}
+.kchip.on{background:var(--accent);color:var(--accent-ink);box-shadow:none}
+
+/* macros */
+.mgrid{display:grid;grid-template-columns:300px 1fr;gap:16px;align-items:start}
+.mslots{display:flex;flex-direction:column;gap:1px;max-height:392px;overflow:auto;margin:0 -6px;padding:0 6px}
+.mslot{display:flex;align-items:center;gap:10px;height:28px;padding:0 8px;border:0;border-radius:6px;background:transparent;text-align:left;flex:none}
+.mslot:hover{background:var(--hover)}
+.mslot.on{background:var(--accent-soft)}
+.mno{width:28px;font-family:'Saira';font-weight:600;font-size:12px;color:var(--muted)}
+.mslot.on .mno{color:var(--accent)}
+.mnm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.mnm.empty{color:var(--faint);font-weight:400}
+.mslot .cnt{color:var(--faint);font-size:12px}
+.mem{margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.mem-l{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px}
+.mem-l b{font-family:'Saira';font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
+.mem-b{height:4px;border-radius:4px;background:var(--raised);overflow:hidden}
+.mem-b i{display:block;height:100%;background:var(--accent);border-radius:4px}
+.mname{flex:1;min-width:0;height:30px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--fg);font:600 15px 'Figtree',sans-serif;padding:0 8px;margin-left:-8px}
+.mname:hover{border-color:var(--line-strong)}
+.mname:focus{border-color:var(--accent);outline:none}
+.mname::placeholder{color:var(--faint)}
+.steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+.step{display:flex;align-items:center;gap:10px;height:34px;padding:0 4px 0 6px;border-radius:7px}
+.step:hover{background:var(--raised)}
+.sno{width:16px;color:var(--faint);font-family:'Saira';font-weight:500;font-size:11.5px;text-align:right}
+.sic{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;background:var(--raised);color:var(--muted);flex:none}
+.stx{color:var(--muted)}
+.stx kbd{font-family:'Saira';font-weight:600;font-size:12px;color:var(--fg);background:var(--key-face);box-shadow:inset 0 -2px 0 var(--key-skirt),0 0 0 1px var(--line);border-radius:5px;padding:1px 7px 3px;margin-left:7px}
+.madd{display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:12px;border-top:1px solid var(--line)}
+.win .mfoot{margin-top:12px}
+
+/* advanced */
+.agrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.acol{display:flex;flex-direction:column;gap:16px}
+
+/* mouse */
+.tiles.many .t-main .big b{font-size:30px}
+.tiles.many .t-main .big span{display:none}
+.sdot{width:9px;height:9px;border-radius:50%;margin-right:7px;flex:none;box-shadow:0 0 0 1px rgba(0,0,0,.25)}
+.bgrid{display:grid;grid-template-columns:300px 1fr;gap:16px;align-items:start}
+.mfig{display:grid;place-items:center;padding:4px 0}
+.mfig svg{display:block;overflow:visible}
+.mfig .mbody{fill:var(--key-face);stroke:var(--line-strong);stroke-width:1.5}
+.mfig .rg{fill:var(--raised);stroke:var(--line-strong);stroke-width:1.2;transition:fill .12s}
+.mfig .seam{fill:none;stroke:var(--line-strong);stroke-width:1.2}
+.mfig [data-act]:hover .rg{fill:var(--hover)}
+.mfig .on>.rg{fill:var(--accent-soft);stroke:var(--accent);stroke-width:2}
+.mfig .on>.mbody{stroke:var(--accent);stroke-width:2}
+.mfig .bdg circle{fill:var(--panel);stroke:var(--line-strong);stroke-width:1.2}
+.mfig .bdg text{font:600 10px 'Saira',sans-serif;fill:var(--fg);text-anchor:middle}
+.mfig .on .bdg circle{fill:var(--accent);stroke:none}
+.mfig .on .bdg text{fill:var(--accent-ink)}
+.mfl{width:656px;flex:none}
+.mfl .mfig{height:288px}
+.blist{display:flex;flex-direction:column;gap:1px}
+.bli{display:flex;align-items:center;gap:10px;height:34px;padding:0 8px;border:0;border-radius:7px;background:transparent;text-align:left;position:relative}
+.bli:hover{background:var(--hover)}
+.bli.on{background:var(--accent-soft)}
+.bno{width:20px;height:20px;border-radius:50%;display:grid;place-items:center;background:var(--raised);font:600 10.5px 'Saira',sans-serif;flex:none}
+.bli.on .bno{background:var(--accent);color:var(--accent-ink)}
+.bnm{font-weight:500}
+.bact{color:var(--muted)}
+.bact.acc{color:var(--accent);font-weight:600}
+.bli>svg{color:var(--faint)}
+.bli.pending::before{content:'';position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:2px;background:var(--warn)}
 
 @media (prefers-reduced-motion: reduce){
   .win *{transition:none!important}
@@ -389,28 +513,104 @@ const I = {
 };
 const batt = p => `<svg viewBox="0 0 18 10" width="17" height="10" aria-hidden="true"><rect x=".75" y=".75" width="14.5" height="8.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><rect x="16.1" y="3.3" width="1.4" height="3.4" rx=".6" fill="currentColor"/><rect x="2.2" y="2.2" width="${(11.6 * p / 100).toFixed(1)}" height="5.6" rx="1" fill="currentColor"/></svg>`;
 
-/* ---------- keyboard layout (ATK RS7, 75%) ---------- */
-const U = 40, PITCH = 40, FGAP = 8;
-const KEYS = [];
-const k = (id, label, x, row, w = 1) => KEYS.push({ id, label, x, row, w });
-k('esc', 'Esc', 0, 0);
-[1, 2, 3, 4].forEach((n, i) => k('f' + n, 'F' + n, 1.5 + i, 0));
-[5, 6, 7, 8].forEach((n, i) => k('f' + n, 'F' + n, 6 + i, 0));
-[9, 10, 11, 12].forEach((n, i) => k('f' + n, 'F' + n, 10.5 + i, 0));
-k('del', 'Del', 15, 0);
-k('grv', '`', 0, 1); '1234567890'.split('').forEach((c, i) => k('d' + c, c, 1 + i, 1));
-k('min', '-', 11, 1); k('eq', '=', 12, 1); k('bksp', 'Backspace', 13, 1, 2); k('ins', 'Ins', 15, 1);
-k('tab', 'Tab', 0, 2, 1.5); 'QWERTYUIOP'.split('').forEach((c, i) => k(c.toLowerCase(), c, 1.5 + i, 2));
-k('lbr', '[', 11.5, 2); k('rbr', ']', 12.5, 2); k('bsl', '\\', 13.5, 2, 1.5); k('pgup', 'PgUp', 15, 2);
-k('caps', 'Caps', 0, 3, 1.75); 'ASDFGHJKL'.split('').forEach((c, i) => k(c.toLowerCase(), c, 1.75 + i, 3));
-k('semi', ';', 10.75, 3); k('quot', "'", 11.75, 3); k('ent', 'Enter', 12.75, 3, 2.25); k('pgdn', 'PgDn', 15, 3);
-k('lsft', 'Shift', 0, 4, 2.25); 'ZXCVBNM'.split('').forEach((c, i) => k(c.toLowerCase(), c, 2.25 + i, 4));
-k('com', ',', 9.25, 4); k('dot', '.', 10.25, 4); k('sl', '/', 11.25, 4); k('rsft', 'Shift', 12.25, 4, 1.75); k('up', '↑', 14, 4);
-k('lctl', 'Ctrl', 0, 5, 1.25); k('win', 'Win', 1.25, 5, 1.25); k('lalt', 'Alt', 2.5, 5, 1.25); k('spc', 'Space', 3.75, 5, 6.25);
-k('ralt', 'Alt', 10, 5); k('fn', 'Fn', 11, 5); k('left', '←', 13, 5); k('down', '↓', 14, 5); k('right', '→', 15, 5);
-const KEY = Object.fromEntries(KEYS.map(x => [x.id, x]));
+Object.assign(I, {
+  search: SV('0 0 16 16', 14, '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5l3 3"/>', 1.5),
+  arrow: SV('0 0 16 16', 16, '<path d="M2.5 8h11M9.5 4l4 4-4 4"/>', 1.5),
+  arrowS: SV('0 0 16 16', 10, '<path d="M2.5 8h11M9.5 4l4 4-4 4"/>', 1.8),
+  x: SV('0 0 16 16', 12, '<path d="M4 4l8 8M12 4l-8 8"/>', 1.6),
+  chevR: SV('0 0 16 16', 14, '<path d="M6 4l4 4-4 4"/>'),
+  rec: '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="8" cy="8" r="5" fill="var(--danger)"/></svg>',
+  down: SV('0 0 16 16', 12, '<path d="M8 2.5v11M4 9.5l4 4 4-4"/>', 1.6),
+  up: SV('0 0 16 16', 12, '<path d="M8 13.5v-11M4 6.5l4-4 4 4"/>', 1.6),
+  tap: SV('0 0 16 16', 12, '<path d="M5 2.5v6M2.5 6L5 8.5 7.5 6M11 13.5v-6M8.5 10L11 7.5l2.5 2.5"/>', 1.5),
+  clock: SV('0 0 16 16', 12, '<circle cx="8" cy="8" r="5.5"/><path d="M8 5v3.2l2 1.3"/>', 1.5),
+});
 
-const CODE = { Escape: 'esc', Delete: 'del', Backquote: 'grv', Minus: 'min', Equal: 'eq', Backspace: 'bksp', Insert: 'ins', Tab: 'tab', BracketLeft: 'lbr', BracketRight: 'rbr', Backslash: 'bsl', PageUp: 'pgup', CapsLock: 'caps', Semicolon: 'semi', Quote: 'quot', Enter: 'ent', PageDown: 'pgdn', ShiftLeft: 'lsft', Comma: 'com', Period: 'dot', Slash: 'sl', ShiftRight: 'rsft', ArrowUp: 'up', ControlLeft: 'lctl', MetaLeft: 'win', AltLeft: 'lalt', Space: 'spc', AltRight: 'ralt', ArrowLeft: 'left', ArrowDown: 'down', ArrowRight: 'right' };
+/* ---------- advanced-key icons: the SVGs the app ships in crates/ui/assets/icons ---------- */
+const ADV_SVG = {
+  rs: 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0zIC0zIDQyIDQyIiBmb2N1c2FibGU9ImZhbHNlIj4KICA8ZGVmcz4KICAgIDxtYXNrIGlkPSJjdXRvdXQiIG1hc2tVbml0cz0idXNlclNwYWNlT25Vc2UiIHg9Ii0zIiB5PSItMyIgd2lkdGg9IjQyIiBoZWlnaHQ9IjQyIj4KICAgICAgPHJlY3QgeD0iLTMiIHk9Ii0zIiB3aWR0aD0iNDIiIGhlaWdodD0iNDIiIGZpbGw9IndoaXRlIi8+CiAgICAgIDxwYXRoIGQ9Ik0yNS43ODYzIDE0LjMwMzFDMjUuMjk0NyAxNC4zMDMxIDI0Ljg0MzQgMTQuMjU0NiAyNC40MzIyIDE0LjE1NzVDMjQuMDI1NSAxNC4wNjA0IDIzLjY4MTQgMTMuOTI2OSAyMy4zOTk5IDEzLjc1N1YxMi4wOTQ1QzIzLjgwNjYgMTIuMzAwOCAyNC4yMDQzIDEyLjQ2MjYgMjQuNTkzMSAxMi41Nzk5QzI0Ljk4NjQgMTIuNjkzMiAyNS4zODg2IDEyLjc0OTggMjUuNzk5NyAxMi43NDk4QzI2LjAyNzYgMTIuNzQ5OCAyNi4yMzc3IDEyLjczMTYgMjYuNDI5OCAxMi42OTUyQzI2LjYyNjUgMTIuNjU0OCAyNi43OTYzIDEyLjU5NDEgMjYuOTM5MyAxMi41MTMyQzI3LjA4MjMgMTIuNDMyMyAyNy4xOTQgMTIuMzMxMiAyNy4yNzQ0IDEyLjIwOThDMjcuMzU0OSAxMi4wODg1IDI3LjM5NTEgMTEuOTQ2OSAyNy4zOTUxIDExLjc4NTFDMjcuMzk1MSAxMS41NTQ1IDI3LjM0MzcgMTEuMzYyNCAyNy4yNDA5IDExLjIwODdDMjcuMTQyNiAxMS4wNTA5IDI3LjAwNDEgMTAuOTA1MyAyNi44MjUzIDEwLjc3MThDMjYuNjUxIDEwLjYzODMgMjYuNDQ3NyAxMC40OTQ3IDI2LjIxNTMgMTAuMzQxQzI1Ljk0MjcgMTAuMTYzIDI1LjY3NjggOS45NjA3OCAyNS40MTc2IDkuNzM0MjZDMjUuMTYyOSA5LjUwNzc0IDI0Ljk1MjggOS4yNDQ4MSAyNC43ODc1IDguOTQ1NDhDMjQuNjIyMSA4LjY0MjEgMjQuNTM5NSA4LjI4ODE2IDI0LjUzOTUgNy44ODM2NUMyNC41Mzk1IDcuNDg3MjQgMjQuNjE3NyA3LjEyNTIxIDI0Ljc3NDEgNi43OTc1NkMyNC45MzUgNi40Njk5MSAyNS4xNjI5IDYuMTg0NzQgMjUuNDU3OCA1Ljk0MjA0QzI1Ljc1MjggNS42OTkzNCAyNi4xMDU4IDUuNTEzMjYgMjYuNTE3IDUuMzgzODJDMjYuOTMyNiA1LjI1MDM0IDI3LjM5NTEgNS4xODM1OSAyNy45MDQ2IDUuMTgzNTlDMjguNDA5NSA1LjE4MzU5IDI4Ljg3NjUgNS4yMzQxNiAyOS4zMDU2IDUuMzM1MjhDMjkuNzM5IDUuNDMyMzYgMzAuMTU5MSA1LjU4MjAzIDMwLjU2NTggNS43ODQyOEwyOS44MzUxIDcuMTk4MDJDMjkuNDg2NiA3LjA0ODM1IDI5LjE1MzYgNi45MzcxMiAyOC44MzYzIDYuODY0MzFDMjguNTIzNSA2Ljc4NzQ1IDI4LjIxMjkgNi43NDkwMiAyNy45MDQ2IDYuNzQ5MDJDMjcuNzIxMyA2Ljc0OTAyIDI3LjU1MTUgNi43NzMyOSAyNy4zOTUxIDYuODIxODNDMjcuMjQzMiA2Ljg2NjMzIDI3LjEwOTEgNi45MzMwNyAyNi45OTI5IDcuMDIyMDZDMjYuODgxMiA3LjEwNzAxIDI2Ljc5NCA3LjIxMDE2IDI2LjczMTUgNy4zMzE1MUMyNi42Njg5IDcuNDUyODYgMjYuNjM3NiA3LjU5MDM5IDI2LjYzNzYgNy43NDQxQzI2LjYzNzYgNy45NTQ0NCAyNi42ODQ1IDguMTM0NDUgMjYuNzc4NCA4LjI4NDExQzI2Ljg3NjcgOC40MzM3OCAyNy4wMTUyIDguNTczMzMgMjcuMTk0IDguNzAyNzdDMjcuMzc3MiA4LjgyODE3IDI3LjU5NjIgOC45Njc3MiAyNy44NTA5IDkuMTIxNDRDMjguMjEyOSA5LjMzNTgyIDI4LjUxMjMgOS41NjYzOSAyOC43NDkyIDkuODEzMTRDMjguOTkwNSAxMC4wNTU4IDI5LjE2OTMgMTAuMzIwOCAyOS4yODU1IDEwLjYwOEMyOS40MDYxIDEwLjg5NTIgMjkuNDY2NCAxMS4yMTI3IDI5LjQ2NjQgMTEuNTYwNkMyOS40NjY0IDEyLjAyNTggMjkuMzcwNCAxMi40MzAzIDI5LjE3ODIgMTIuNzc0MUMyOC45ODYgMTMuMTE3OSAyOC43MjAxIDEzLjQwMzEgMjguMzgwNSAxMy42Mjk2QzI4LjA0NTMgMTMuODU2MSAyNy42NTQzIDE0LjAyNiAyNy4yMDc0IDE0LjEzOTNDMjYuNzY1IDE0LjI0ODUgMjYuMjkxMyAxNC4zMDMxIDI1Ljc4NjMgMTQuMzAzMVoiIGZpbGw9ImJsYWNrIi8+CiAgICAgIDxwYXRoIGQ9Ik01LjE4Mzk2IDE0LjEyNjZMNy4yNTUzIDUuMjU1ODZIOS42NjE4QzEwLjY0NSA1LjI1NTg2IDExLjQyMDMgNS40NDggMTEuOTg3OSA1LjgzMjI4QzEyLjU1OTkgNi4yMTI1MSAxMi44NDU5IDYuODMxNCAxMi44NDU5IDcuNjg4OTVDMTIuODQ1OSA4LjE1ODE3IDEyLjc1MjEgOC41Njg3NCAxMi41NjQ0IDguOTIwNjZDMTIuMzc2NyA5LjI3MjU4IDEyLjExOTcgOS41Njc4NyAxMS43OTM1IDkuODA2NTJDMTEuNDcxNyAxMC4wNDUyIDExLjEwMyAxMC4yMjkyIDEwLjY4NzQgMTAuMzU4N0wxMi40MzcgMTQuMTI2NkgxMC4yMTE1TDguODIzODggMTAuNzIyN0g4LjAyNjE4TDcuMjI4NDggMTQuMTI2Nkg1LjE4Mzk2Wk04LjM4MTQ2IDkuMTkzN0g4LjkwNDMyQzkuMTk0OCA5LjE5MzcgOS40NTQgOS4xNjUzOSA5LjY4MTkxIDkuMTA4NzZDOS45MTQzIDkuMDQ4MDggMTAuMTEwOSA4Ljk2MTExIDEwLjI3MTggOC44NDc4NUMxMC40MzI3IDguNzMwNTQgMTAuNTUzNCA4LjU4NDkyIDEwLjYzMzggOC40MTA5OUMxMC43MTg3IDguMjMzMDEgMTAuNzYxMiA4LjAyNjcxIDEwLjc2MTIgNy43OTIxQzEwLjc2MTIgNy40NjA0IDEwLjY1MzkgNy4yMTE2MyAxMC40Mzk0IDcuMDQ1NzlDMTAuMjI0OSA2Ljg3OTk0IDkuODkxOTUgNi43OTcwMiA5LjQ0MDU5IDYuNzk3MDJIOC45NDQ1NEw4LjM4MTQ2IDkuMTkzN1oiIGZpbGw9ImJsYWNrIi8+CiAgICA8L21hc2s+CiAgPC9kZWZzPgogIDxnIG1hc2s9InVybCgjY3V0b3V0KSI+CiAgICA8cGF0aCBkPSJNMTUuNjMyMyAwLjY0ODQzOEg0LjYzNDg0QzMuNTY3MTMgMC42NDg0MzggMi40NzQ3OCAxLjg3MzIgMi4xODczMiAzLjM4OTU4TDAuMTA5MzkyIDE0LjQxMjRDLTAuMzQ2NDM5IDE2LjgzMjggMC42NjM3OCAxOC43OTI0IDIuMzY4MDEgMTguNzkyNEgxMy4zNjU0QzE0LjQzMzEgMTguNzkyNCAxNS41MjU1IDE3LjU2NzcgMTUuODEzIDE2LjA1MTNMMTcuODkwOSA1LjAyODQzQzE4LjM0NjcgMi42MDgwNiAxNy4zMzI0IDAuNjQ4NDM4IDE1LjYzMjMgMC42NDg0MzhaIiBmaWxsPSJjdXJyZW50Q29sb3IiLz4KICAgIDxwYXRoIGQ9Ik0zMy42MzIzIDAuNjQ4NDM4SDIyLjYzNDhDMjEuNTY3MSAwLjY0ODQzOCAyMC40NzQ4IDEuODczMiAyMC4xODczIDMuMzg5NThMMTguMTA5NCAxNC40MTI0QzE3LjY1MzYgMTYuODMyOCAxOC42NjM4IDE4Ljc5MjQgMjAuMzY4IDE4Ljc5MjRIMzEuMzY1NEMzMi40MzMxIDE4Ljc5MjQgMzMuNTI1NSAxNy41Njc3IDMzLjgxMyAxNi4wNTEzTDM1Ljg5MDkgNS4wMjg0M0MzNi4zNDY3IDIuNjA4MDYgMzUuMzMyNCAwLjY0ODQzOCAzMy42MzIzIDAuNjQ4NDM4WiIgZmlsbD0iY3VycmVudENvbG9yIi8+CiAgICA8cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGNsaXAtcnVsZT0iZXZlbm9kZCIgZD0iTTEyLjg2OTEgMjcuMzgxOEMxMi4wNTg1IDI3LjM4MTggMTEuMDIxNCAyOC4yNDU4IDEwLjk0MjggMjkuMjE3OEMxMC44ODE3IDI5Ljk3MzggMTEuMjMzIDMwLjgzNzggMTIuMDQzNSAzMC44Mzc4SDEyLjg5ODlDMTIuODk5MiAzMC44Mzc4IDEyLjg5OTQgMzAuODM3OCAxMi44OTk3IDMwLjgzNzhMMTguOTIzMSAzMC44Mzc4TDE5Ljc3OTIgMzAuODM3OEMyMC41ODk3IDMwLjgzNzggMjEuNzM2IDMwLjA2NDIgMjEuNzM2IDI5LjEwOThDMjEuNzM2IDI4LjE1NTUgMjEuMDc4OSAyNy4zODE4IDIwLjI2ODQgMjcuMzgxOEgxOS40MTIzSDEzLjcyNTJIMTIuODY5MVoiIGZpbGw9ImN1cnJlbnRDb2xvciIvPgogICAgPHBhdGggZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMS44NzMxIDIzLjY1MlYyMi4yNDhMMTMuOTA3MSAyMy42NTJIMTMuOTA4NEwxNC4wMDAzIDIzLjcxNjRMMTUuOTQxMSAyNS4wNTZIMTUuOTEzNUwxNy4xMTY2IDI1Ljg5ODRIOS44MjAwN0M4LjA0ODg3IDI1Ljg5ODQgNi4yMjcyNyAyNy4zMzEyIDUuNzUyMDcgMjkuMTAyNEM1LjI3Njg3IDMwLjg2NjQgNi4zMjgwNyAzMi4zMDY0IDguMDk5MjcgMzIuMzA2NEgxNC41MzYzTDE3Ljc0NDUgMzQuNTUyOEg3LjQ5NDQ3QzQuNDg0ODcgMzQuNTUyOCAyLjY5OTI3IDMyLjExMiAzLjUwNTY3IDI5LjEwMjRDNC4zMTIwNyAyNi4wOTI4IDcuNDA4MDcgMjMuNjUyIDEwLjQxNzcgMjMuNjUySDExLjg3MzFaTTIzLjA3NiAzNC41MDA3VjM1Ljk2NEwyMS4wMzE2IDM0LjU1MjhIMjEuMDA4MkwxOS4zODk0IDMzLjQxOTNMMTkuMDA4IDMzLjE1NkgxOS4wMTM0TDE3LjgwMDEgMzIuMzA2NEgyMi45MDI1QzI0LjY3MzcgMzIuMzA2NCAyNi40OTUzIDMwLjg3MzYgMjYuOTcwNSAyOS4xMDI0QzI3LjQ0NTcgMjcuMzM4NCAyNi4zOTQ1IDI1Ljg5ODQgMjQuNjIzMyAyNS44OTg0SDIwLjM4MDRMMTcuMTcyMiAyMy42NTJIMjUuMjI4MUMyOC4yMzc3IDIzLjY1MiAzMC4wMjMzIDI2LjA5MjggMjkuMjE2OSAyOS4xMDI0QzI4LjQ3OTMgMzEuODU1MSAyNS44MjYzIDM0LjEzMiAyMy4wNzYgMzQuNTAwN1oiIGZpbGw9ImN1cnJlbnRDb2xvciIvPgogIDwvZz4KPC9zdmc+Cg==',
+  socd: 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii0zIC0zIDQyIDQyIiBmb2N1c2FibGU9ImZhbHNlIj4KICA8ZGVmcz4KICAgIDxtYXNrIGlkPSJjdXRvdXQiIG1hc2tVbml0cz0idXNlclNwYWNlT25Vc2UiIHg9Ii0zIiB5PSItMyIgd2lkdGg9IjQyIiBoZWlnaHQ9IjQyIj4KICAgICAgPHJlY3QgeD0iLTMiIHk9Ii0zIiB3aWR0aD0iNDIiIGhlaWdodD0iNDIiIGZpbGw9IndoaXRlIi8+CiAgICAgIDxwYXRoIGQ9Ik0yOS4xMjUgMTguNDU3OUgyMy43NUMyMy41NDE3IDE4LjQ1NzkgMjMuMzY0NiAxOC4zODUgMjMuMjE4OCAxOC4yMzkxQzIzLjA3MjkgMTguMDkzMyAyMyAxNy45MTYyIDIzIDE3LjcwNzlDMjMgMTcuNDk5NSAyMy4wNzI5IDE3LjMyMjUgMjMuMjE4OCAxNy4xNzY2QzIzLjM2NDYgMTcuMDMwOCAyMy41NDE3IDE2Ljk1NzkgMjMuNzUgMTYuOTU3OUgyOS4xMjVMMjcuNDU4MyAxNS4yOTEyQzI3LjMwNTYgMTUuMTM4NCAyNy4yMjkyIDE0Ljk2MTQgMjcuMjI5MiAxNC43NkMyNy4yMjkyIDE0LjU1ODYgMjcuMzA1NiAxNC4zODE1IDI3LjQ1ODMgMTQuMjI4N0MyNy42MTExIDE0LjA3NTkgMjcuNzg4MiAxMy45OTk1IDI3Ljk4OTYgMTMuOTk5NUMyOC4xOTEgMTMuOTk5NSAyOC4zNjgxIDE0LjA3NTkgMjguNTIwOCAxNC4yMjg3TDMxLjQ3OTIgMTcuMTg3QzMxLjYzMTkgMTcuMzM5OCAzMS43MDgzIDE3LjUxMzQgMzEuNzA4MyAxNy43MDc5QzMxLjcwODMgMTcuOTAyMyAzMS42MzE5IDE4LjA3NTkgMzEuNDc5MiAxOC4yMjg3TDI4LjUyMDggMjEuMTg3QzI4LjM2ODEgMjEuMzM5OCAyOC4xOTEgMjEuNDEyNyAyNy45ODk2IDIxLjQwNThDMjcuNzg4MiAyMS4zOTg5IDI3LjYxMTEgMjEuMzE5IDI3LjQ1ODMgMjEuMTY2MkMyNy4zMDU2IDIxLjAxMzQgMjcuMjI5MiAyMC44MzY0IDI3LjIyOTIgMjAuNjM1QzI3LjIyOTIgMjAuNDMzNiAyNy4zMDU2IDIwLjI1NjUgMjcuNDU4MyAyMC4xMDM3TDI5LjEyNSAxOC40NTc5WiIgZmlsbD0iYmxhY2siLz4KICAgICAgPHBhdGggZD0iTTcuNTgyMDMgMTguNDU3OUgxMi45NTdDMTMuMTY1NCAxOC40NTc5IDEzLjM0MjQgMTguMzg1IDEzLjQ4ODMgMTguMjM5MUMxMy42MzQxIDE4LjA5MzMgMTMuNzA3IDE3LjkxNjIgMTMuNzA3IDE3LjcwNzlDMTMuNzA3IDE3LjQ5OTUgMTMuNjM0MSAxNy4zMjI1IDEzLjQ4ODMgMTcuMTc2NkMxMy4zNDI0IDE3LjAzMDggMTMuMTY1NCAxNi45NTc5IDEyLjk1NyAxNi45NTc5SDcuNTgyMDNMOS4yNDg3IDE1LjI5MTJDOS40MDE0OCAxNS4xMzg0IDkuNDc3ODYgMTQuOTYxNCA5LjQ3Nzg2IDE0Ljc2QzkuNDc3ODYgMTQuNTU4NiA5LjQwMTQ4IDE0LjM4MTUgOS4yNDg3IDE0LjIyODdDOS4wOTU5MiAxNC4wNzU5IDguOTE4ODQgMTMuOTk5NSA4LjcxNzQ1IDEzLjk5OTVDOC41MTYwNiAxMy45OTk1IDguMzM4OTggMTQuMDc1OSA4LjE4NjIgMTQuMjI4N0w1LjIyNzg2IDE3LjE4N0M1LjA3NTA5IDE3LjMzOTggNC45OTg3IDE3LjUxMzQgNC45OTg3IDE3LjcwNzlDNC45OTg3IDE3LjkwMjMgNS4wNzUwOSAxOC4wNzU5IDUuMjI3ODYgMTguMjI4N0w4LjE4NjIgMjEuMTg3QzguMzM4OTggMjEuMzM5OCA4LjUxNjA2IDIxLjQxMjcgOC43MTc0NSAyMS40MDU4QzguOTE4ODQgMjEuMzk4OSA5LjA5NTkyIDIxLjMxOSA5LjI0ODcgMjEuMTY2MkM5LjQwMTQ4IDIxLjAxMzQgOS40Nzc4NiAyMC44MzY0IDkuNDc3ODYgMjAuNjM1QzkuNDc3ODYgMjAuNDMzNiA5LjQwMTQ4IDIwLjI1NjUgOS4yNDg3IDIwLjEwMzdMNy41ODIwMyAxOC40NTc5WiIgZmlsbD0iYmxhY2siLz4KICAgIDwvbWFzaz4KICA8L2RlZnM+CiAgPGcgbWFzaz0idXJsKCNjdXRvdXQpIj4KICAgIDxwYXRoIGQ9Ik0xNS42MzIzIDguNjQ4NDRINC42MzQ4NEMzLjU2NzEzIDguNjQ4NDQgMi40NzQ3OCA5Ljg3MzIgMi4xODczMiAxMS4zODk2TDAuMTA5MzkyIDIyLjQxMjRDLTAuMzQ2NDM5IDI0LjgzMjggMC42NjM3OCAyNi43OTI0IDIuMzY4MDEgMjYuNzkyNEgxMy4zNjU0QzE0LjQzMzEgMjYuNzkyNCAxNS41MjU1IDI1LjU2NzcgMTUuODEzIDI0LjA1MTNMMTcuODkwOSAxMy4wMjg0QzE4LjM0NjcgMTAuNjA4MSAxNy4zMzI0IDguNjQ4NDQgMTUuNjMyMyA4LjY0ODQ0WiIgZmlsbD0iY3VycmVudENvbG9yIi8+CiAgICA8cGF0aCBkPSJNMzMuNjMyMyA4LjY0ODQ0SDIyLjYzNDhDMjEuNTY3MSA4LjY0ODQ0IDIwLjQ3NDggOS44NzMyIDIwLjE4NzMgMTEuMzg5NkwxOC4xMDk0IDIyLjQxMjRDMTcuNjUzNiAyNC44MzI4IDE4LjY2MzggMjYuNzkyNCAyMC4zNjggMjYuNzkyNEgzMS4zNjU0QzMyLjQzMzEgMjYuNzkyNCAzMy41MjU1IDI1LjU2NzcgMzMuODEzIDI0LjA1MTNMMzUuODkwOSAxMy4wMjg0QzM2LjM0NjcgMTAuNjA4MSAzNS4zMzI0IDguNjQ4NDQgMzMuNjMyMyA4LjY0ODQ0WiIgZmlsbD0iY3VycmVudENvbG9yIi8+CiAgICA8cGF0aCBkPSJNMzAuNzM3MyA1LjEzNjY0QzMxLjI5MTIgNS43MzUyNyAzMC44MzU0IDYuNjQ4NDQgMzAuMDE5OCA2LjY0ODQ0SDI5LjE1MjhDMjguODgwNyA2LjY0ODQ0IDI4LjYyMTYgNi41MzYxNyAyOC40MjY5IDYuMzQ1OTFDMjUuOTkzIDMuOTY2NTIgMjIuNjYzIDIuNSAxOC45OTA0IDIuNUMxNS4zMTc4IDIuNSAxMS45ODc3IDMuOTY2NTIgOS41NTM4MiA2LjM0NTkxQzkuMzU5MiA2LjUzNjE3IDkuMTAwMDggNi42NDg0NCA4LjgyNzkyIDYuNjQ4NDRINy45NjA5MUM3LjE0NTM2IDYuNjQ4NDQgNi42ODk2IDUuNzM1MjcgNy4yNDM0NyA1LjEzNjY1QzEwLjE2NjIgMS45Nzc3IDE0LjM0NzMgMCAxOC45OTA0IDBDMjMuNjMzNCAwIDI3LjgxNDUgMS45Nzc3IDMwLjczNzMgNS4xMzY2NFoiIGZpbGw9ImN1cnJlbnRDb2xvciIvPgogICAgPHBhdGggZD0iTTI4LjczNzMgMzAuNTExOEMyOS4yOTEyIDI5LjkxMzIgMjguODM1NCAyOSAyOC4wMTk4IDI5SDI3LjE1MjhDMjYuODgwNyAyOSAyNi42MjE2IDI5LjExMjMgMjYuNDI2OSAyOS4zMDI1QzIzLjk5MyAzMS42ODE5IDIwLjY2MyAzMy4xNDg0IDE2Ljk5MDQgMzMuMTQ4NEMxMy4zMTc4IDMzLjE0ODQgOS45ODc3MSAzMS42ODE5IDcuNTUzODIgMjkuMzAyNUM3LjM1OTIgMjkuMTEyMyA3LjEwMDA4IDI5IDYuODI3OTIgMjlINS45NjA5MUM1LjE0NTM2IDI5IDQuNjg5NiAyOS45MTMyIDUuMjQzNDcgMzAuNTExOEM4LjE2NjIzIDMzLjY3MDcgMTIuMzQ3MyAzNS42NDg0IDE2Ljk5MDQgMzUuNjQ4NEMyMS42MzM0IDM1LjY0ODQgMjUuODE0NSAzMy42NzA3IDI4LjczNzMgMzAuNTExOFoiIGZpbGw9ImN1cnJlbnRDb2xvciIvPgogIDwvZz4KPC9zdmc+Cg==',
+  dks: 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii01MCAtNTAgNjAwIDYwMCIgZm9jdXNhYmxlPSJmYWxzZSI+CiAgPGRlZnM+CiAgICA8bWFzayBpZD0iY3V0b3V0IiBtYXNrVW5pdHM9InVzZXJTcGFjZU9uVXNlIiB4PSItNTAiIHk9Ii01MCIgd2lkdGg9IjYwMCIgaGVpZ2h0PSI2MDAiPgogICAgICA8cmVjdCB4PSItNTAiIHk9Ii01MCIgd2lkdGg9IjYwMCIgaGVpZ2h0PSI2MDAiIGZpbGw9IndoaXRlIi8+CiAgICAgIDxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMTc0LjksMTYwLjljLTYuMiwyMC4yLTE2LjYsMzUuNi0zMS40LDQ2LjNjLTE0LjcsMTAuNy0zMywxNi4xLTU0LjYsMTYuMUg1NC4zbDM3LjQtMTIyLjRoMzguNGMyMCwwLDMzLjksNS4zLDQxLjcsMTUuOEMxNzkuNywxMjcuMiwxODAuNywxNDIsMTc0LjksMTYwLjl6IE0xNDcuNywxNjEuNmM4LTI2LjMsMC40LTM5LjQtMjIuOC0zOS40aC0xMy44bC0yNC40LDc5LjdoMTEuMUMxMjIuOSwyMDEuOCwxMzkuNSwxODguNCwxNDcuNywxNjEuNnoiLz4KICAgICAgPHBhdGggZmlsbD0iYmxhY2siIGQ9Ik0yNzkuNywyMjMuM2gtMjkuNWwtMTYuMy01MS42bC0xMy40LDcuOWwtMTMuNCw0My43aC0yNmwzNy40LTEyMi40aDI2bC0xNy4xLDU2bDE0LjYtMTQuNGw0NS45LTQxLjZoMjguOEwyNTcuNSwxNTVMMjc5LjcsMjIzLjN6Ii8+CiAgICAgIDxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMzc3LjcsMTg5LjNjLTMuNCwxMS4xLTEwLDE5LjgtMTkuOSwyNi4xYy05LjksNi40LTIxLjksOS41LTM2LjEsOS41Yy0xMy4xLDAtMjMuOS0yLjUtMzIuNC03LjRsNy40LTI0LjFjNy4xLDMuNywxMy4zLDYuMywxOC42LDcuOGM1LjMsMS41LDEwLjMsMi4zLDE1LDIuM2M1LjcsMCwxMC40LTEuMSwxNC4xLTMuM2MzLjctMi4yLDYuMi01LjQsNy41LTkuN2MwLjctMi40LDAuNy00LjUsMC02LjRjLTAuOC0xLjktMi4yLTMuNy00LjMtNS40Yy0yLjEtMS43LTYuNS00LjUtMTMuMy04LjNjLTYuNC0zLjUtMTEtNi45LTEzLjctMTAuMWMtMi44LTMuMi00LjYtNy01LjUtMTEuM2MtMC45LTQuMy0wLjUtOS4zLDEuMy0xNS4xYzMuMy0xMC44LDkuNi0xOS4zLDE4LjgtMjUuNWM5LjItNi4yLDIwLjMtOS4zLDMzLjMtOS4zYzYuNCwwLDEyLjIsMC44LDE3LjUsMi4zczEwLjcsMy42LDE2LjIsNi40bC0xNC41LDIwLjJjLTUuNy0yLjctMTAuNS00LjUtMTQuNS01LjZjLTMuOS0xLjEtOC0xLjYtMTIuMS0xLjZjLTQuOSwwLTksMS4xLTEyLjQsMy40Yy0zLjMsMi4zLTUuNSw1LjMtNi43LDljLTAuNywyLjMtMC44LDQuMy0wLjIsNmMwLjUsMS43LDEuNywzLjMsMy42LDQuOWMxLjgsMS42LDYuNCw0LjUsMTMuOCw4LjZjOS44LDUuNSwxNS45LDExLDE4LjUsMTYuNUMzODAuMSwxNzQuNiwzODAuMiwxODEuMywzNzcuNywxODkuM3oiLz4KICAgIDwvbWFzaz4KICA8L2RlZnM+CiAgPGcgbWFzaz0idXJsKCNjdXRvdXQpIj4KICAgIDxwYXRoIGZpbGw9ImN1cnJlbnRDb2xvciIgZD0iTTQ3Ny4zLDIwMi40YzEzLjksMTQuMiwxOS4zLDM0LjIsMTQuNCw1My40bC00NS4zLDE3Ny42Yy04LjUsMzMuMy0zOC41LDU2LjYtNzIuOSw1Ni42SDEyMS4yYy0xNy42LDAtMzMuOC04LTQ0LjYtMjEuOHMtMTQuNC0zMS42LTEwLjEtNDguNmwxNS4yLTU5LjNjMi42LTEwLjEsMTIuOC0xNi4xLDIyLjktMTMuNWMxMC4xLDIuNiwxNi4xLDEyLjgsMTMuNSwyMi45TDEwMyw0MjguOWMtMS40LDUuNy0wLjIsMTEuNiwzLjQsMTYuMmMzLjYsNC42LDksNy4zLDE0LjksNy4zaDI1Mi4yYzE3LjIsMCwzMi4yLTExLjYsMzYuNC0yOC4zbDQ1LjMtMTc3LjZjMS42LTYuNC0wLjItMTMuMS00LjgtMTcuOGMtNy4zLTcuNC03LjEtMTkuMywwLjMtMjYuNkM0NTguMSwxOTQuOCw0NzAsMTk1LDQ3Ny4zLDIwMi40eiIvPgogICAgPHBhdGggZmlsbD0iY3VycmVudENvbG9yIiBkPSJNNDI5LjksMzAuNWMxMC44LDEzLjgsMTQuNCwzMS42LDEwLjEsNDguNWwtNDUuMywxNzcuNmMtOC41LDMzLjMtMzguNSw1Ni42LTcyLjksNTYuNkg2OS41Yy0xNy42LDAtMzMuOC04LTQ0LjYtMjEuOHMtMTQuNC0zMS42LTEwLjEtNDguNkw2MC40LDY1LjNDNjksMzIsOTguOSw4LjcsMTMzLjMsOC43aDI1MkM0MDIuOCw4LjcsNDE5LjEsMTYuNyw0MjkuOSwzMC41eiBNNDAzLjUsNjkuOGMxLjQtNS43LDAuMi0xMS42LTMuNC0xNi4yYy0zLjYtNC42LTktNy4zLTE0LjktNy4zaC0yNTJjLTE3LjIsMC0zMi4yLDExLjYtMzYuNCwyOC4zTDUxLjMsMjUyLjJjLTEuNSw1LjctMC4yLDExLjYsMy40LDE2LjJjMy42LDQuNiw5LDcuMywxNC45LDcuM2gyNTIuMmMxNy4yLDAsMzIuMi0xMS42LDM2LjQtMjguM0w0MDMuNSw2OS44eiIvPgogICAgPHBhdGggZmlsbD0iY3VycmVudENvbG9yIiBkPSJNNDAwLjIsNTMuNmMzLjYsNC42LDQuOCwxMC41LDMuNCwxNi4ybC00NS4zLDE3Ny42Yy00LjMsMTYuNy0xOS4yLDI4LjMtMzYuNCwyOC4zSDY5LjVjLTUuOSwwLTExLjMtMi43LTE0LjktNy4zYy0zLjYtNC42LTQuOC0xMC41LTMuNC0xNi4yTDk2LjksNzQuNmM0LjMtMTYuNiwxOS4zLTI4LjMsMzYuNC0yOC4zaDI1MkMzOTEuMSw0Ni4zLDM5Ni42LDQ5LDQwMC4yLDUzLjZ6Ii8+CiAgICA8cG9seWdvbiBmaWxsPSJjdXJyZW50Q29sb3IiIHBvaW50cz0iNDE0LjEsMjkuNSA5Ni42LDMyLjEgODEuOCw0NS44IDI4LjYsMjU3LjkgNjEuOCwyODcuOSAzNjIuNCwyODcuOSA0MjYuMyw3NC44Ii8+CiAgPC9nPgo8L3N2Zz4K',
+  mt: 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii01MCAtNTAgNjAwIDYwMCIgZm9jdXNhYmxlPSJmYWxzZSI+CiAgPGRlZnM+CiAgICA8bWFzayBpZD0iY3V0b3V0IiBtYXNrVW5pdHM9InVzZXJTcGFjZU9uVXNlIiB4PSItNTAiIHk9Ii01MCIgd2lkdGg9IjYwMCIgaGVpZ2h0PSI2MDAiPgogICAgICA8cmVjdCB4PSItNTAiIHk9Ii01MCIgd2lkdGg9IjYwMCIgaGVpZ2h0PSI2MDAiIGZpbGw9IndoaXRlIi8+CiAgICAgIDxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMTY0LjMsMjIxLjlsLTMuOC05Ny4yaC0wLjhjLTQuMiwxOS44LTcuMiwzMy05LDM5LjZsLTE1LjQsNTcuNmgtMjMuNUwxNDUuMSw5OGgzNS44bDMuOSw5NC44aDAuNUwyNDEuOCw5OGgzNS44bC0zMy4yLDEyMy45aC0yNC41bDE1LjctNTguN2MwLjctMi44LDEuNi02LDIuNy05LjZjMS4xLTMuNiw0LTEzLjIsOC45LTI4LjhoLTAuOGwtNTgsOTcuMUgxNjQuM3oiLz4KICAgICAgPHBhdGggZmlsbD0iYmxhY2siIGQ9Ik0zMjMuMywyMjEuOWgtMjYuM2wyNy4zLTEwMi4xaC0zMy43bDUuOS0yMS45aDkzLjZsLTUuOSwyMS45aC0zMy43TDMyMy4zLDIyMS45eiIvPgogICAgPC9tYXNrPgogIDwvZGVmcz4KICA8ZyBtYXNrPSJ1cmwoI2N1dG91dCkiPgogICAgPHBhdGggZmlsbD0iY3VycmVudENvbG9yIiBkPSJNNDA1LjIsOS40SDEzNy40Yy0yNiwwLTUyLjYsMjEtNTkuNiw0N2wtNTAuNiwxODljLTExLjEsNDEuNSwxMy41LDc1LjEsNTUsNzUuMWgyNjcuOGMyNiwwLDUyLjYtMjEsNTkuNi00N2w1MC42LTE4OUM0NzEuMyw0Myw0NDYuNiw5LjQsNDA1LjIsOS40eiIvPgogICAgPHBhdGggZmlsbD0iY3VycmVudENvbG9yIiBkPSJNMTUwLjYsMzcyLjVINzcuOGMtMTIuNSwwLTI1LjQsMTAuMi0yOC44LDIyLjdsLTE5LjUsNzIuN2MtMy40LDEyLjUsNC4xLDIyLjcsMTYuNiwyMi43aDcyLjdjMTIuNSwwLDI1LjQtMTAuMiwyOC44LTIyLjdsMTkuNS03Mi43QzE3MC41LDM4Mi42LDE2My4xLDM3Mi41LDE1MC42LDM3Mi41eiIvPgogICAgPHBhdGggZmlsbD0iY3VycmVudENvbG9yIiBkPSJNNDU1LjcsMzcyLjVIMjQ3LjljLTE0LjMsMC0yOC45LDEwLjItMzIuNywyMi43TDE5Myw0NjcuOWMtMy44LDEyLjUsNC42LDIyLjcsMTguOSwyMi43aDIwNy44YzE0LjMsMCwyOC45LTEwLjIsMzIuNy0yMi43bDIyLjItNzIuN0M0NzguNCwzODIuNiw0NzAsMzcyLjUsNDU1LjcsMzcyLjV6Ii8+CiAgPC9nPgo8L3N2Zz4K',
+  tgl: 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9Ii01MCAtNTAgNjAwIDYwMCIgZm9jdXNhYmxlPSJmYWxzZSI+CiAgPGRlZnM+CiAgICA8bWFzayBpZD0iY3V0b3V0IiBtYXNrVW5pdHM9InVzZXJTcGFjZU9uVXNlIiB4PSItNTAiIHk9Ii01MCIgd2lkdGg9IjYwMCIgaGVpZ2h0PSI2MDAiPgogICAgICA8cmVjdCB4PSItNTAiIHk9Ii01MCIgd2lkdGg9IjYwMCIgaGVpZ2h0PSI2MDAiIGZpbGw9IndoaXRlIi8+CiAgICAgIDxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMTM2LDIyMS45aC0yNi4zTDEzNywxMTkuOGgtMzMuN2w1LjktMjEuOWg5My42bC01LjksMjEuOWgtMzMuN0wxMzYsMjIxLjl6Ii8+CiAgICAgIDxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMjU0LjQsMTUyLjNoNDkuMmwtMTcuMiw2NC4zYy04LjcsMi42LTE2LjcsNC40LTI0LDUuNWMtNy4zLDEtMTQuNywxLjYtMjIsMS42Yy0xOC43LDAtMzEuNS01LjUtMzguNC0xNi41Yy02LjktMTEtNy42LTI2LjgtMi4xLTQ3LjNjNS40LTIwLDE1LjMtMzUuNiwyOS43LTQ2LjhjMTQuNC0xMS4yLDMxLjgtMTYuOCw1Mi4xLTE2LjhjMTIuNywwLDI0LjMsMi41LDM0LjcsNy42bC0xNC40LDIxYy03LjgtNC41LTE2LjYtNi44LTI2LjQtNi44Yy0xMS40LDAtMjEuNSwzLjgtMzAuNCwxMS40Yy04LjksNy42LTE1LjEsMTcuOS0xOC41LDMwLjhjLTMuNiwxMy41LTMuNiwyMy43LDAsMzAuOGMzLjYsNy4xLDEwLjcsMTAuNiwyMS4yLDEwLjZjNS41LDAsMTEuMi0wLjYsMTcuMi0xLjdsNi45LTI1LjloLTIzLjVMMjU0LjQsMTUyLjN6Ii8+CiAgICAgIDxwYXRoIGZpbGw9ImJsYWNrIiBkPSJNMzE0LjQsMjIxLjlMMzQ3LjYsOThoMjYuM2wtMjcuNCwxMDIuMmg1MC4zbC01LjgsMjEuN0gzMTQuNHoiLz4KICAgIDwvbWFzaz4KICA8L2RlZnM+CiAgPGcgbWFzaz0idXJsKCNjdXRvdXQpIj4KICAgIDxwYXRoIGZpbGw9ImN1cnJlbnRDb2xvciIgZD0iTTQxMS42LDkuNEgxNDMuN2MtMjYsMC01Mi42LDIxLTU5LjYsNDdsLTUwLjcsMTg5Yy0xMS4xLDQxLjUsMTMuNSw3NS4xLDU1LDc1LjFoMjY3LjljMjYsMCw1Mi42LTIxLDU5LjYtNDdsNTAuNy0xODlDNDc3LjcsNDMsNDUzLjEsOS40LDQxMS42LDkuNHoiLz4KICAgIDxwYXRoIGZpbGw9ImN1cnJlbnRDb2xvciIgZD0iTTM3My4xLDM3MC40YzI0LjYsMCwzOS4yLDIwLDMyLjYsNDQuNWMtNi42LDI0LjYtMzEuOSw0NC41LTU2LjUsNDQuNUgxNDMuNmMtMjQuNiwwLTM5LjItMjAtMzIuNi00NC41YzYuNi0yNC41LDMxLjktNDQuNSw1Ni41LTQ0LjVIMzczLjEgTTM4MS41LDMzOS4ySDE3NS44Yy00MS44LDAtODQuOCwzMy45LTk2LDc1LjdzMTMuNiw3NS43LDU1LjQsNzUuN2gyMDUuN2M0MS44LDAsODQuOC0zMy45LDk2LTc1LjdTNDIzLjMsMzM5LjIsMzgxLjUsMzM5LjJMMzgxLjUsMzM5LjJ6Ii8+CiAgICA8ZWxsaXBzZSB0cmFuc2Zvcm09Im1hdHJpeCgwLjc1MjYgLTAuNjU4NSAwLjY1ODUgMC43NTI2IC0yMzMuOTI5NiAyMDcuMjA2MykiIGZpbGw9ImN1cnJlbnRDb2xvciIgY3g9IjE1OC44IiBjeT0iNDE0LjkiIHJ4PSIyNy43IiByeT0iMjEuMiIvPgogIDwvZz4KPC9zdmc+Cg==',
+};
+document.head.insertAdjacentHTML('beforeend', '<style>' + Object.entries(ADV_SVG).map(([t, b]) => `.adv.${t}{-webkit-mask-image:url("data:image/svg+xml;base64,${b}");mask-image:url("data:image/svg+xml;base64,${b}")}`).join('') + '</style>');
+const adv = (t, cls = '') => `<i class="adv ${t} ${cls}" aria-hidden="true"></i>`;
+const PAIR_TYPES = [
+  { id: 'rs', name: 'Rapid switching', short: 'RS', summary: 'Two keys; the deeper press wins.' },
+  { id: 'socd', name: 'SOCD', short: 'SOCD', summary: 'Two opposing keys; choose which one wins.' },
+  { id: 'dks', name: 'Dynamic keystroke', short: 'DKS', summary: 'Up to four actions along one key’s travel.' },
+  { id: 'mt', name: 'Mod-tap', short: 'MT', summary: 'Tap for one key, hold for another.' },
+  { id: 'tgl', name: 'Toggle', short: 'TGL', summary: 'Tap to latch a key down, tap again to release.' },
+];
+const PT = Object.fromEntries(PAIR_TYPES.map(t => [t.id, t]));
+
+/* ---------- physical layouts, one per keyboard ---------- */
+const U = 40, PITCH = 40;
+function layout(fgap, build) {
+  const keys = [];
+  build((id, label, x, row, w = 1, extra = {}) => keys.push({ id, label, x, row, w, ...extra }));
+  keys.fgap = fgap;
+  keys.rows = Math.max(...keys.map(x => x.row));
+  keys.cols = Math.max(...keys.map(x => x.x + x.w));
+  keys.width = keys.cols * U;
+  keys.height = (keys.rows + 1) * PITCH + fgap - 2;
+  return keys;
+}
+const each = (s, f) => s.split('').forEach(f);
+const LAYOUTS = {
+  /* ATK RS7, 75% */
+  rs7: layout(8, k => {
+    k('esc', 'Esc', 0, 0);
+    [1, 2, 3, 4].forEach((n, i) => k('f' + n, 'F' + n, 1.5 + i, 0));
+    [5, 6, 7, 8].forEach((n, i) => k('f' + n, 'F' + n, 6 + i, 0));
+    [9, 10, 11, 12].forEach((n, i) => k('f' + n, 'F' + n, 10.5 + i, 0));
+    k('del', 'Del', 15, 0);
+    k('grv', '`', 0, 1); each('1234567890', (c, i) => k('d' + c, c, 1 + i, 1));
+    k('min', '-', 11, 1); k('eq', '=', 12, 1); k('bksp', 'Backspace', 13, 1, 2); k('ins', 'Ins', 15, 1);
+    k('tab', 'Tab', 0, 2, 1.5); each('QWERTYUIOP', (c, i) => k(c.toLowerCase(), c, 1.5 + i, 2));
+    k('lbr', '[', 11.5, 2); k('rbr', ']', 12.5, 2); k('bsl', '\\', 13.5, 2, 1.5); k('pgup', 'PgUp', 15, 2);
+    k('caps', 'Caps', 0, 3, 1.75); each('ASDFGHJKL', (c, i) => k(c.toLowerCase(), c, 1.75 + i, 3));
+    k('semi', ';', 10.75, 3); k('quot', "'", 11.75, 3); k('ent', 'Enter', 12.75, 3, 2.25); k('pgdn', 'PgDn', 15, 3);
+    k('lsft', 'Shift', 0, 4, 2.25); each('ZXCVBNM', (c, i) => k(c.toLowerCase(), c, 2.25 + i, 4));
+    k('com', ',', 9.25, 4); k('dot', '.', 10.25, 4); k('sl', '/', 11.25, 4); k('rsft', 'Shift', 12.25, 4, 1.75); k('up', '↑', 14, 4);
+    k('lctl', 'Ctrl', 0, 5, 1.25); k('win', 'Win', 1.25, 5, 1.25); k('lalt', 'Alt', 2.5, 5, 1.25); k('spc', 'Space', 3.75, 5, 6.25);
+    k('ralt', 'Alt', 10, 5); k('fn', 'Fn', 11, 5); k('left', '←', 13, 5); k('down', '↓', 14, 5); k('right', '→', 15, 5);
+  }),
+  /* Keychron Q1, 75% with a knob; follows the 6 x 16 VIA matrix */
+  q1: layout(8, k => {
+    k('esc', 'Esc', 0, 0);
+    [1, 2, 3, 4].forEach((n, i) => k('f' + n, 'F' + n, 1.25 + i, 0));
+    [5, 6, 7, 8].forEach((n, i) => k('f' + n, 'F' + n, 5.5 + i, 0));
+    [9, 10, 11, 12].forEach((n, i) => k('f' + n, 'F' + n, 9.75 + i, 0));
+    k('del', 'Del', 14, 0); k('knob', 'Knob', 15, 0, 1, { knob: true });
+    k('grv', '`', 0, 1); each('1234567890', (c, i) => k('d' + c, c, 1 + i, 1));
+    k('min', '-', 11, 1); k('eq', '=', 12, 1); k('bksp', 'Backspace', 13, 1, 2); k('pgup', 'PgUp', 15, 1);
+    k('tab', 'Tab', 0, 2, 1.5); each('QWERTYUIOP', (c, i) => k(c.toLowerCase(), c, 1.5 + i, 2));
+    k('lbr', '[', 11.5, 2); k('rbr', ']', 12.5, 2); k('bsl', '\\', 13.5, 2, 1.5); k('pgdn', 'PgDn', 15, 2);
+    k('caps', 'Caps', 0, 3, 1.75); each('ASDFGHJKL', (c, i) => k(c.toLowerCase(), c, 1.75 + i, 3));
+    k('semi', ';', 10.75, 3); k('quot', "'", 11.75, 3); k('ent', 'Enter', 12.75, 3, 2.25); k('home', 'Home', 15, 3);
+    k('lsft', 'Shift', 0, 4, 2.25); each('ZXCVBNM', (c, i) => k(c.toLowerCase(), c, 2.25 + i, 4));
+    k('com', ',', 9.25, 4); k('dot', '.', 10.25, 4); k('sl', '/', 11.25, 4); k('rsft', 'Shift', 12.25, 4, 1.75); k('up', '↑', 14, 4);
+    k('lctl', 'Ctrl', 0, 5, 1.25); k('win', 'Win', 1.25, 5, 1.25); k('lalt', 'Alt', 2.5, 5, 1.25); k('spc', 'Space', 3.75, 5, 6.25);
+    k('ralt', 'Alt', 10, 5); k('fn', 'Fn', 11, 5); k('rctl', 'Ctrl', 12, 5); k('left', '←', 13, 5); k('down', '↓', 14, 5); k('right', '→', 15, 5);
+  }),
+  /* Wooting 60HE, 60% ANSI */
+  wooting: layout(0, k => {
+    k('esc', 'Esc', 0, 0); each('1234567890', (c, i) => k('d' + c, c, 1 + i, 0));
+    k('min', '-', 11, 0); k('eq', '=', 12, 0); k('bksp', 'Backspace', 13, 0, 2);
+    k('tab', 'Tab', 0, 1, 1.5); each('QWERTYUIOP', (c, i) => k(c.toLowerCase(), c, 1.5 + i, 1));
+    k('lbr', '[', 11.5, 1); k('rbr', ']', 12.5, 1); k('bsl', '\\', 13.5, 1, 1.5);
+    k('caps', 'Caps', 0, 2, 1.75); each('ASDFGHJKL', (c, i) => k(c.toLowerCase(), c, 1.75 + i, 2));
+    k('semi', ';', 10.75, 2); k('quot', "'", 11.75, 2); k('ent', 'Enter', 12.75, 2, 2.25);
+    k('lsft', 'Shift', 0, 3, 2.25); each('ZXCVBNM', (c, i) => k(c.toLowerCase(), c, 2.25 + i, 3));
+    k('com', ',', 9.25, 3); k('dot', '.', 10.25, 3); k('sl', '/', 11.25, 3); k('rsft', 'Shift', 12.25, 3, 2.75);
+    k('lctl', 'Ctrl', 0, 4, 1.25); k('win', 'Win', 1.25, 4, 1.25); k('lalt', 'Alt', 2.5, 4, 1.25); k('spc', 'Space', 3.75, 4, 6.25);
+    k('ralt', 'Alt', 10, 4, 1.25); k('rwin', 'Win', 11.25, 4, 1.25); k('fn', 'Fn', 12.5, 4, 1.25); k('rctl', 'Ctrl', 13.75, 4, 1.25);
+  }),
+};
+
+const CODE = { Escape: 'esc', Delete: 'del', Backquote: 'grv', Minus: 'min', Equal: 'eq', Backspace: 'bksp', Insert: 'ins', Tab: 'tab', BracketLeft: 'lbr', BracketRight: 'rbr', Backslash: 'bsl', PageUp: 'pgup', CapsLock: 'caps', Semicolon: 'semi', Quote: 'quot', Enter: 'ent', PageDown: 'pgdn', Home: 'home', ShiftLeft: 'lsft', Comma: 'com', Period: 'dot', Slash: 'sl', ShiftRight: 'rsft', ArrowUp: 'up', ControlLeft: 'lctl', ControlRight: 'rctl', MetaLeft: 'win', MetaRight: 'rwin', AltLeft: 'lalt', Space: 'spc', AltRight: 'ralt', ArrowLeft: 'left', ArrowDown: 'down', ArrowRight: 'right' };
 function codeToId(c) {
   if (CODE[c]) return CODE[c];
   if (/^Key[A-Z]$/.test(c)) return c[3].toLowerCase();
@@ -419,15 +619,16 @@ function codeToId(c) {
   return null;
 }
 
-const MODS = new Set(['tab', 'caps', 'lsft', 'rsft', 'lctl', 'win', 'lalt', 'ralt', 'fn', 'ent', 'bksp', 'bsl', 'grv', 'ins', 'del', 'pgup', 'pgdn']);
+const MODS = new Set(['tab', 'caps', 'lsft', 'rsft', 'lctl', 'rctl', 'win', 'rwin', 'lalt', 'ralt', 'fn', 'ent', 'bksp', 'bsl', 'grv', 'ins', 'del', 'pgup', 'pgdn', 'home']);
 function ledDefault(x) {
-  if (x.row === 0) return x.id === 'del' ? '#b04dff' : '#ff8a3d';
+  if (x.row === 0 && KEYS.fgap) return x.id === 'del' ? '#b04dff' : '#ff8a3d';
   if (['w', 'a', 's', 'd', 'up', 'left', 'down', 'right'].includes(x.id)) return '#2fe0ff';
-  if (MODS.has(x.id)) return '#b04dff';
+  if (MODS.has(x.id) || x.id === 'esc') return '#b04dff';
   return '#4c5bff';
 }
 
 const EFFECTS = ['Off', 'Customization', 'Single color', 'Focus', 'Up-down rainbow', 'Left-right rainbow', 'Monochrome breath', 'Fluttering ribbons', 'Laser', 'Pinwheel', 'Vortex', 'Spectral cycle', 'Colorful swirls', 'Double vortex', 'Christmas', 'Spectrum breathing', 'Spectrum float', 'Digital rain', 'Single light up', 'Crucifix', 'Fingertip rainbow'];
+const STD_EFFECTS = ['Off', 'Single color', 'Breathing', 'Spectrum cycle', 'Wave', 'Reactive'];
 const FX = (body) => SV('0 0 16 16', 16, body, 1.4);
 const FX_ICON = {
   'Off': FX('<circle cx="8" cy="8" r="5.5"/><path d="M4.1 4.1l7.8 7.8"/>'),
@@ -452,39 +653,139 @@ const FX_ICON = {
   'Crucifix': FX('<path d="M8 2v12M2.5 6.5h11"/>'),
   'Fingertip rainbow': FX('<circle cx="8" cy="8" r="1.2" fill="currentColor"/><path d="M5.5 5.2a4 4 0 0 0 0 5.6M10.5 5.2a4 4 0 0 1 0 5.6M3.3 3a7 7 0 0 0 0 10M12.7 3a7 7 0 0 1 0 10"/>'),
 };
-const FIXED_SPEED =new Set(['Off', 'Customization', 'Single color']);
-const COLORABLE = new Set(['Customization', 'Single color', 'Monochrome breath']);
+FX_ICON['Breathing'] = FX_ICON['Monochrome breath'];
+FX_ICON['Spectrum cycle'] = FX_ICON['Spectral cycle'];
+FX_ICON['Wave'] = FX('<path d="M1.5 9.5c2.2 0 2.2-4 4.4-4s2.2 4 4.4 4 2.2-4 4.2-4"/><path d="M1.5 13h13" opacity=".5"/>');
+FX_ICON['Reactive'] = FX('<rect x="5.5" y="5.5" width="5" height="5" rx="1"/><path d="M3 3l1.4 1.4M13 3l-1.4 1.4M3 13l1.4-1.4M13 13l-1.4-1.4"/>');
+const FIXED_SPEED = new Set(['Off', 'Customization', 'Single color']);
+const COLORABLE = new Set(['Customization', 'Single color', 'Monochrome breath', 'Breathing', 'Reactive']);
+const RAINBOW = new Set(['Spectrum cycle', 'Wave']);
 const SWATCHES = ['#ff3b3b', '#ff8a3d', '#ffd23d', '#7dff4a', '#2fe0ff', '#4c5bff', '#b04dff', '#ff4fb8', '#ffffff', '#ff6f61', '#3dffb0', '#8a9bff'];
 
+/* ---------- devices: what each one offers decides what the page shows ---------- */
 const DEVICES = [
-  { id: 'atlantis', name: 'Lamzu Atlantis (1K Receiver)', kind: 'mouse', brand: 'Lamzu', conn: '2.4 GHz dongle', short: '2.4 GHz', batt: 78 },
-  { id: 'rs7', name: 'ATK RS7 RGB', kind: 'kb', brand: 'ATK', conn: 'Wired USB', short: 'Wired', fw: 'Firmware 1.07' },
-  { id: 'basilisk', name: 'Razer Basilisk V3', kind: 'mouse', brand: 'Razer', conn: 'Wired USB', short: 'Wired', fw: 'Firmware 1.04' },
-  { id: 'x2', name: 'Pulsar X2 CrazyLight', kind: 'mouse', brand: 'Pulsar', conn: '2.4 GHz dongle', short: '2.4 GHz', batt: 64, fw: 'Firmware 1.10' },
-  { id: 'q1', name: 'Keychron Q1', kind: 'kb', brand: 'Keychron', conn: 'Wired USB', short: 'Wired', fw: 'VIA v12' },
-  { id: 'wooting', name: 'Wooting 60HE', kind: 'kb', brand: 'Wooting', conn: 'Wired USB', short: 'Wired', fw: 'Firmware 2.8.1' },
+  {
+    id: 'atlantis', name: 'Lamzu Atlantis (1K Receiver)', kind: 'mouse', brand: 'Lamzu', conn: '2.4 GHz dongle', short: '2.4 GHz', batt: 78,
+    tabs: [['sensor', 'Sensor'], ['buttons', 'Buttons'], ['macros', 'Macros']], profiles: 4,
+    mouse: { dpi: [400, 800, 1600, 3200], active: 1, colors: ['#ff3b3b', '#2fe0ff', '#7dff4a', '#ffd23d'], min: 50, max: 26000, range: '50 to 26,000 DPI', polls: ['125', '250', '500', '1K'], poll: '1K', lods: ['1 mm', '2 mm'], lod: '1 mm', debounce: true, sensor: ['msync', 'angle', 'ripple', 'xy'] },
+    macros: { slots: 16, bytes: 384, perSlot: true, repeat: true },
+  },
+  {
+    id: 'rs7', name: 'ATK RS7 RGB', kind: 'kb', brand: 'ATK', conn: 'Wired USB', short: 'Wired', fw: 'Firmware 1.07',
+    tabs: [['triggers', 'Triggers & paired keys'], ['keybinds', 'Keybinds'], ['lighting', 'Lighting'], ['macros', 'Macros'], ['advanced', 'Advanced']],
+    he: { travel: 3.4, min: 0.1, step: 0.02, rtMin: 0.02, rtMax: 3.4, def: 1.2, rtDef: 0.16, dz: true, extreme: true },
+    pairs: true, calibrate: true, presets: { label: 'Preset', items: ['Default', 'FPS / Gaming', 'Typing', 'Custom'] },
+    layers: ['Win Base', 'Win Fn', 'Mac Base', 'Mac Fn'], effects: EFFECTS, zones: ['Back lamp', 'Logo light'], effect: 'Customization', bright: 80,
+    macros: { slots: 16, bytes: 512 }, polls: ['1K', '2K', '4K', '8K'],
+  },
+  {
+    id: 'basilisk', name: 'Razer Basilisk V3', kind: 'mouse', brand: 'Razer', conn: 'Wired USB', short: 'Wired', fw: 'Firmware 1.04',
+    tabs: [['sensor', 'Sensor'], ['lighting', 'Lighting']],
+    mouse: { dpi: [400, 800, 1600, 3200, 6400], active: 2, min: 100, max: 26000, range: '100 to 26,000 DPI', polls: ['125', '500', '1K'], poll: '1K', lods: null, debounce: false, sensor: ['xy'] },
+    zones: ['Mouse', 'Scroll wheel', 'Logo'], effects: STD_EFFECTS,
+  },
+  {
+    id: 'x2', name: 'Pulsar X2 CrazyLight', kind: 'mouse', brand: 'Pulsar', conn: '2.4 GHz dongle', short: '2.4 GHz', batt: 64, fw: 'Firmware 1.10',
+    tabs: [['sensor', 'Sensor']], profiles: 4,
+    mouse: { dpi: [800, 1600, 3200], active: 0, min: 10, max: 32000, range: '10 to 32,000 DPI', polls: ['125', '250', '500', '1K', '2K', '4K'], poll: '2K', lods: ['Low', 'Medium', 'High'], lod: 'Medium', debounce: true, sensor: ['msync', 'angle', 'ripple'] },
+  },
+  {
+    id: 'q1', name: 'Keychron Q1', kind: 'kb', brand: 'Keychron', conn: 'Wired USB', short: 'Wired', fw: 'VIA v12',
+    tabs: [['keybinds', 'Keybinds'], ['lighting', 'Lighting'], ['macros', 'Macros']],
+    layers: ['Layer 0', 'Layer 1', 'Layer 2', 'Layer 3'], effects: STD_EFFECTS, effect: 'Wave', bright: 70,
+    macros: { slots: 16, bytes: 1024 },
+  },
+  {
+    id: 'wooting', name: 'Wooting 60HE', kind: 'kb', brand: 'Wooting', conn: 'Wired USB', short: 'Wired', fw: 'Firmware 2.8.1',
+    tabs: [['triggers', 'Triggers'], ['lighting', 'Lighting']],
+    he: { travel: 4, min: 0.1, step: 0.05, rtMin: 0.1, rtMax: 2.35, def: 2, rtDef: 0.25, dz: false },
+    presets: { label: 'Onboard profile', items: ['Profile 1', 'Profile 2', 'Profile 3', 'Profile 4'] },
+    effects: ['Off', 'Single color', 'Customization'], effect: 'Customization', bright: 90,
+  },
 ];
+const BTNS = [
+  { id: 'b1', name: 'Left button', def: 'Left click' },
+  { id: 'b2', name: 'Right button', def: 'Right click' },
+  { id: 'b3', name: 'Wheel click', def: 'Middle click' },
+  { id: 'b4', name: 'Back side button', def: 'Back' },
+  { id: 'b5', name: 'Front side button', def: 'Forward' },
+  { id: 'b6', name: 'DPI button', def: 'Cycle DPI' },
+];
+const MEDIA = { f1: 'Bri−', f2: 'Bri+', f5: 'Prev', f6: 'Play', f7: 'Next', f8: 'Mute', f9: 'Vol−', f10: 'Vol+' };
+const step = (t, k) => ({ t, k });
+function initialMacros() {
+  const empty = () => ({ name: '', steps: [], rep: 'Once' });
+  const list = Array.from({ length: D.macros.slots }, empty);
+  if (D.id === 'atlantis') {
+    list[0] = { name: 'Double click', rep: 'Once', steps: [step('tap', 'Left click'), { t: 'delay', v: 20 }, step('tap', 'Left click')] };
+    list[1] = { name: 'Copy', rep: 'Once', steps: [step('down', 'Ctrl'), step('tap', 'C'), step('up', 'Ctrl')] };
+  } else if (D.id === 'q1') {
+    list[0] = { name: 'Copy', rep: 'Once', steps: [step('down', 'Ctrl'), step('down', 'C'), step('up', 'C'), step('up', 'Ctrl')] };
+  } else {
+    list[0] = { name: 'Copy line', rep: 'Once', steps: [step('tap', 'Home'), step('down', 'Shift'), step('tap', 'End'), step('up', 'Shift'), step('down', 'Ctrl'), step('tap', 'C'), step('up', 'Ctrl')] };
+    list[1] = { name: 'Quick swap', rep: 'Once', steps: [step('tap', 'Q'), { t: 'delay', v: 30 }, step('tap', 'Q')] };
+  }
+  return list;
+}
+function initialMap() {
+  if (D.id === 'q1') return [{}, { ...MEDIA, knob: 'Vol' }, {}, {}];
+  return [{ caps: 'Ctrl' }, { ...MEDIA }, { win: 'Opt', lalt: 'Cmd' }, { ...MEDIA }];
+}
 
-/* ---------- state ---------- */
-function initialState() {
-  const act = {}, rt = {}, press = {}, lift = {}, led = {};
-  KEYS.forEach(x => { act[x.id] = 1.2; rt[x.id] = false; press[x.id] = 0.15; lift[x.id] = 0.15; led[x.id] = ledDefault(x); });
-  ['w', 'a', 's', 'd'].forEach(id => { act[id] = 1.5; rt[id] = true; });
+/* ---------- state; every device keeps its own ---------- */
+let D = null, KEYS = [], KEY = {}, S, base, hist = [], labels = [], dragging = false;
+const ui = { theme: 'dark', view: 'device', device: 'rs7', tray: true, startup: false, battAlerts: true, accent: 'cyan' };
+const DUI = ['sel', 'ledSel', 'kbTab', 'msTab', 'zone', 'layer', 'mapSel', 'macro', 'btn', 'tester', 'preset', 'profile', 'pairType', 'menu', 'pick', 'pickQ'];
+const STORE = {};
+function freshUI(d) {
   return {
-    act, rt, press, lift, led, dzTop: 0.1, dzBot: 0.1,
-    socdMode: 'last', socdAct: 1.5, socdRt: false,
-    effect: 'Customization', color: '#2fe0ff', bright: 80, speed: 50,
-    dpi: [800, 1600, 3200], dpiActive: 0, poll: '1K', lod: 'Medium', debounce: 3, msync: true, angle: false, ripple: true,
+    sel: new Set(d.he ? ['w', 'a', 's', 'd'] : []), ledSel: new Set(), kbTab: d.tabs[0][0], msTab: d.tabs[0][0],
+    zone: d.zones ? d.zones[0] : null, layer: 0, mapSel: 'caps', macro: 0, btn: 'b5',
+    tester: { id: 'w', depth: d.he ? d.he.travel * 0.55 : 0 }, preset: d.presets ? d.presets.items[0] : null, profile: 1,
+    pairType: 'socd', menu: false, pick: d.kind === 'mouse' ? 'Mouse' : 'Basic', pickQ: '',
   };
 }
-let S = initialState();
-let base = clone(S), hist = [], labels = [], dragging = false;
-const ui = {
-  theme: 'dark', view: 'device', device: 'rs7', kbTab: 'triggers', msTab: 'sensor', preset: 'Default', profile: 1, zone: 'Back lamp',
-  sel: new Set(['w', 'a', 's', 'd']), ledSel: new Set(), pairType: 'SOCD', menu: false,
-  tester: { id: 'w', depth: 1.86 }, tray: true, startup: false, battAlerts: true, accent: 'cyan',
-};
-/* accent presets: [dark accent, dark ink, light accent, light ink]; orange and red stay reserved for meaning */
+function initialState() {
+  const s = { act: {}, rt: {}, press: {}, lift: {}, led: {} }, he = D.he;
+  KEYS.forEach(x => {
+    s.led[x.id] = ledDefault(x);
+    if (he) { s.act[x.id] = he.def; s.rt[x.id] = false; s.press[x.id] = he.rtDef; s.lift[x.id] = he.rtDef; }
+  });
+  if (he) ['w', 'a', 's', 'd'].forEach(id => { s.act[id] = D.id === 'rs7' ? 1.5 : 1.2; s.rt[id] = true; });
+  Object.assign(s, {
+    dzTop: 0.1, dzBot: 0.1, socdMode: 'last', socdAct: 1.5, socdRt: false,
+    pairs: D.pairs ? [{ type: 'rs', keys: ['w', 's'] }, { type: 'socd', keys: ['a', 'd'] }, { type: 'dks', keys: ['esc'] }] : [],
+    dks: [['↓', 'Press past', 'Esc'], ['↓', 'Bottom out', ''], ['↑', 'Lift from bottom', ''], ['↑', 'Release above', 'Esc']],
+    effect: D.effect || 'Off', color: '#2fe0ff', bright: D.bright || 80, speed: 50,
+    adv: { mac: false, wasd: false, fninv: false, game: true, winlock: true, sixkey: false, anti: false, extreme: false }, kbPoll: '1K',
+    map: D.layers ? initialMap() : null, macros: D.macros ? initialMacros() : null,
+  });
+  if (D.mouse) {
+    const m = D.mouse;
+    Object.assign(s, { dpi: [...m.dpi], dpiActive: m.active, poll: m.poll, lod: m.lod, debounce: 3, msync: true, angle: false, ripple: true, xy: false });
+    s.btns = Object.fromEntries(BTNS.map(b => [b.id, b.def]));
+    s.btns.b5 = 'M1';
+  }
+  if (D.zones && D.kind === 'mouse') s.zfx = {
+    'Mouse': { effect: 'Spectrum cycle', color: '#2fe0ff', bright: 80, speed: 50 },
+    'Scroll wheel': { effect: 'Single color', color: '#2fe0ff', bright: 80, speed: 50 },
+    'Logo': { effect: 'Breathing', color: '#b04dff', bright: 80, speed: 40 },
+  };
+  return s;
+}
+function useDevice(id) {
+  if (D) STORE[D.id] = { S, base, hist, labels, ui: Object.fromEntries(DUI.map(k => [k, ui[k]])) };
+  D = DEVICES.find(d => d.id === id); ui.device = id;
+  KEYS = LAYOUTS[id] || []; KEY = Object.fromEntries(KEYS.map(x => [x.id, x]));
+  const st = STORE[id];
+  if (st) { ({ S, base, hist, labels } = st); Object.assign(ui, st.ui); }
+  else { Object.assign(ui, freshUI(D)); S = initialState(); base = clone(S); hist = []; labels = []; }
+}
+const L = () => D.kind === 'mouse' ? S.zfx[ui.zone] : S;
+const stepA = () => D.he.step / (D.he.extreme && S.adv.extreme ? 2 : 1);
+const pctOf = (v, a, b) => ((v - a) / (b - a) * 100).toFixed(1) + '%';
+
+/* accent presets: [name, dark accent, dark ink, light accent, light ink]; orange and red stay reserved for meaning */
 const ACCENTS = {
   cyan: ['Cyan', '#47b4ff', '#04121f', '#0067b3', '#ffffff'],
   violet: ['Violet', '#a98bff', '#120a2a', '#6a3fd0', '#ffffff'],
@@ -511,6 +812,7 @@ function selVals(map) {
   const vals = ids.map(id => map[id]);
   return { ids, v: vals[0], same: vals.every(v => Math.abs(v - vals[0]) < 0.001) };
 }
+const pairOf = id => S.pairs.find(p => p.keys.includes(id));
 
 /* ---------- colour helpers ---------- */
 function hsv2hex(h, s, v) {
@@ -534,20 +836,22 @@ function dim(hex, pct) {
 }
 function ledColor(x) {
   const e = S.effect; let c;
-  if (e === 'Off') return null;
+  if (e === 'Off' || x.knob) return null;
+  const across = (x.x + x.w / 2) / KEYS.cols;
   if (e === 'Customization') c = S.led[x.id];
-  else if (e === 'Single color' || e === 'Monochrome breath') c = S.color;
-  else if (e === 'Left-right rainbow') c = hsv2hex((x.x + x.w / 2) / 16 * 330, .85, 1);
-  else if (e === 'Up-down rainbow') c = hsv2hex(x.row / 5 * 300, .85, 1);
-  else c = hsv2hex(((x.x + x.w / 2) / 16 * 240 + x.row * 28) % 360, .8, 1);
+  else if (COLORABLE.has(e)) c = S.color;
+  else if (e === 'Left-right rainbow' || e === 'Wave') c = hsv2hex(across * 330, .85, 1);
+  else if (e === 'Up-down rainbow') c = hsv2hex(x.row / KEYS.rows * 300, .85, 1);
+  else if (e === 'Spectrum cycle') c = hsv2hex(195, .85, 1);
+  else c = hsv2hex((across * 240 + x.row * 28) % 360, .8, 1);
   return dim(c, S.bright);
 }
 function currentColor() {
-  if (S.effect === 'Customization' && ui.ledSel.size) {
+  if (D.kind === 'kb' && S.effect === 'Customization' && ui.ledSel.size) {
     const cs = [...ui.ledSel].map(id => S.led[id]);
     if (cs.every(c => c === cs[0])) return cs[0];
   }
-  return S.color;
+  return L().color;
 }
 
 /* ---------- templates ---------- */
@@ -586,41 +890,49 @@ function tabsHTML(tabs, current, act) {
 function stepper(act, val, unit = 'mm', cls = '') {
   return `<div class="stp ${cls}"><button class="sbtn" data-act="${act}" data-d="-1" aria-label="Decrease">−</button><span class="snum"><span data-live="${act}">${val}</span>${unit ? `<small>${unit}</small>` : ''}</span><button class="sbtn" data-act="${act}" data-d="1" aria-label="Increase">+</button></div>`;
 }
+const segHTML = (act, items, cur, cls = 'sm', label = '') => `<div class="seg ${cls}" role="radiogroup" ${label ? `aria-label="${label}"` : ''}>${items.map(p => `<button class="${p === cur ? 'on' : ''}" role="radio" aria-checked="${p === cur}" data-act="${act}" data-arg="${esc(p)}">${esc(p)}</button>`).join('')}</div>`;
+const swHTML = (act, on, label, arg = '') => `<button class="sw ${on ? 'on' : ''}" role="switch" aria-checked="${on}" aria-label="${label}" data-act="${act}" ${arg ? `data-arg="${arg}"` : ''}></button>`;
 
 function isPending(id, lens) {
   if (lens === 'led') return S.led[id] !== base.led[id];
+  if (lens === 'map') return (S.map[ui.layer][id] || '') !== (base.map[ui.layer][id] || '');
   return ['act', 'rt', 'press', 'lift'].some(m => S[m][id] !== base[m][id]);
 }
 const anyPending = lens => KEYS.some(x => isPending(x.id, lens));
+const plateAttr = id => `class="plate" id="${id}" style="width:${KEYS.width}px;height:${KEYS.height}px"`;
 function boardHTML(lens) {
-  const sel = lens === 'trig' ? ui.sel : ui.ledSel;
-  const bv = baseValue();
+  const he = D.he;
+  const isSel = id => lens === 'map' ? ui.mapSel === id : (lens === 'trig' ? ui.sel : ui.ledSel).has(id);
+  const bv = lens === 'trig' ? baseValue() : 0;
   let h = '';
   for (const x of KEYS) {
-    const left = x.x * U, top = x.row * PITCH + (x.row ? FGAP : 0), w = x.w * U - 3;
-    const cls = ['key']; if (sel.has(x.id)) cls.push('sel');
+    const left = x.x * U, top = x.row * PITCH + (x.row ? KEYS.fgap : 0), w = x.w * U - 3;
+    const cls = ['key']; if (isSel(x.id)) cls.push('sel'); if (x.knob) cls.push('knob');
     let style = `left:${left}px;top:${top}px;width:${w}px`;
-    let inner = '';
+    let inner = '', desc = x.label;
     if (lens === 'trig') {
-      const a = S.act[x.id];
+      const a = S.act[x.id], p = pairOf(x.id);
       const d = ui.tester.id === x.id ? ui.tester.depth : 0;
-      inner += `<span class="depth" data-depth="${x.id}" style="height:${(d / 3.4 * 100).toFixed(1)}%"></span>`;
+      inner += `<span class="depth" data-depth="${x.id}" style="height:${(d / he.travel * 100).toFixed(1)}%"></span>`;
       inner += `<span class="lg">${esc(x.label)}</span>`;
       if (Math.abs(a - bv) > 0.001) { cls.push('diff'); inner += `<span class="val">${fmt(a)}</span>`; }
-      inner += `<span class="bar"><i style="width:${(a / 3.4 * 100).toFixed(1)}%"></i></span>`;
-      const paired = x.id === 'a' || x.id === 'd';
-      if (paired) cls.push('paired');
-      const pend = isPending(x.id, 'trig');
-      if (pend) cls.push('pending');
-      if (paired || S.rt[x.id]) inner += `<span class="tr">${paired ? `<span class="pair">${I.link}</span>` : ''}${S.rt[x.id] ? '<span class="rt"></span>' : ''}</span>`;
+      inner += `<span class="bar"><i style="width:${(a / he.travel * 100).toFixed(1)}%"></i></span>`;
+      if (p) cls.push('paired');
+      if (isPending(x.id, 'trig')) cls.push('pending');
+      if (S.rt[x.id]) { cls.push('rtk'); inner += '<span class="rt"></span>'; }
+      desc = `${x.label}, ${fmt(a)} millimetres${S.rt[x.id] ? ', Rapid Trigger on' : ''}${p ? ', ' + PT[p.type].name : ''}`;
+    } else if (lens === 'map') {
+      const m = S.map[ui.layer][x.id];
+      if (m) { cls.push('remap'); inner += `<span class="lg">${esc(m)}</span><span class="sub">${esc(x.label)}</span>`; desc = `${x.label}, sends ${m}`; }
+      else { if (ui.layer) cls.push('thru'); inner += `<span class="lg">${esc(x.label)}</span>`; }
+      if (isPending(x.id, 'map')) cls.push('pending');
     } else {
       inner += `<span class="lg">${esc(x.label)}</span>`;
       const c = ledColor(x);
       if (c) { cls.push('lit'); style += `;--led:${c};--lg:${ink(c)}`; }
       if (isPending(x.id, 'led')) cls.push('pending');
     }
-    const desc = lens === 'trig' ? `${x.label}, ${fmt(S.act[x.id])} millimetres${S.rt[x.id] ? ', Rapid Trigger on' : ''}` : x.label;
-    h += `<button class="${cls.join(' ')}" data-key="${x.id}" data-lens="${lens}" style="${style}" aria-pressed="${sel.has(x.id)}" aria-label="${esc(desc)}"><span class="face">${inner}</span></button>`;
+    h += `<button class="${cls.join(' ')}" data-key="${x.id}" data-lens="${lens}" style="${style}" aria-pressed="${isSel(x.id)}" aria-label="${esc(desc)}"><span class="face">${inner}</span>${lens === 'trig' && pairOf(x.id) ? `<span class="tr" title="${PT[pairOf(x.id).type].name}">${adv(pairOf(x.id).type)}</span>` : ''}</button>`;
   }
   return h;
 }
@@ -641,38 +953,48 @@ function selbarHTML(lens) {
 }
 
 function inspHTML() {
-  const types = [['SOCD', 1], ['Rapid switching', 0], ['Dynamic keystroke', 0], ['Mod-tap', 0], ['Toggle', 0]];
-  const cur = ui.pairType, count = types.find(t => t[0] === cur)[1];
+  const cur = PT[ui.pairType], list = S.pairs.filter(p => p.type === cur.id);
   let h = `<div class="phead"><span class="ptitle">Paired keys</span><span class="sp"></span><button class="btn outline sm" data-act="noop">${I.plus}Add</button></div>
-    <div class="selwrap"><button class="select ${ui.menu ? 'open' : ''}" data-act="menu" aria-haspopup="menu" aria-expanded="${ui.menu}"><span>${cur}</span><span class="cnt">${count ? count + ' configured' : 'None yet'}</span>${I.chev}</button>
-    ${ui.menu ? `<div class="menu" role="menu">${types.map(([t, c]) => `<button class="mi ${t === cur ? 'on' : ''}" role="menuitemradio" aria-checked="${t === cur}" data-act="ptype" data-arg="${t}"><span class="ck">${t === cur ? I.check : ''}</span>${t}<span class="cnt">${c || ''}</span></button>`).join('')}</div>` : ''}</div>`;
-  if (cur !== 'SOCD') return h + `<p class="empty-sm">No ${cur.toLowerCase()} keys yet. Choose Add, then pick the keys on the board.</p>`;
-  const modes = [['last', 'Last pressed wins'], ['neutral', 'Neither key sends'], ['first', 'A always wins'], ['second', 'D always wins']];
-  return h + `<div class="pair-row" data-hover="pair"><span class="mini">A</span><span class="plus">+</span><span class="mini">D</span><span class="sp"></span><button class="btn ghost sm danger" data-act="noop">Remove</button></div>
-    <div class="flabel">When both are held</div>
-    <div role="radiogroup" aria-label="When both are held">${modes.map(([m, t]) => `<button class="radio ${S.socdMode === m ? 'on' : ''}" role="radio" aria-checked="${S.socdMode === m}" data-act="socd" data-arg="${m}"><i></i>${t}</button>`).join('')}</div>
-    <div class="hr" style="margin:6px 0 2px"></div>
-    <div class="irow"><span>Actuation</span>${stepper('socdAct', fmt(S.socdAct))}</div>
-    <div class="irow"><span>Rapid Trigger</span><button class="sw ${S.socdRt ? 'on' : ''}" role="switch" aria-checked="${S.socdRt}" aria-label="Rapid Trigger for A and D" data-act="socdRt"></button></div>`;
+    <div class="selwrap"><button class="select ${ui.menu ? 'open' : ''}" data-act="menu" aria-haspopup="menu" aria-expanded="${ui.menu}">${adv(cur.id, 'lg')}<span>${cur.name}</span><span class="cnt">${list.length || 'None'}</span>${I.chev}</button>
+    ${ui.menu ? `<div class="menu" role="menu">${PAIR_TYPES.map(t => {
+      const n = S.pairs.filter(p => p.type === t.id).length;
+      return `<button class="mi ${t.id === cur.id ? 'on' : ''}" role="menuitemradio" aria-checked="${t.id === cur.id}" data-act="ptype" data-arg="${t.id}">${adv(t.id, 'lg')}<span class="mi-t"><b>${t.name}</b><small>${t.summary}</small></span><span class="cnt">${n || ''}</span></button>`;
+    }).join('')}</div>` : ''}</div>`;
+  if (!list.length) return h + `<p class="empty-sm">${cur.summary}<br><br>None set up yet. Choose Add, then pick the keys on the board.</p>`;
+  const p = list[0], names = p.keys.map(id => KEY[id].label);
+  h += `<div class="pair-row" data-hover="${p.keys.join(',')}">${names.map(n => `<span class="mini">${esc(n)}</span>`).join('<span class="plus">+</span>')}<span class="sp"></span><button class="btn ghost sm danger" data-act="noop">Remove</button></div>`;
+  if (cur.id === 'socd') {
+    const modes = [['last', 'Last pressed wins'], ['neutral', 'Neither key sends'], ['first', `${names[0]} always wins`], ['second', `${names[1]} always wins`]];
+    return h + `<div class="flabel">When both are held</div>
+      <div role="radiogroup" aria-label="When both are held">${modes.map(([m, t]) => `<button class="radio ${S.socdMode === m ? 'on' : ''}" role="radio" aria-checked="${S.socdMode === m}" data-act="socd" data-arg="${m}"><i></i>${t}</button>`).join('')}</div>
+      <div class="hr" style="margin:6px 0 2px"></div>
+      <div class="irow"><span>Actuation</span>${stepper('socdAct', fmt(S.socdAct))}</div>
+      <div class="irow"><span>Rapid Trigger</span>${swHTML('socdRt', S.socdRt, `Rapid Trigger for ${names.join(' and ')}`)}</div>`;
+  }
+  if (cur.id === 'dks') {
+    return h + `<div class="flabel">Actions along the key’s travel</div><div class="dks">${S.dks.map(([dir, n, a]) => `<div class="dk-r"><span class="dk-a">${dir}</span><span class="dk-n">${n}</span><span class="dk-v ${a ? '' : 'none'}">${a || 'Nothing'}</span></div>`).join('')}</div>
+      <p class="note-sm">Pick a stage, then a key in Keybinds.</p>`;
+  }
+  return h + `<p class="pdesc tight">${cur.summary}</p><p class="note-sm">Each key keeps its own actuation and Rapid Trigger.</p>`;
 }
 
 function gaugeSVG() {
-  const id = ui.tester.id, d = ui.tester.depth, a = S.act[id];
-  const H = 160, T = 8, X = 38, W = 22, y = v => T + v / 3.4 * H;
+  const tr = D.he.travel, id = ui.tester.id, d = ui.tester.depth, a = S.act[id];
+  const H = 160, T = 8, X = 38, W = 22, y = v => T + v / tr * H;
   let s = `<svg class="gauge" viewBox="0 0 100 176" width="100" height="176" aria-hidden="true"><defs>
     <pattern id="hatch" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" style="stroke:var(--tick)" stroke-width="1.4"/></pattern>
     <filter id="glow" x="-30%" y="-400%" width="160%" height="900%"><feGaussianBlur stdDeviation="2.4"/></filter>
     <clipPath id="trk"><rect x="${X}" y="${T}" width="${W}" height="${H}" rx="5"/></clipPath></defs>`;
-  for (let i = 0; i <= 34; i++) {
+  for (let i = 0; i <= Math.round(tr * 10); i++) {
     const yy = y(i / 10), major = i % 5 === 0;
     s += `<line x1="${major ? 22 : 27}" x2="32" y1="${yy}" y2="${yy}" style="stroke:var(--tick)" stroke-width="1"/>`;
     if (major) s += `<text x="18" y="${yy + 3.2}" text-anchor="end" class="gl">${(i / 10).toFixed(1)}</text>`;
   }
   s += `<rect x="${X}" y="${T}" width="${W}" height="${H}" rx="5" style="fill:var(--raised)"/>
     <g clip-path="url(#trk)">
-      <rect x="${X}" y="${T}" width="${W}" height="${S.dzTop / 3.4 * H}" fill="url(#hatch)"/>
-      <rect x="${X}" y="${y(3.4 - S.dzBot)}" width="${W}" height="${S.dzBot / 3.4 * H}" fill="url(#hatch)"/>
-      <rect id="gFill" x="${X}" y="${T}" width="${W}" height="${d / 3.4 * H}" style="fill:var(--accent)" opacity=".28"/>
+      ${D.he.dz ? `<rect x="${X}" y="${T}" width="${W}" height="${S.dzTop / tr * H}" fill="url(#hatch)"/>
+      <rect x="${X}" y="${y(tr - S.dzBot)}" width="${W}" height="${S.dzBot / tr * H}" fill="url(#hatch)"/>` : ''}
+      <rect id="gFill" x="${X}" y="${T}" width="${W}" height="${d / tr * H}" style="fill:var(--accent)" opacity=".28"/>
       <line id="gEdge" x1="${X}" x2="${X + W}" y1="${y(d)}" y2="${y(d)}" style="stroke:var(--fg)" stroke-width="1.5" opacity="${d > 0.005 ? .9 : 0}"/>
     </g>
     <line x1="${X - 7}" x2="${X + W + 7}" y1="${y(a)}" y2="${y(a)}" style="stroke:var(--accent)" stroke-width="6" opacity=".55" filter="url(#glow)"/>
@@ -680,9 +1002,9 @@ function gaugeSVG() {
     <text x="${X + W + 11}" y="${y(a) + 3.6}" class="gl acc">${fmt(a)}</text></svg>`;
   return s;
 }
-function testerHTML() {
+function testerHTML(cls = '') {
   const id = ui.tester.id, d = ui.tester.depth, a = S.act[id], on = d >= a;
-  return `<section class="panel" id="ktPanel"><div class="phead"><span class="ptitle">Key tester</span><span class="sp"></span><span class="pnote">Press any key to test it</span></div>
+  return `<section class="panel ${cls}" id="ktPanel" data-cls="${cls}"><div class="phead"><span class="ptitle">Key tester</span><span class="sp"></span><span class="pnote">Press any key</span></div>
     <div class="kt">${gaugeSVG()}<div class="kt-r">
       <span class="kcap">${esc(KEY[id].label)}</span>
       <div class="big"><b id="ktDepth">${fmt(d)}</b><span>mm</span></div>
@@ -692,85 +1014,194 @@ function testerHTML() {
 function idleHTML(msg) {
   return `<div class="idle">${I.cursor}<p>${msg}</p><button class="btn outline sm" data-act="selall" data-arg="trig">Select all keys</button></div>`;
 }
-function rulerHTML() {
+function rulerHTML(a, b) {
   let t = '';
-  for (let i = 1; i <= 34; i++) { const v = i / 10; t += `<i class="${i % 5 === 0 ? 'M' : ''}" style="left:${((v - .1) / 3.3 * 100).toFixed(2)}%"></i>`; }
-  [0.1, 1, 2, 3, 3.4].forEach(v => { t += `<b style="left:${((v - .1) / 3.3 * 100).toFixed(2)}%">${fmt(v)}</b>`; });
+  for (let i = Math.round(a * 10); i <= Math.round(b * 10); i++) t += `<i class="${i % 5 === 0 ? 'M' : ''}" style="left:${pctOf(i / 10, a, b)}"></i>`;
+  [...new Set([a, 1, 2, 3, b])].forEach(v => { t += `<b style="left:${pctOf(v, a, b)}">${fmt(v)}</b>`; });
   return `<div class="ruler" aria-hidden="true">${t}</div>`;
 }
 function actHTML() {
+  const he = D.he;
   if (!ui.sel.size) return `<section class="panel"><div class="phead"><span class="ptitle">Actuation</span></div>${idleHTML('Select keys on the board to set how far they travel before they register.')}</section>`;
   const { v, same } = selVals(S.act);
   return `<section class="panel"><div class="phead"><span class="ptitle">Actuation</span><span class="sp"></span><button class="btn outline sm" data-act="useall" ${same ? '' : 'disabled'}>Use for all keys</button></div>
     <div class="bigrow"><button class="sbtn lg" data-act="act" data-d="-1" aria-label="Decrease actuation">−</button>
       <div class="big"><b data-live="act">${same ? fmt(v) : 'Mixed'}</b><span>${same ? 'mm' : ''}</span></div>
       <button class="sbtn lg" data-act="act" data-d="1" aria-label="Increase actuation">+</button></div>
-    <input class="rng" type="range" min="0.1" max="3.4" step="0.02" value="${v}" style="--p:${((v - .1) / 3.3 * 100).toFixed(1)}%" data-slide="act" aria-label="Actuation point">
-    ${rulerHTML()}
-    <div class="hr"></div>
+    <input class="rng" type="range" min="${he.min}" max="${he.travel}" step="${stepA()}" value="${v}" style="--p:${pctOf(v, he.min, he.travel)}" data-slide="act" aria-label="Actuation point">
+    ${rulerHTML(he.min, he.travel)}
+    ${he.dz ? `<div class="hr"></div>
     <span class="dz-l">Dead zones for all keys (mm)</span>
-    <div class="dz-r"><span>Top</span>${stepper('dzTop', fmt(S.dzTop), '', 'xs')}<span>Bottom</span>${stepper('dzBot', fmt(S.dzBot), '', 'xs')}</div></section>`;
+    <div class="dz-r"><span>Top</span>${stepper('dzTop', fmt(S.dzTop), '', 'xs')}<span>Bottom</span>${stepper('dzBot', fmt(S.dzBot), '', 'xs')}</div>` : `<div class="hr"></div><p class="pnote">Moves in ${fmt(stepA())} mm steps, from ${fmt(he.min)} to ${fmt(he.travel)} mm.</p>`}</section>`;
 }
 function rtHTML() {
+  const he = D.he;
   if (!ui.sel.size) return `<section class="panel"><div class="phead"><span class="ptitle">Rapid Trigger</span></div>${idleHTML('Select keys on the board to set up Rapid Trigger for them.')}</section>`;
   const ids = [...ui.sel], onN = ids.filter(id => S.rt[id]).length, on = onN === ids.length;
   const pv = selVals(S.press), lv = selVals(S.lift);
-  return `<section class="panel"><div class="phead"><span class="ptitle">Rapid Trigger</span><span class="sp"></span>${onN && !on ? `<span class="pnote">On for ${onN} of ${ids.length}</span>` : ''}<button class="sw ${on ? 'on' : ''}" role="switch" aria-checked="${on}" aria-label="Rapid Trigger" data-act="rt"></button></div>
+  const slide = (kind, sv, label) => `<input class="rng" type="range" min="${he.rtMin}" max="${he.rtMax}" step="${stepA()}" value="${sv.v}" style="--p:${pctOf(sv.v, he.rtMin, he.rtMax)}" data-slide="${kind}" ${on ? '' : 'disabled'} aria-label="${label}">`;
+  return `<section class="panel"><div class="phead"><span class="ptitle">Rapid Trigger</span><span class="sp"></span>${onN && !on ? `<span class="pnote">On for ${onN} of ${ids.length}</span>` : ''}${swHTML('rt', on, 'Rapid Trigger')}</div>
     <p class="pdesc">Fires and resets whenever the key changes direction, instead of at one fixed point.</p>
     <div class="rtb ${on ? '' : 'off'}">
       <div class="srow2"><span>Press sensitivity</span>${stepper('press', pv.same ? fmt(pv.v) : 'Mixed')}</div>
-      <input class="rng" type="range" min="0.02" max="1" step="0.01" value="${pv.v}" style="--p:${((pv.v - .02) / .98 * 100).toFixed(1)}%" data-slide="press" ${on ? '' : 'disabled'} aria-label="Press sensitivity">
+      ${slide('press', pv, 'Press sensitivity')}
       <div class="srow2" style="margin-top:10px"><span>Lift sensitivity</span>${stepper('lift', lv.same ? fmt(lv.v) : 'Mixed')}</div>
-      <input class="rng" type="range" min="0.02" max="1" step="0.01" value="${lv.v}" style="--p:${((lv.v - .02) / .98 * 100).toFixed(1)}%" data-slide="lift" ${on ? '' : 'disabled'} aria-label="Lift sensitivity">
+      ${slide('lift', lv, 'Lift sensitivity')}
+      <div class="rng-ends"><span>${fmt(he.rtMin)}</span><span>${fmt(he.rtMax)} mm</span></div>
     </div></section>`;
 }
 function trigHTML() {
-  return `<div class="brow"><div class="bcol"><div class="case"><div class="plate" id="plateTrig">${boardHTML('trig')}</div>
-      <div class="lip"><span class="lg-i"><i class="g-bar"></i>Actuation point</span><span class="lg-i"><i class="g-dot"></i>Rapid Trigger</span><span class="lg-i">${I.link}Paired key</span>${anyPending('trig') ? '<span class="lg-i"><i class="g-pend"></i>Not applied</span>' : ''}<span class="sp"></span><span>Keys without a number use ${fmt(baseValue())} mm</span></div></div>
-      ${selbarHTML('trig')}</div>
-    <aside class="panel insp">${inspHTML()}</aside></div>
-    <div class="tools">${testerHTML()}${actHTML()}${rtHTML()}</div>`;
+  const types = [...new Set(S.pairs.map(p => p.type))];
+  const legend = `<span class="lg-i"><i class="g-bar"></i>Actuation</span><span class="lg-i"><i class="g-dot"></i>Rapid Trigger</span>${types.length ? `<span class="lg-i" title="${types.map(t => PT[t].name).join(', ')}"><span class="advs">${types.map(t => adv(t)).join('')}</span>Paired</span>` : ''}${anyPending('trig') ? '<span class="lg-i"><i class="g-pend"></i>Not applied</span>' : ''}<span class="sp"></span><span>Unmarked keys use ${fmt(baseValue())} mm</span>`;
+  const aside = D.pairs ? `<aside class="panel insp">${inspHTML()}</aside>` : testerHTML('insp');
+  return `<div class="brow"><div class="bcol"><div class="case"><div ${plateAttr('plateTrig')}>${boardHTML('trig')}</div>
+      <div class="lip">${legend}</div></div>
+      ${selbarHTML('trig')}</div>${aside}</div>
+    <div class="tools ${D.pairs ? '' : 'two'}">${D.pairs ? testerHTML() : ''}${actHTML()}${rtHTML()}</div>`;
 }
 
+/* ---------- keybinds ---------- */
+const P = s => [s, s];
+const PICK = {
+  Basic: ['Esc', 'Tab', 'Caps', 'Shift', 'Ctrl', 'Alt', 'Win', 'Space', 'Enter', 'Bksp', 'Del', 'Ins', 'Home', 'End', 'PgUp', 'PgDn', '↑', '↓', '←', '→', 'PrtSc', 'Menu'].map(P),
+  Media: [['Play / pause', 'Play'], ['Previous track', 'Prev'], ['Next track', 'Next'], ['Mute', 'Mute'], ['Volume down', 'Vol−'], ['Volume up', 'Vol+'], ['Brightness down', 'Bri−'], ['Brightness up', 'Bri+'], ['Calculator', 'Calc'], ['Browser', 'Web']],
+  Mouse: ['Left click', 'Right click', 'Middle click', 'Back', 'Forward', 'Scroll up', 'Scroll down', 'Cycle DPI', 'DPI +', 'DPI −'].map(P),
+};
+function pickItems(cat) {
+  if (cat === 'Macro') return S.macros.map((m, i) => m.steps.length ? [`M${i + 1} · ${m.name}`, `M${i + 1}`] : null).filter(Boolean);
+  if (cat === 'Layer') return D.layers.slice(1).map((n, i) => [`Hold ${n}`, `L${i + 1}`]);
+  return PICK[cat];
+}
+function pickAll() {
+  const extra = [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'].map(P).concat(Array.from({ length: 24 }, (_, i) => P('F' + (i + 1))));
+  return pickCats().flatMap(pickItems).concat(extra);
+}
+const pickCats = () => D.kind === 'mouse' ? ['Mouse', 'Basic', 'Media', 'Macro'] : ['Basic', 'Media', 'Mouse', 'Macro', 'Layer'];
+const bindLabel = l => { const m = /^M(\d+)$/.exec(l); return m && S.macros ? `M${m[1]} · ${S.macros[m[1] - 1].name}` : l; };
+function pickerHTML() {
+  const isKey = D.kind === 'kb';
+  const q = ui.pickQ.trim().toLowerCase();
+  const items = q ? pickAll().filter(([c]) => c.toLowerCase().includes(q)) : pickItems(ui.pick);
+  const cur = isKey ? (S.map[ui.layer][ui.mapSel] || (ui.layer ? '' : KEY[ui.mapSel].label)) : S.btns[ui.btn];
+  const remapped = isKey ? !!S.map[ui.layer][ui.mapSel] : S.btns[ui.btn] !== BTNS.find(b => b.id === ui.btn).def;
+  const target = isKey ? `${KEY[ui.mapSel].label} on ${D.layers[ui.layer]}` : BTNS.find(b => b.id === ui.btn).name;
+  return `<section class="panel picker" id="picker"><div class="phead"><span class="ptitle">Assign</span><span class="pnote">to ${esc(target)}</span><span class="sp"></span>
+      <button class="btn ghost sm" data-act="assign" data-arg="None">Disable</button><button class="btn outline sm" data-act="rebind" ${remapped ? '' : 'disabled'}>Restore default</button></div>
+    <div class="pk-top"><label class="search">${I.search}<input id="pickQ" placeholder="Search keys, media and macros" value="${esc(ui.pickQ)}" spellcheck="false" aria-label="Search actions"></label>${q ? '' : segHTML('pick', pickCats(), ui.pick, '', 'Category')}</div>
+    <div class="kchips">${items.length ? items.map(([c, l]) => `<button class="kchip ${l === cur ? 'on' : ''}" data-act="assign" data-arg="${esc(l)}">${esc(c)}</button>`).join('') : '<span class="pnote">Nothing matches. Try a key name such as F13 or Vol.</span>'}</div></section>`;
+}
+function keyInspHTML() {
+  const x = KEY[ui.mapSel], m = S.map[ui.layer][x.id], layer = D.layers[ui.layer];
+  const entries = Object.entries(S.map[ui.layer]);
+  const note = m ? `Sends ${esc(m)} on ${layer}.` : ui.layer ? `Not set on ${layer}, so it falls through to ${D.layers[0]}.` : 'Sends its default.';
+  return `<div class="phead"><span class="ptitle">Key</span></div>
+    <div class="kmap"><span class="kcap">${esc(x.label)}</span>${I.arrow}<span class="kcap ${m ? 'acc' : 'thru'}">${esc(m || x.label)}</span></div>
+    <p class="pnote">${note}</p>
+    <div class="hr"></div>
+    <div class="flabel">Remapped on ${layer}</div>
+    <div class="rlist">${entries.length ? entries.map(([id, l]) => `<button class="rchip ${id === ui.mapSel ? 'on' : ''}" data-act="mapsel" data-arg="${id}"><b>${esc(KEY[id].label)}</b>${I.arrowS}${esc(l)}</button>`).join('') : '<span class="pnote">Nothing yet. Every key sends its default.</span>'}</div>`;
+}
+function keybindsHTML() {
+  const n = Object.keys(S.map[ui.layer]).length;
+  return `<div class="brow"><div class="bcol"><div class="case"><div ${plateAttr('plateMap')}>${boardHTML('map')}</div>
+      <div class="lip"><span class="lg-i"><i class="g-remap"></i>Remapped</span>${ui.layer ? '<span class="lg-i"><i class="g-thru"></i>Uses the base layer</span>' : ''}${anyPending('map') ? '<span class="lg-i"><i class="g-pend"></i>Not applied</span>' : ''}<span class="sp"></span><span>Small legend shows the original key</span></div></div>
+      <div class="selbar"><span class="plabel">Layer</span>${segHTML('layer', D.layers, D.layers[ui.layer], 'sm', 'Layer')}<span class="sp"></span><span class="pnote">${n ? `${n} ${n === 1 ? 'key' : 'keys'} remapped on this layer` : 'No keys remapped on this layer'}</span></div></div>
+    <aside class="panel insp">${keyInspHTML()}</aside></div>${pickerHTML()}`;
+}
+
+/* ---------- lighting ---------- */
+function fxPanel() {
+  const Lz = L();
+  return `<section class="panel"><div class="phead"><span class="ptitle">Effect</span></div>
+    <div class="fx" role="radiogroup" aria-label="Lighting effect">${D.effects.map(e => `<button class="fxb ${Lz.effect === e ? 'on' : ''}" role="radio" aria-checked="${Lz.effect === e}" data-act="effect" data-arg="${e}"><span class="fxi">${FX_ICON[e]}</span>${e}</button>`).join('')}</div></section>`;
+}
+function colorPanel(hint) {
+  const Lz = L(), cur = currentColor(), hsv = hex2hsv(cur);
+  return `<section class="panel"><div class="phead"><span class="ptitle">Color</span><span class="sp"></span><span class="pnote">${hint}</span></div>
+    <div class="${COLORABLE.has(Lz.effect) ? '' : 'cp-off'}">
+      <div class="cp"><div>
+        <div class="sv" id="svBox" style="background:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,${hsv2hex(hsv.h, 1, 1)})"><span class="mk" style="left:${hsv.s * 100}%;top:${(1 - hsv.v) * 100}%"></span></div>
+        <div class="hue" id="hueBar"><span class="mk" style="left:${hsv.h / 360 * 100}%"></span></div></div>
+        <div class="sws">${SWATCHES.map(c => `<button class="swb ${c === cur ? 'on' : ''}" style="background:${c}" data-act="swatch" data-arg="${c}" aria-label="Color ${c}"></button>`).join('')}</div></div>
+      <div class="hexrow"><span class="hexsw" style="background:${cur}"></span><input class="hexin" id="hexIn" value="${cur}" aria-label="Hex color" spellcheck="false"></div>
+    </div></section>`;
+}
+function lampHTML(title, top = '') {
+  const Lz = L(), fixed = FIXED_SPEED.has(Lz.effect);
+  return `<aside class="panel insp lamp"><div class="phead"><span class="ptitle">${title}</span></div>${top}
+    <div class="srow2"><span>Brightness</span><span class="val" data-live="bright">${Lz.bright}%</span></div>
+    <input class="rng" type="range" min="0" max="100" step="1" value="${Lz.bright}" style="--p:${Lz.bright}%" data-slide="bright" aria-label="Brightness">
+    <div class="srow2"><span>Speed</span><span class="val" data-live="speed">${fixed ? '' : Lz.speed + '%'}</span></div>
+    <input class="rng" type="range" min="0" max="100" step="1" value="${Lz.speed}" style="--p:${Lz.speed}%" data-slide="speed" ${fixed ? 'disabled' : ''} aria-label="Speed">
+    ${fixed ? '<p class="pnote" style="margin-top:8px">This effect runs at a fixed speed.</p>' : ''}</aside>`;
+}
 function lightHTML() {
-  const fixed = FIXED_SPEED.has(S.effect), colorable = COLORABLE.has(S.effect);
+  if (D.kind === 'mouse') return mouseLightHTML();
   const still = !['Off', 'Customization', 'Single color'].includes(S.effect);
-  const cur = currentColor(), hsv = hex2hsv(cur);
-  let colorHint = 'This effect picks its own colors.';
-  if (S.effect === 'Customization') colorHint = ui.ledSel.size ? `Paints ${ui.ledSel.size} selected ${ui.ledSel.size === 1 ? 'key' : 'keys'}` : 'Select keys to paint them';
-  if (S.effect === 'Single color' || S.effect === 'Monochrome breath') colorHint = 'Used for every key';
-  return `<div class="brow"><div class="bcol"><div class="case"><div class="plate" id="plateLed">${boardHTML('led')}</div>
+  let hint = 'This effect picks its own colors.';
+  if (S.effect === 'Customization') hint = ui.ledSel.size ? `Paints ${ui.ledSel.size} selected ${ui.ledSel.size === 1 ? 'key' : 'keys'}` : 'Select keys to paint them';
+  else if (COLORABLE.has(S.effect)) hint = 'Used for every key';
+  const zones = D.zones ? `<div class="seg" role="radiogroup" aria-label="Lighting zone">${D.zones.map(z => `<button class="${ui.zone === z ? 'on' : ''}" role="radio" aria-checked="${ui.zone === z}" data-act="zone" data-arg="${z}">${z}</button>`).join('')}</div>` : '';
+  return `<div class="brow"><div class="bcol"><div class="case"><div ${plateAttr('plateLed')}>${boardHTML('led')}</div>
       <div class="lip"><span>${S.effect === 'Off' ? 'Lighting is off.' : still ? 'Keys show a still frame of the effect.' : 'Keys show their LED color.'}</span>${anyPending('led') ? '<span class="sp"></span><span class="lg-i"><i class="g-pend"></i>Not applied</span>' : ''}</div></div>
       ${selbarHTML('led')}</div>
-    <aside class="panel insp lamp"><div class="phead"><span class="ptitle">Lamp</span></div>
-      <div class="seg" role="radiogroup" aria-label="Lighting zone">${['Back lamp', 'Logo light'].map(z => `<button class="${ui.zone === z ? 'on' : ''}" role="radio" aria-checked="${ui.zone === z}" data-act="zone" data-arg="${z}">${z}</button>`).join('')}</div>
-      <div class="srow2"><span>Brightness</span><span class="val" data-live="bright">${S.bright}%</span></div>
-      <input class="rng" type="range" min="0" max="100" step="1" value="${S.bright}" style="--p:${S.bright}%" data-slide="bright" aria-label="Brightness">
-      <div class="srow2"><span>Speed</span><span class="val" data-live="speed">${fixed ? '' : S.speed + '%'}</span></div>
-      <input class="rng" type="range" min="0" max="100" step="1" value="${S.speed}" style="--p:${S.speed}%" data-slide="speed" ${fixed ? 'disabled' : ''} aria-label="Speed">
-      ${fixed ? '<p class="pnote" style="margin-top:8px">This effect runs at a fixed speed.</p>' : ''}</aside></div>
-    <div class="lrow">
-      <section class="panel"><div class="phead"><span class="ptitle">Effect</span></div>
-        <div class="fx" role="radiogroup" aria-label="Lighting effect">${EFFECTS.map(e => `<button class="fxb ${S.effect === e ? 'on' : ''}" role="radio" aria-checked="${S.effect === e}" data-act="effect" data-arg="${e}"><span class="fxi">${FX_ICON[e]}</span>${e}</button>`).join('')}</div></section>
-      <section class="panel"><div class="phead"><span class="ptitle">Color</span><span class="sp"></span><span class="pnote">${colorHint}</span></div>
-        <div class="${colorable ? '' : 'cp-off'}">
-          <div class="cp"><div>
-            <div class="sv" id="svBox" style="background:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,${hsv2hex(hsv.h, 1, 1)})"><span class="mk" style="left:${hsv.s * 100}%;top:${(1 - hsv.v) * 100}%"></span></div>
-            <div class="hue" id="hueBar"><span class="mk" style="left:${hsv.h / 360 * 100}%"></span></div></div>
-            <div class="sws">${SWATCHES.map(c => `<button class="swb ${c === cur ? 'on' : ''}" style="background:${c}" data-act="swatch" data-arg="${c}" aria-label="Color ${c}"></button>`).join('')}</div></div>
-          <div class="hexrow"><span class="hexsw" style="background:${cur}"></span><input class="hexin" id="hexIn" value="${cur}" aria-label="Hex color" spellcheck="false"></div>
-        </div></section></div>`;
+    ${lampHTML(D.zones ? 'Lamp' : 'Backlight', zones)}</div>
+    <div class="lrow">${fxPanel()}${colorPanel(hint)}</div>`;
+}
+
+/* ---------- macros ---------- */
+const macroBytes = m => m.steps.reduce((n, s) => n + (s.t === 'delay' ? 5 : 3), 0) + (m.steps.length ? 1 : 0);
+const STEP = { down: ['down', 'Press'], up: ['up', 'Release'], tap: ['tap', 'Tap'] };
+function macrosHTML() {
+  const M = D.macros, cur = S.macros[ui.macro];
+  const used = M.perSlot ? macroBytes(cur) : S.macros.reduce((n, m) => n + macroBytes(m), 0);
+  const list = `<section class="panel"><div class="phead"><span class="ptitle">Macros</span><span class="sp"></span><span class="pnote">${M.slots} slots</span></div>
+    <div class="mslots">${S.macros.map((m, i) => `<button class="mslot ${i === ui.macro ? 'on' : ''}" data-act="macro" data-i="${i}" aria-current="${i === ui.macro}"><span class="mno">M${i + 1}</span><span class="mnm ${m.steps.length ? '' : 'empty'}">${m.steps.length ? esc(m.name) : 'Empty'}</span><span class="cnt">${m.steps.length ? m.steps.length + ' steps' : ''}</span></button>`).join('')}</div>
+    <div class="mem"><div class="mem-l"><span>${M.perSlot ? 'This macro' : 'Memory, all macros'}</span><span><b>${used}</b> of ${M.bytes} bytes</span></div><div class="mem-b"><i style="width:${(used / M.bytes * 100).toFixed(1)}%"></i></div></div></section>`;
+  const stepRow = (s, i) => {
+    const body = s.t === 'delay'
+      ? `<span class="sic">${I.clock}</span><span class="stx">Wait</span><span class="sp"></span><div class="stp xs"><button class="sbtn" data-act="mdelay" data-i="${i}" data-d="-1" aria-label="Shorter">−</button><span class="snum">${s.v}<small>ms</small></span><button class="sbtn" data-act="mdelay" data-i="${i}" data-d="1" aria-label="Longer">+</button></div>`
+      : `<span class="sic">${I[STEP[s.t][0]]}</span><span class="stx">${STEP[s.t][1]}<kbd>${esc(s.k)}</kbd></span><span class="sp"></span>`;
+    return `<li class="step"><span class="sno">${i + 1}</span>${body}<button class="btn ghost icon sm" data-act="mdel" data-i="${i}" aria-label="Remove step ${i + 1}">${I.x}</button></li>`;
+  };
+  const where = D.kind === 'mouse' ? 'Buttons' : 'Keybinds';
+  const editor = `<section class="panel medit"><div class="phead"><input class="mname" id="mName" value="${esc(cur.name)}" placeholder="Name this macro" aria-label="Macro name" spellcheck="false"><span class="sp"></span>
+      <button class="btn outline sm" data-act="noop">${I.rec}Record</button><button class="btn ghost sm danger" data-act="mclear" ${cur.steps.length ? '' : 'disabled'}>Clear</button></div>
+    ${cur.steps.length ? `<ol class="steps">${cur.steps.map(stepRow).join('')}</ol>`
+      : `<div class="idle" style="min-height:150px">${I.rec.replace(/width="12" height="12"/, 'width="22" height="22"')}<p>Record what you type, or add keys and delays one at a time.</p></div>`}
+    <div class="madd"><button class="btn outline sm" data-act="madd" data-arg="tap">${I.plus}Key</button><button class="btn outline sm" data-act="madd" data-arg="delay">${I.plus}Delay</button>
+      ${M.repeat ? `<span class="sp"></span><span class="plabel">When held</span>${segHTML('mrep', ['Once', 'Repeat', 'Toggle'], cur.rep, 'sm', 'When held')}` : ''}</div>
+    <p class="pnote mfoot">To use it, assign M${ui.macro + 1} to a ${D.kind === 'mouse' ? 'button' : 'key'} in ${where}.</p></section>`;
+  return `<div class="mgrid">${list}${editor}</div>`;
+}
+
+/* ---------- advanced ---------- */
+function advHTML() {
+  const row = (k, name, desc, first) => `<div class="srow ${first ? 'first' : ''}"><div class="stext"><div class="sname">${name}</div><div class="sdesc">${desc}</div></div>${swHTML('adv', S.adv[k], name, k)}</div>`;
+  return `<div class="agrid">
+    <div class="acol"><section class="panel"><div class="phead"><span class="ptitle">Key layout</span></div>
+      ${row('mac', 'Mac mode', 'Swap the Windows and Alt keys to match a Mac layout.', 1)}
+      ${row('wasd', 'Exchange WASD and arrows', 'WASD sends the arrow keys and the arrows send WASD.')}</section>
+    <section class="panel"><div class="phead"><span class="ptitle">Function keys</span></div>
+      ${row('fninv', 'Fn key inversion', 'F1–F12 send media and brightness keys; hold Fn for F1–F12.', 1)}
+      ${row('game', 'Game mode', 'Block keys the keyboard marks for game mode, such as the Windows key.')}</section></div>
+    <div class="acol"><section class="panel"><div class="phead"><span class="ptitle">Key conflict</span></div>
+      ${row('winlock', 'Windows key lock', 'Disable the Windows keys so they can’t interrupt a game.', 1)}
+      ${row('sixkey', '6-key rollover', 'Report at most six keys at once for older BIOS and KVM switches.')}
+      ${row('anti', 'Anti-accidental touch', 'Ignore very light brushes against the keys.')}</section>
+    <section class="panel"><div class="phead"><span class="ptitle">Precision and polling</span></div>
+      ${row('extreme', 'Extreme mode (0.01 mm)', 'Use 0.01 mm actuation and Rapid Trigger steps instead of 0.02 mm.', 1)}
+      <div class="srow"><div class="stext"><div class="sname">Polling rate</div><div class="sdesc">Reports per second, in Hz.</div></div>${segHTML('kbPoll', D.polls, S.kbPoll, 'sm', 'Polling rate')}</div></section></div></div>`;
 }
 
 function kbHTML(d) {
-  const tabs = [['triggers', 'Triggers & paired keys'], ['keybinds', 'Keybinds'], ['lighting', 'Lighting'], ['macros', 'Macros'], ['advanced', 'Advanced']];
-  const body = ui.kbTab === 'triggers' ? trigHTML() : ui.kbTab === 'lighting' ? lightHTML()
-    : `<div class="panel ph"><p>The ${tabs.find(t => t[0] === ui.kbTab)[1]} tab is not part of this mockup.</p></div>`;
-  return headHTML(d, `<button class="btn outline" data-act="noop">${I.target}Calibrate…</button>`)
-    + presetRow('Preset', ['Default', 'FPS / Gaming', 'Typing', 'Custom'], ui.preset, 'preset')
-    + tabsHTML(tabs, ui.kbTab, 'kbtab') + `<div class="tabbody">${body}</div>`;
+  const body = { triggers: trigHTML, keybinds: keybindsHTML, lighting: lightHTML, macros: macrosHTML, advanced: advHTML }[ui.kbTab]();
+  return headHTML(d, d.calibrate ? `<button class="btn outline" data-act="noop">${I.target}Calibrate…</button>` : '')
+    + (d.presets ? presetRow(d.presets.label, d.presets.items, ui.preset, 'preset') : '')
+    + tabsHTML(d.tabs, ui.kbTab, 'kbtab') + `<div class="tabbody">${body}</div>`;
 }
 
+/* ---------- mouse ---------- */
 function dpiRuler() {
   const pos = v => Math.log2(v / 100) / Math.log2(320) * 100;
   const marks = [100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600];
@@ -779,36 +1210,85 @@ function dpiRuler() {
   S.dpi.forEach((v, i) => { h += `<span class="dm ${i === S.dpiActive ? 'on' : ''}" style="left:${pos(clamp(v, 100, 32000))}%">${i + 1}</span>`; });
   return h + '</div>';
 }
-function mouseHTML(d) {
-  const tabs = [['sensor', 'Sensor'], ['buttons', 'Buttons'], ['lighting', 'Lighting']];
-  let body;
-  if (ui.msTab !== 'sensor') body = `<div class="panel ph"><p>The ${tabs.find(t => t[0] === ui.msTab)[1]} tab is not part of this mockup.</p></div>`;
-  else {
-    const seg = (act, items, cur) => `<div class="seg sm" role="radiogroup">${items.map(p => `<button class="${p === cur ? 'on' : ''}" role="radio" aria-checked="${p === cur}" data-act="${act}" data-arg="${p}">${p}</button>`).join('')}</div>`;
-    const sw = (act, on, label) => `<button class="sw ${on ? 'on' : ''}" role="switch" aria-checked="${on}" aria-label="${label}" data-act="${act}"></button>`;
-    body = `<section class="panel"><div class="phead"><span class="ptitle">DPI stages</span><span class="sp"></span><span class="pnote">Click a stage to make it active. 10 to 32,000 DPI.</span></div>
-      <div class="tiles">${S.dpi.map((v, i) => `<div class="tile ${i === S.dpiActive ? 'on' : ''}" role="button" tabindex="0" aria-pressed="${i === S.dpiActive}" data-act="dpiActive" data-i="${i}">
-        <div class="t-top">Stage ${i + 1}${i === S.dpiActive ? '<span class="badge">Active</span>' : ''}</div>
+const SENSOR = {
+  msync: ['Motion sync', 'Times sensor reads to each report. Smoother, with a little delay.'],
+  angle: ['Angle snapping', 'Straightens movement that is almost horizontal or vertical.'],
+  ripple: ['Ripple control', 'Smooths jitter at high DPI, with a little delay.'],
+  xy: ['Separate X and Y DPI', 'Set a different DPI for horizontal and vertical movement.'],
+};
+function sensorHTML() {
+  const m = D.mouse, n = S.dpi.length;
+  const rep = [`<div class="srow first"><div class="stext"><div class="sname">Polling rate</div><div class="sdesc">Reports per second, in Hz.</div></div>${segHTML('poll', m.polls, S.poll)}</div>`];
+  if (m.lods) rep.push(`<div class="srow"><div class="stext"><div class="sname">Lift-off distance</div><div class="sdesc">How high you can lift before tracking stops.</div></div>${segHTML('lod', m.lods, S.lod)}</div>`);
+  if (m.debounce) rep.push(`<div class="srow"><div class="stext"><div class="sname">Click debounce</div><div class="sdesc">Raise it if a button double-clicks.</div></div>${stepper('debounce', S.debounce, 'ms')}</div>`);
+  const sen = m.sensor.map((k, i) => `<div class="srow ${i ? '' : 'first'}"><div class="stext"><div class="sname">${SENSOR[k][0]}</div><div class="sdesc">${SENSOR[k][1]}</div></div>${swHTML(k, S[k], SENSOR[k][0])}</div>`);
+  return `<section class="panel"><div class="phead"><span class="ptitle">DPI stages</span><span class="sp"></span><span class="pnote">Click a stage to make it active. ${m.range}.</span></div>
+      <div class="tiles ${n > 4 ? 'many' : ''}" style="grid-template-columns:repeat(${n},1fr)">${S.dpi.map((v, i) => `<div class="tile ${i === S.dpiActive ? 'on' : ''}" role="button" tabindex="0" aria-pressed="${i === S.dpiActive}" data-act="dpiActive" data-i="${i}">
+        <div class="t-top">${m.colors ? `<i class="sdot" style="background:${m.colors[i]}" title="Stage LED color"></i>` : ''}Stage ${i + 1}${i === S.dpiActive ? '<span class="badge">Active</span>' : ''}</div>
         <div class="t-main"><div class="big"><b>${v}</b><span>DPI</span></div>
         <div class="t-step"><button class="sbtn" data-act="dpi" data-i="${i}" data-d="-1" aria-label="Decrease stage ${i + 1}">−</button><button class="sbtn" data-act="dpi" data-i="${i}" data-d="1" aria-label="Increase stage ${i + 1}">+</button></div></div></div>`).join('')}</div>
       ${dpiRuler()}</section>
-      <div class="mcols">
-        <section class="panel"><div class="phead"><span class="ptitle">Reporting</span></div>
-          <div class="srow first"><div class="stext"><div class="sname">Polling rate</div><div class="sdesc">Reports per second, in Hz.</div></div>${seg('poll', ['125', '250', '500', '1K', '2K', '4K'], S.poll)}</div>
-          <div class="srow"><div class="stext"><div class="sname">Lift-off distance</div><div class="sdesc">How high you can lift before tracking stops.</div></div>${seg('lod', ['Low', 'Medium', 'High'], S.lod)}</div>
-          <div class="srow"><div class="stext"><div class="sname">Click debounce</div><div class="sdesc">Raise it if a button double-clicks.</div></div>${stepper('debounce', S.debounce, 'ms')}</div></section>
-        <section class="panel"><div class="phead"><span class="ptitle">Sensor</span></div>
-          <div class="srow first"><div class="stext"><div class="sname">Motion sync</div><div class="sdesc">Times sensor reads to each report. Smoother, with a little delay.</div></div>${sw('msync', S.msync, 'Motion sync')}</div>
-          <div class="srow"><div class="stext"><div class="sname">Angle snapping</div><div class="sdesc">Straightens movement that is almost horizontal or vertical.</div></div>${sw('angle', S.angle, 'Angle snapping')}</div>
-          <div class="srow"><div class="stext"><div class="sname">Ripple control</div><div class="sdesc">Smooths jitter at high DPI, with a little delay.</div></div>${sw('ripple', S.ripple, 'Ripple control')}</div></section>
-      </div>`;
+    <div class="mcols">
+      <section class="panel"><div class="phead"><span class="ptitle">Reporting</span></div>${rep.join('')}</section>
+      <section class="panel"><div class="phead"><span class="ptitle">Sensor</span></div>${sen.join('')}</section>
+    </div>`;
+}
+const BODY = 'M100 12C152 12 174 52 176 112c2 60-2 120-24 156-14 22-90 22-104 0-22-36-26-96-24-156C26 52 48 12 100 12z';
+const REGION = {
+  b1: '<path class="rg" d="M98 14C52 16 28 54 25.5 110 48 116 74 118 98 118z"/>',
+  b2: '<path class="rg" d="M102 14c46 2 70 40 72.5 96-22.5 6-48.5 8-72.5 8z"/>',
+  b3: '<rect class="rg" x="91" y="36" width="18" height="42" rx="9"/>',
+  b6: '<rect class="rg" x="92" y="88" width="16" height="16" rx="4"/>',
+  b5: '<rect class="rg" x="16" y="128" width="13" height="36" rx="5"/>',
+  b4: '<rect class="rg" x="16" y="170" width="13" height="36" rx="5"/>',
+};
+const BADGE = { b1: [58, 72], b2: [142, 72], b3: [100, 57], b6: [100, 96], b5: [2, 146], b4: [2, 188] };
+function mouseSVG(mode) {
+  let s = `<svg viewBox="-12 0 200 292" width="${mode === 'btn' ? 220 : 196}" height="${mode === 'btn' ? 322 : 286}" role="img" aria-label="${mode === 'btn' ? 'Mouse buttons' : 'Lighting zones'}">
+    <defs><linearGradient id="rb" x1="0" x2="1" y1="0" y2="1">${[0, 60, 120, 180, 240, 300].map((h, i) => `<stop offset="${i / 5}" stop-color="${hsv2hex(h, .85, 1)}"/>`).join('')}</linearGradient>
+    <filter id="mglow" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="5"/></filter></defs>`;
+  if (mode === 'light') {
+    const fill = z => { const f = S.zfx[z]; return f.effect === 'Off' ? null : RAINBOW.has(f.effect) ? 'url(#rb)' : dim(f.color, f.bright); };
+    const m = fill('Mouse'), w = fill('Scroll wheel'), lg = fill('Logo');
+    if (m) s += `<path d="${BODY}" fill="none" stroke="${m}" stroke-width="9" opacity=".75" filter="url(#mglow)"/>`;
+    s += `<g data-act="zone" data-arg="Mouse" class="${ui.zone === 'Mouse' ? 'on' : ''}"><path class="mbody" d="${BODY}"/>${m ? `<path d="${BODY}" fill="none" stroke="${m}" stroke-width="2.5"/>` : ''}</g>
+      <path class="seam" d="M100 14v104M26 112c24 7 124 7 148 0"/>
+      <g data-act="zone" data-arg="Scroll wheel" class="${ui.zone === 'Scroll wheel' ? 'on' : ''}"><rect class="rg" x="91" y="36" width="18" height="42" rx="9" ${w ? `style="fill:${w}"` : ''}/></g>
+      <g data-act="zone" data-arg="Logo" class="${ui.zone === 'Logo' ? 'on' : ''}"><circle class="rg" cx="100" cy="212" r="17" ${lg ? `style="fill:${lg}"` : ''}/><path d="M92 218l8-14 8 14" fill="none" stroke="${lg ? '#0b0d10' : 'var(--muted)'}" stroke-width="2" stroke-linejoin="round" opacity=".7"/></g>`;
+    return s + '</svg>';
   }
-  return headHTML(d) + presetRow('Onboard profile', ['Profile 1', 'Profile 2', 'Profile 3', 'Profile 4'], 'Profile ' + ui.profile, 'profile')
-    + tabsHTML(tabs, ui.msTab, 'mstab') + `<div class="tabbody">${body}</div>`;
+  s += `<path class="mbody" d="${BODY}"/>`;
+  for (const b of BTNS) {
+    const on = ui.btn === b.id, [bx, by] = BADGE[b.id];
+    s += `<g data-act="btn" data-arg="${b.id}" class="${on ? 'on' : ''}">${REGION[b.id]}<g class="bdg"><circle cx="${bx}" cy="${by}" r="9"/><text x="${bx}" y="${by + 3.6}">${b.id.slice(1)}</text></g></g>`;
+  }
+  return s + '</svg>';
+}
+function buttonsHTML() {
+  const list = BTNS.map(b => {
+    const l = S.btns[b.id], remap = l !== b.def, pend = l !== base.btns[b.id];
+    return `<button class="bli ${ui.btn === b.id ? 'on' : ''} ${pend ? 'pending' : ''}" data-act="btn" data-arg="${b.id}" aria-current="${ui.btn === b.id}"><span class="bno">${b.id.slice(1)}</span><span class="bnm">${b.name}</span><span class="sp"></span><span class="bact ${remap ? 'acc' : ''}">${esc(bindLabel(l))}</span>${I.chevR}</button>`;
+  }).join('');
+  const n = BTNS.filter(b => S.btns[b.id] !== b.def).length;
+  return `<div class="bgrid"><section class="panel"><div class="phead"><span class="ptitle">Buttons</span></div><div class="mfig">${mouseSVG('btn')}</div></section>
+    <div><section class="panel"><div class="phead"><span class="ptitle">Assignments</span><span class="sp"></span><span class="pnote">${n ? `${n} changed from default` : 'All defaults'}</span></div><div class="blist">${list}</div></section>${pickerHTML()}</div></div>`;
+}
+function mouseLightHTML() {
+  const f = S.zfx[ui.zone];
+  const hint = COLORABLE.has(f.effect) ? `Used for the ${ui.zone.toLowerCase()}` : 'This effect picks its own colors.';
+  return `<div class="brow"><section class="panel mfl"><div class="phead"><span class="ptitle">Zones</span><span class="sp"></span>${segHTML('zone', D.zones, ui.zone, 'sm', 'Lighting zone')}</div>
+      <div class="mfig" id="mfig">${mouseSVG('light')}</div></section>
+    ${lampHTML(ui.zone)}</div>
+    <div class="lrow">${fxPanel()}${colorPanel(hint)}</div>`;
+}
+function mouseHTML(d) {
+  const body = { sensor: sensorHTML, buttons: buttonsHTML, macros: macrosHTML, lighting: mouseLightHTML }[ui.msTab]();
+  return headHTML(d) + (d.profiles ? presetRow('Onboard profile', Array.from({ length: d.profiles }, (_, i) => 'Profile ' + (i + 1)), 'Profile ' + ui.profile, 'profile') : '')
+    + (d.tabs.length > 1 ? tabsHTML(d.tabs, ui.msTab, 'mstab') : '') + `<div class="tabbody">${body}</div>`;
 }
 
 function settingsHTML() {
-  const row = (act, on, name, desc, first) => `<div class="srow ${first ? 'first' : ''}"><div class="stext"><div class="sname">${name}</div><div class="sdesc">${desc}</div></div><button class="sw ${on ? 'on' : ''}" role="switch" aria-checked="${on}" aria-label="${name}" data-act="${act}"></button></div>`;
+  const row = (act, on, name, desc, first) => `<div class="srow ${first ? 'first' : ''}"><div class="stext"><div class="sname">${name}</div><div class="sdesc">${desc}</div></div>${swHTML(act, on, name)}</div>`;
   return `<div class="narrow"><h1 class="ptitle-lg">Settings</h1>
     <section class="panel"><div class="phead"><span class="ptitle">App</span></div>
       ${row('tray', ui.tray, 'Close to tray', 'Closing the window keeps AgnoPeriph running in the notification area.', true)}
@@ -829,10 +1309,7 @@ function gamesHTML() {
 function mainHTML() {
   if (ui.view === 'settings') return settingsHTML();
   if (ui.view === 'games') return gamesHTML();
-  const d = DEVICES.find(x => x.id === ui.device);
-  if (d.id === 'rs7') return kbHTML(d);
-  if (d.kind === 'mouse') return mouseHTML(d);
-  return headHTML(d) + `<div class="panel ph" style="margin-top:20px"><p>${esc(d.name)} is not part of this mockup.<br>Open ATK RS7 RGB for the keyboard design.</p></div>`;
+  return D.kind === 'kb' ? kbHTML(D) : mouseHTML(D);
 }
 function dirtyHTML() {
   const n = labels.length, areas = [...new Set(labels)].join(', ');
@@ -868,86 +1345,108 @@ function renderAll() {
   if (fs) { const n = win.querySelector(fs); if (n) n.focus({ preventScroll: true }); }
 }
 function renderTester() {
-  const p = $('#ktPanel'); if (p) p.outerHTML = testerHTML();
+  const p = $('#ktPanel'); if (p) p.outerHTML = testerHTML(p.dataset.cls);
 }
 function updateTesterDOM() {
-  const { id, depth } = ui.tester, a = S.act[id], H = 160, T = 8;
+  const { id, depth } = ui.tester, a = S.act[id], H = 160, T = 8, tr = D.he.travel;
   const fill = $('#gFill'), edge = $('#gEdge');
-  if (fill) fill.setAttribute('height', depth / 3.4 * H);
-  if (edge) { const yy = T + depth / 3.4 * H; edge.setAttribute('y1', yy); edge.setAttribute('y2', yy); edge.setAttribute('opacity', depth > 0.005 ? .9 : 0); }
+  if (fill) fill.setAttribute('height', depth / tr * H);
+  if (edge) { const yy = T + depth / tr * H; edge.setAttribute('y1', yy); edge.setAttribute('y2', yy); edge.setAttribute('opacity', depth > 0.005 ? .9 : 0); }
   const dEl = $('#ktDepth'); if (dEl) dEl.textContent = fmt(depth);
   const st = $('#ktState'); if (st) { const on = depth >= a; st.textContent = on ? 'Pressed' : 'Released'; st.classList.toggle('on', on); }
-  const kd = win.querySelector(`[data-depth="${id}"]`); if (kd) kd.style.height = (depth / 3.4 * 100).toFixed(1) + '%';
+  const kd = win.querySelector(`[data-depth="${id}"]`); if (kd) kd.style.height = (depth / tr * 100).toFixed(1) + '%';
 }
 let raf = 0;
 function tween(target, ms) {
   cancelAnimationFrame(raf);
   const from = ui.tester.depth, t0 = performance.now();
   if (reduced) { ui.tester.depth = target; updateTesterDOM(); return; }
-  const step = now => {
+  const stepF = now => {
     const t = Math.min(1, (now - t0) / ms), e = 1 - Math.pow(1 - t, 3);
     ui.tester.depth = from + (target - from) * e;
     updateTesterDOM();
-    if (t < 1) raf = requestAnimationFrame(step);
+    if (t < 1) raf = requestAnimationFrame(stepF);
   };
-  raf = requestAnimationFrame(step);
+  raf = requestAnimationFrame(stepF);
 }
 
 /* ---------- events ---------- */
+function assign(l) {
+  if (D.kind === 'mouse') { commit('Buttons', () => { S.btns[ui.btn] = l; }); return; }
+  commit('Keybinds', () => {
+    const m = S.map[ui.layer], id = ui.mapSel;
+    if (!ui.layer && l === KEY[id].label) delete m[id]; else m[id] = l;
+  });
+}
 win.addEventListener('click', e => {
   const keyEl = e.target.closest('[data-key]');
   if (keyEl) {
-    const set = keyEl.dataset.lens === 'trig' ? ui.sel : ui.ledSel, id = keyEl.dataset.key;
-    set.has(id) ? set.delete(id) : set.add(id);
+    const id = keyEl.dataset.key, lens = keyEl.dataset.lens;
+    if (lens === 'map') ui.mapSel = id;
+    else { const set = lens === 'trig' ? ui.sel : ui.ledSel; set.has(id) ? set.delete(id) : set.add(id); }
     renderAll(); return;
   }
   const el = e.target.closest('[data-act]');
   if (!el) { if (ui.menu) { ui.menu = false; renderAll(); } return; }
   const act = el.dataset.act, arg = el.dataset.arg, dd = parseFloat(el.dataset.d || 0), idx = parseInt(el.dataset.i || 0);
   if (act !== 'menu' && act !== 'ptype' && ui.menu) ui.menu = false;
+  const he = D.he;
   switch (act) {
     case 'noop': renderAll(); break;
     case 'theme': ui.theme = ui.theme === 'dark' ? 'light' : 'dark'; renderAll(); break;
     case 'setTheme': ui.theme = arg; renderAll(); break;
     case 'accent': ui.accent = arg; renderAll(); break;
-    case 'dev': ui.view = 'device'; ui.device = arg; renderAll(); break;
+    case 'dev': ui.view = 'device'; useDevice(arg); renderAll(); break;
     case 'nav': ui.view = arg; renderAll(); break;
     case 'preset': ui.preset = arg; renderAll(); break;
     case 'profile': ui.profile = parseInt(arg.split(' ')[1]); renderAll(); break;
     case 'kbtab': ui.kbTab = arg; renderAll(); break;
     case 'mstab': ui.msTab = arg; renderAll(); break;
-    case 'selall': (arg === 'trig' ? ui.sel : ui.ledSel).clear(); KEYS.forEach(x => (arg === 'trig' ? ui.sel : ui.ledSel).add(x.id)); renderAll(); break;
-    case 'invert': { const n = new Set(KEYS.map(x => x.id).filter(id => !ui.sel.has(id))); ui.sel = n; renderAll(); break; }
+    case 'selall': { const set = arg === 'trig' ? ui.sel : ui.ledSel; set.clear(); KEYS.forEach(x => { if (!x.knob) set.add(x.id); }); renderAll(); break; }
+    case 'invert': ui.sel = new Set(KEYS.map(x => x.id).filter(id => !ui.sel.has(id))); renderAll(); break;
     case 'clear': (arg === 'trig' ? ui.sel : ui.ledSel).clear(); renderAll(); break;
-    case 'restore': commit('Restore default', () => ui.sel.forEach(id => { S.act[id] = 1.2; S.rt[id] = false; S.press[id] = .15; S.lift[id] = .15; })); break;
-    case 'act': commit('Actuation', () => { const { v } = selVals(S.act); const nv = clamp(r2(v + dd * .02), .1, 3.4); ui.sel.forEach(id => S.act[id] = nv); }); break;
+    case 'restore': commit('Restore default', () => ui.sel.forEach(id => { S.act[id] = he.def; S.rt[id] = false; S.press[id] = he.rtDef; S.lift[id] = he.rtDef; })); break;
+    case 'act': commit('Actuation', () => { const { v } = selVals(S.act); const nv = clamp(r2(v + dd * stepA()), he.min, he.travel); ui.sel.forEach(id => S.act[id] = nv); }); break;
     case 'useall': commit('Actuation', () => { const { v } = selVals(S.act); KEYS.forEach(x => S.act[x.id] = v); }); break;
-    case 'dzTop': commit('Dead zones', () => S.dzTop = clamp(r2(S.dzTop + dd * .02), 0, 1)); break;
-    case 'dzBot': commit('Dead zones', () => S.dzBot = clamp(r2(S.dzBot + dd * .02), 0, 1)); break;
+    case 'dzTop': commit('Dead zones', () => S.dzTop = clamp(r2(S.dzTop + dd * stepA()), 0, 1)); break;
+    case 'dzBot': commit('Dead zones', () => S.dzBot = clamp(r2(S.dzBot + dd * stepA()), 0, 1)); break;
     case 'rt': commit('Rapid Trigger', () => { const on = [...ui.sel].every(id => S.rt[id]); ui.sel.forEach(id => S.rt[id] = !on); }); break;
-    case 'press': case 'lift': commit('Rapid Trigger', () => { const m = S[act]; const { v } = selVals(m); const nv = clamp(r2(v + dd * .01), .02, 1); ui.sel.forEach(id => m[id] = nv); }); break;
+    case 'press': case 'lift': commit('Rapid Trigger', () => { const m = S[act]; const { v } = selVals(m); const nv = clamp(r2(v + dd * stepA()), he.rtMin, he.rtMax); ui.sel.forEach(id => m[id] = nv); }); break;
     case 'menu': ui.menu = !ui.menu; renderAll(); break;
     case 'ptype': ui.pairType = arg; ui.menu = false; renderAll(); break;
     case 'socd': commit('SOCD', () => S.socdMode = arg); break;
-    case 'socdAct': commit('SOCD', () => S.socdAct = clamp(r2(S.socdAct + dd * .02), .1, 3.4)); break;
+    case 'socdAct': commit('SOCD', () => S.socdAct = clamp(r2(S.socdAct + dd * stepA()), he.min, he.travel)); break;
     case 'socdRt': commit('SOCD', () => S.socdRt = !S.socdRt); break;
     case 'zone': ui.zone = arg; renderAll(); break;
-    case 'effect': commit('Lighting', () => S.effect = arg); break;
+    case 'effect': commit('Lighting', () => L().effect = arg); break;
     case 'swatch': applyColor(arg); break;
+    case 'layer': ui.layer = D.layers.indexOf(arg); renderAll(); break;
+    case 'mapsel': ui.mapSel = arg; renderAll(); break;
+    case 'btn': ui.btn = arg; renderAll(); break;
+    case 'pick': ui.pick = arg; renderAll(); break;
+    case 'assign': assign(arg); break;
+    case 'rebind':
+      if (D.kind === 'mouse') commit('Buttons', () => { S.btns[ui.btn] = BTNS.find(b => b.id === ui.btn).def; });
+      else commit('Keybinds', () => { delete S.map[ui.layer][ui.mapSel]; });
+      break;
+    case 'macro': ui.macro = idx; renderAll(); break;
+    case 'mdel': commit('Macros', () => S.macros[ui.macro].steps.splice(idx, 1)); break;
+    case 'mclear': commit('Macros', () => { S.macros[ui.macro].steps = []; }); break;
+    case 'madd': commit('Macros', () => S.macros[ui.macro].steps.push(arg === 'delay' ? { t: 'delay', v: 20 } : step('tap', 'A'))); break;
+    case 'mdelay': commit('Macros', () => { const s = S.macros[ui.macro].steps[idx]; s.v = clamp(s.v + dd * 10, 0, 5000); }); break;
+    case 'mrep': commit('Macros', () => { S.macros[ui.macro].rep = arg; }); break;
+    case 'adv': commit('Advanced', () => { S.adv[arg] = !S.adv[arg]; }); break;
+    case 'kbPoll': commit('Polling rate', () => S.kbPoll = arg); break;
     case 'dpiActive': commit('DPI', () => S.dpiActive = idx); break;
-    case 'dpi': commit('DPI', () => S.dpi[idx] = clamp(S.dpi[idx] + dd * 50, 50, 32000)); break;
+    case 'dpi': commit('DPI', () => S.dpi[idx] = clamp(S.dpi[idx] + dd * 50, D.mouse.min, D.mouse.max)); break;
     case 'poll': commit('Polling rate', () => S.poll = arg); break;
     case 'lod': commit('Lift-off distance', () => S.lod = arg); break;
     case 'debounce': commit('Click debounce', () => S.debounce = clamp(S.debounce + dd, 0, 20)); break;
-    case 'msync': case 'angle': case 'ripple': commit('Sensor', () => S[act] = !S[act]); break;
+    case 'msync': case 'angle': case 'ripple': case 'xy': commit('Sensor', () => S[act] = !S[act]); break;
     case 'tray': case 'startup': case 'battAlerts': ui[act] = !ui[act]; renderAll(); break;
     case 'undo': if (hist.length) { S = hist.pop(); labels.pop(); } renderAll(); break;
     case 'discard': S = clone(base); hist = []; labels = []; renderAll(); break;
-    case 'apply': {
-      base = clone(S); hist = []; labels = []; renderAll();
-      const d = DEVICES.find(x => x.id === ui.device);
-      toast(`Applied to ${d.name}`); break;
-    }
+    case 'apply': base = clone(S); hist = []; labels = []; renderAll(); toast(`Applied to ${D.name}`); break;
   }
 });
 win.addEventListener('keydown', e => {
@@ -955,38 +1454,51 @@ win.addEventListener('keydown', e => {
   if (t && (e.key === 'Enter' || e.key === ' ') && e.target === t) { e.preventDefault(); t.click(); }
   if (e.key === 'Escape' && ui.menu) { ui.menu = false; renderAll(); const s = win.querySelector('[data-act="menu"]'); s && s.focus(); }
 });
-win.addEventListener('mouseover', e => { if (e.target.closest('[data-hover="pair"]')) $('#plateTrig')?.classList.add('hl-pair'); });
-win.addEventListener('mouseout', e => { if (e.target.closest('[data-hover="pair"]')) $('#plateTrig')?.classList.remove('hl-pair'); });
+const hoverKeys = (e, on) => {
+  const h = e.target.closest('[data-hover]'); if (!h) return;
+  h.dataset.hover.split(',').forEach(id => win.querySelector(`[data-key="${id}"][data-lens="trig"]`)?.classList.toggle('hl', on));
+};
+win.addEventListener('mouseover', e => hoverKeys(e, true));
+win.addEventListener('mouseout', e => hoverKeys(e, false));
 
 const SLIDE_LABEL = { act: 'Actuation', press: 'Rapid Trigger', lift: 'Rapid Trigger', bright: 'Lighting', speed: 'Lighting' };
 win.addEventListener('input', e => {
   const t = e.target;
   if (t.id === 'hexIn') { if (/^#[0-9a-f]{6}$/i.test(t.value)) applyColor(t.value.toLowerCase(), true); return; }
+  if (t.id === 'pickQ') {
+    ui.pickQ = t.value; $('#picker').outerHTML = pickerHTML();
+    const n = $('#pickQ'); n.focus(); n.setSelectionRange(n.value.length, n.value.length); return;
+  }
+  if (t.id === 'mName') return;
   const kind = t.dataset.slide; if (!kind) return;
   if (!dragging) { hist.push(clone(S)); labels.push(SLIDE_LABEL[kind]); dragging = true; renderDirty(); }
-  const v = parseFloat(t.value);
+  const v = parseFloat(t.value), he = D.he;
   const live = (k2, txt) => win.querySelectorAll(`[data-live="${k2}"]`).forEach(n => n.textContent = txt);
   if (kind === 'act') {
     ui.sel.forEach(id => S.act[id] = v);
-    t.style.setProperty('--p', ((v - .1) / 3.3 * 100) + '%'); live('act', fmt(v));
+    t.style.setProperty('--p', pctOf(v, he.min, he.travel)); live('act', fmt(v));
     $('#plateTrig').innerHTML = boardHTML('trig');
-    if (ui.sel.has(ui.tester.id)) { renderTester(); }
+    if (ui.sel.has(ui.tester.id)) renderTester();
   } else if (kind === 'press' || kind === 'lift') {
     ui.sel.forEach(id => S[kind][id] = v);
-    t.style.setProperty('--p', ((v - .02) / .98 * 100) + '%'); live(kind, fmt(v));
+    t.style.setProperty('--p', pctOf(v, he.rtMin, he.rtMax)); live(kind, fmt(v));
   } else {
-    S[kind] = v; t.style.setProperty('--p', v + '%'); live(kind, v + '%');
-    if (kind === 'bright') $('#plateLed').innerHTML = boardHTML('led');
+    L()[kind] = v; t.style.setProperty('--p', v + '%'); live(kind, v + '%');
+    if (kind === 'bright') { const p = $('#plateLed'), m = $('#mfig'); if (p) p.innerHTML = boardHTML('led'); if (m) m.innerHTML = mouseSVG('light'); }
   }
 });
-win.addEventListener('change', e => { if (e.target.dataset.slide) { dragging = false; renderAll(); } });
+win.addEventListener('change', e => {
+  if (e.target.id === 'mName') { const v = e.target.value; commit('Macros', () => { S.macros[ui.macro].name = v; }); return; }
+  if (e.target.dataset.slide) { dragging = false; renderAll(); }
+});
 
 function applyColor(c, keepInput) {
-  if (!COLORABLE.has(S.effect)) return;
-  if (S.effect === 'Customization') {
+  const Lz = L();
+  if (!COLORABLE.has(Lz.effect)) return;
+  if (D.kind === 'kb' && S.effect === 'Customization') {
     if (!ui.ledSel.size) { S.color = c; renderAll(); return; }
     commit('Lighting', () => { ui.ledSel.forEach(id => S.led[id] = c); S.color = c; });
-  } else commit('Lighting', () => S.color = c);
+  } else commit('Lighting', () => { L().color = c; });
   if (keepInput) { const h = $('#hexIn'); if (h) { h.focus(); h.setSelectionRange(7, 7); } }
 }
 function pickAt(e, kind) {
@@ -1009,15 +1521,15 @@ function toast(msg) {
 }
 
 /* live key tester: physical key presses drive the gauge */
-const testerLive = () => ui.view === 'device' && ui.device === 'rs7' && ui.kbTab === 'triggers';
+const testerLive = () => ui.view === 'device' && D.he && ui.kbTab === 'triggers';
 document.addEventListener('keydown', e => {
   if (e.repeat || !testerLive() || e.target.closest('input')) return;
-  const id = codeToId(e.code); if (!id) return;
+  const id = codeToId(e.code); if (!id || !KEY[id]) return;
   if (id !== ui.tester.id) {
     const old = win.querySelector(`[data-depth="${ui.tester.id}"]`); if (old) old.style.height = '0%';
     ui.tester.id = id; ui.tester.depth = 0; renderTester();
   }
-  tween(3.2 + Math.random() * 0.18, 110);
+  tween(D.he.travel * (0.94 + Math.random() * 0.05), 110);
 });
 document.addEventListener('keyup', e => {
   if (!testerLive()) return;
@@ -1033,17 +1545,33 @@ function fit() {
 }
 new ResizeObserver(fit).observe($('#stage'));
 
-/* initial state from the URL hash, e.g. #lighting-light or #triggers-empty-dark */
+/* initial state from the URL hash, e.g. #wooting-light or #rs7-keybinds-fn; see the README for every flag */
 document.querySelectorAll('[data-icon]').forEach(n => n.outerHTML = I[n.dataset.icon]);
 const flags = location.hash.slice(1).split(/[-,&]/);
+const devFlag = DEVICES.find(d => flags.includes(d.id));
+useDevice(flags.includes('mouse') ? 'x2' : devFlag ? devFlag.id : 'rs7');
+const tabFlag = D.tabs.find(t => flags.includes(t[0]));
+if (tabFlag) { if (D.kind === 'kb') ui.kbTab = tabFlag[0]; else ui.msTab = tabFlag[0]; }
+const tab = D.kind === 'kb' ? ui.kbTab : ui.msTab;
 if (flags.includes('light')) ui.theme = 'light';
-if (flags.includes('lighting')) { ui.kbTab = 'lighting'; ui.ledSel = new Set(['w', 'a', 's', 'd']); }
-if (flags.includes('mouse')) ui.device = 'x2';
 if (flags.includes('settings')) ui.view = 'settings';
 if (flags.includes('games')) ui.view = 'games';
+if (tab === 'lighting' && D.kind === 'kb') ui.ledSel = new Set(['w', 'a', 's', 'd']);
 if (flags.includes('empty')) ui.sel.clear();
+if (flags.includes('fn') && D.layers) { ui.layer = 1; ui.mapSel = 'f6'; }
+if (flags.includes('menu')) ui.menu = true;
+PAIR_TYPES.forEach(t => { if (flags.includes(t.id)) ui.pairType = t.id; });
+D.zones && D.zones.forEach(z => { if (flags.includes(z.split(' ')[0].toLowerCase())) ui.zone = z; });
 Object.keys(ACCENTS).forEach(id => { if (flags.includes(id)) ui.accent = id; });
-if (flags.includes('dirty')) { hist.push(clone(S)); labels.push('Rapid Trigger'); S.press.w = S.press.a = S.press.s = S.press.d = 0.1; S.lift.w = S.lift.a = S.lift.s = S.lift.d = 0.1; }
+if (flags.includes('dirty')) {
+  hist.push(clone(S));
+  if (tab === 'triggers') { labels.push('Rapid Trigger'); ['w', 'a', 's', 'd'].forEach(id => { S.press[id] = S.lift[id] = D.he.rtDef - stepA() * 3; }); }
+  else if (tab === 'keybinds') { labels.push('Keybinds'); S.map[ui.layer].grv = 'Esc'; }
+  else if (tab === 'lighting' && D.kind === 'kb') { labels.push('Lighting'); ['w', 'a', 's', 'd'].forEach(id => S.led[id] = '#ff3b3b'); }
+  else if (tab === 'macros') { labels.push('Macros'); S.macros[0].steps.push({ t: 'delay', v: 20 }); }
+  else if (D.kind === 'mouse') { labels.push('DPI'); S.dpi[0] += 50; }
+  else { labels.push('Advanced'); S.adv.mac = true; }
+}
 if (flags.includes('shot')) win.classList.add('shot');
 renderAll(); fit();
 </script>
