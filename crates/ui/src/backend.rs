@@ -313,14 +313,14 @@ pub trait PeripheralService: Send + Sync {
         Err(CoreError::UnsupportedCapability("live_key_travel"))
     }
 
-    /// Reads live analog travel with an optional focus key hint for high-rate key tester
-    /// polling. Defaults to [`Self::read_live_key_travel`].
+    /// Reads live analog travel with focus key hints for high-rate key tester polling.
+    /// Defaults to [`Self::read_live_key_travel`].
     fn read_live_key_travel_focused(
         &self,
         device: &DeviceId,
-        focus_key: Option<KeyIndex>,
+        focus_keys: &[KeyIndex],
     ) -> CoreResult<Vec<KeyTravelSample>> {
-        let _ = focus_key;
+        let _ = focus_keys;
         self.read_live_key_travel(device)
     }
 
@@ -1424,8 +1424,7 @@ impl LiveHidService {
     fn read_live_key_travel_inner(
         &self,
         device: &DeviceId,
-        focus_key: Option<KeyIndex>,
-        focused: bool,
+        focus_keys: Option<&[KeyIndex]>,
     ) -> CoreResult<Vec<KeyTravelSample>> {
         let mut state = lock(&self.state);
         let dry_run = state.dry_run;
@@ -1444,10 +1443,9 @@ impl LiveHidService {
 
         let read_once = |peripheral: &mut dyn Peripheral| -> CoreResult<Vec<KeyTravelSample>> {
             let he = require(peripheral.as_hall_effect_mut(), "hall_effect")?;
-            if focused {
-                he.read_live_key_travel_focused(focus_key)
-            } else {
-                he.read_live_key_travel()
+            match focus_keys {
+                Some(keys) => he.read_live_key_travel_focused(keys),
+                None => he.read_live_key_travel(),
             }
         };
 
@@ -1962,15 +1960,15 @@ impl PeripheralService for LiveHidService {
     }
 
     fn read_live_key_travel(&self, device: &DeviceId) -> CoreResult<Vec<KeyTravelSample>> {
-        self.read_live_key_travel_inner(device, None, false)
+        self.read_live_key_travel_inner(device, None)
     }
 
     fn read_live_key_travel_focused(
         &self,
         device: &DeviceId,
-        focus_key: Option<KeyIndex>,
+        focus_keys: &[KeyIndex],
     ) -> CoreResult<Vec<KeyTravelSample>> {
-        self.read_live_key_travel_inner(device, focus_key, true)
+        self.read_live_key_travel_inner(device, Some(focus_keys))
     }
 
     fn sync_hardware_state(&self, device: &DeviceId) -> CoreResult<Option<DeviceSnapshot>> {
@@ -2648,13 +2646,13 @@ mod tests {
         // First call hits 0x0000048F, drops dead handle, and immediate reopen fails while device
         // is still unavailable.
         let first_err = service
-            .read_live_key_travel_focused(&id, Some(KeyIndex::new(33)))
+            .read_live_key_travel_focused(&id, &[KeyIndex::new(33)])
             .unwrap_err();
         assert!(is_disconnect_message(&first_err.to_string()));
 
         // Next call reopens automatically without calling `refresh()` and returns the sample.
         let samples = service
-            .read_live_key_travel_focused(&id, Some(KeyIndex::new(33)))
+            .read_live_key_travel_focused(&id, &[KeyIndex::new(33)])
             .expect("live travel must self-recover without manual refresh");
         assert_eq!(
             samples,

@@ -207,8 +207,17 @@ fn open_with_options(
     height: f32,
     options: AppOptions,
 ) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
+    open_with_service(cx, Arc::new(service), height, options)
+}
+
+/// Opens the app on a service the test keeps a handle to, so it can change mock readings.
+fn open_with_service(
+    cx: &mut HeadlessAppContext,
+    service: Arc<dyn PeripheralService>,
+    height: f32,
+    options: AppOptions,
+) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
     cx.update(gpui_kit::init);
-    let service: Arc<dyn PeripheralService> = Arc::new(service);
     // Mount `Root` as `gpui_kit::open_window` does, so dialogs and popovers have their layers.
     let mut built = None;
     let window = cx
@@ -495,6 +504,40 @@ fn capture_live_tester_screens() {
             settle(&mut cx, handle);
         }
         save(&mut cx, handle, &format!("live-tester-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_live_tester_socd_screens() {
+    let mut cx = headless();
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        // The mock pairs A (49) and D (51) for SOCD last-input priority. A is held first,
+        // then D is pressed shallower, so the tester shows A released.
+        let service = Arc::new(MockPeripheralService::new());
+        let keyboard = DeviceId::new(MOCK_KEYBOARD_ID);
+        let sample = |key, depth| {
+            KeyTravelSample::new(
+                KeyIndex::new(key),
+                TravelHundredthsMm::from_hundredths(depth),
+            )
+        };
+        service.set_live_key_travel(&keyboard, vec![sample(49, 250)]);
+        let (handle, _app) =
+            open_with_service(&mut cx, service.clone(), HEIGHT, AppOptions::default());
+        set_theme(&mut cx, handle, mode);
+        click(&mut cx, handle, device_element_id(&keyboard));
+        open_tab(&mut cx, handle, KeyboardTab::Triggers);
+        for _ in 0..3 {
+            cx.advance_clock(LIVE_POLL_INTERVAL);
+            settle(&mut cx, handle);
+        }
+        service.set_live_key_travel(&keyboard, vec![sample(49, 250), sample(51, 190)]);
+        for _ in 0..3 {
+            cx.advance_clock(LIVE_POLL_INTERVAL);
+            settle(&mut cx, handle);
+        }
+        save(&mut cx, handle, &format!("live-tester-socd-{suffix}"));
     }
 }
 

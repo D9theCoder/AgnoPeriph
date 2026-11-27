@@ -1116,26 +1116,18 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
 
     fn read_live_key_travel_focused(
         &mut self,
-        focus_key: Option<KeyIndex>,
+        focus_keys: &[KeyIndex],
     ) -> CoreResult<Vec<KeyTravelSample>> {
         let chunk_count = (self.spec.key_count() / 4).max(1);
-        let focus_chunk = focus_key
-            .filter(|k| k.value() < self.spec.key_count())
-            .map(|k| k.value() / 4);
+        let mut focus_chunks: Vec<u16> = Vec::with_capacity(focus_keys.len());
+        for key in focus_keys {
+            if key.value() < self.spec.key_count() && !focus_chunks.contains(&(key.value() / 4)) {
+                focus_chunks.push(key.value() / 4);
+            }
+        }
         let mut samples = Vec::new();
 
-        if let Some(fc) = focus_chunk {
-            self.read_live_travel_chunk(fc, true, &mut samples)?;
-            let mut scan_chunk = self.live_scan_chunk % chunk_count;
-            self.live_scan_chunk = (scan_chunk + 1) % chunk_count;
-            if scan_chunk == fc && chunk_count > 1 {
-                scan_chunk = self.live_scan_chunk % chunk_count;
-                self.live_scan_chunk = (scan_chunk + 1) % chunk_count;
-            }
-            if scan_chunk != fc {
-                self.read_live_travel_chunk(scan_chunk, false, &mut samples)?;
-            }
-        } else {
+        if focus_chunks.is_empty() {
             let first = self.live_scan_chunk % chunk_count;
             self.live_scan_chunk = (first + 1) % chunk_count;
             self.read_live_travel_chunk(first, true, &mut samples)?;
@@ -1143,6 +1135,19 @@ impl<T: HidTransport> HallEffectKeyboard for AtkRs7Device<T> {
                 let second = self.live_scan_chunk % chunk_count;
                 self.live_scan_chunk = (second + 1) % chunk_count;
                 self.read_live_travel_chunk(second, false, &mut samples)?;
+            }
+        } else {
+            for (i, &chunk) in focus_chunks.iter().enumerate() {
+                self.read_live_travel_chunk(chunk, i == 0, &mut samples)?;
+            }
+            // One background chunk per call, skipping chunks the focus reads already covered.
+            for _ in 0..chunk_count {
+                let scan_chunk = self.live_scan_chunk % chunk_count;
+                self.live_scan_chunk = (scan_chunk + 1) % chunk_count;
+                if !focus_chunks.contains(&scan_chunk) {
+                    self.read_live_travel_chunk(scan_chunk, false, &mut samples)?;
+                    break;
+                }
             }
         }
         Ok(samples)
@@ -1958,7 +1963,7 @@ mod tests {
 
         let mut dev = AtkRs7Device::open(mock, false, None).unwrap();
         let first = dev
-            .read_live_key_travel_focused(Some(KeyIndex::new(33)))
+            .read_live_key_travel_focused(&[KeyIndex::new(33)])
             .unwrap();
         assert_eq!(
             first,
@@ -1969,7 +1974,7 @@ mod tests {
         );
 
         let second = dev
-            .read_live_key_travel_focused(Some(KeyIndex::new(33)))
+            .read_live_key_travel_focused(&[KeyIndex::new(33)])
             .unwrap();
         assert_eq!(
             second,
@@ -1993,5 +1998,55 @@ mod tests {
             .map(|w| u16::from_be_bytes([w.bytes[6], w.bytes[7]]))
             .collect();
         assert_eq!(live_offsets, vec![32, 0, 32, 4]);
+    }
+
+    #[test]
+    fn focused_live_key_travel_reads_every_focus_chunk_and_skips_them_when_scanning() {
+        let mut mock = MockHidTransport::new(rs7_descriptor());
+        push_open_replies(&mut mock, true);
+        // Stale battery-style frame queued before the request must be drained, not decoded.
+        let mut stale = vec![0u8; RS7_PAYLOAD_LEN];
+        stale[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        stale[8 + 2..8 + 4].copy_from_slice(&99u16.to_be_bytes());
+        mock.push_stale_input_report(stale);
+
+        // Focus keys 49 (chunk 12, k = 1) and 51 (same chunk, k = 3) plus 4 (chunk 1, k = 0).
+        let mut chunk12 = vec![0u8; RS7_PAYLOAD_LEN];
+        chunk12[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        chunk12[8 + 5 + 2..8 + 5 + 4].copy_from_slice(&200u16.to_be_bytes());
+        mock.push_input_response(chunk12);
+        let mut chunk1 = vec![0u8; RS7_PAYLOAD_LEN];
+        chunk1[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        chunk1[8 + 2..8 + 4].copy_from_slice(&120u16.to_be_bytes());
+        mock.push_input_response(chunk1);
+        // Scan chunk 0 is not a focus chunk, so it is read; chunk 1 is skipped next time.
+        let mut scan0 = vec![0u8; RS7_PAYLOAD_LEN];
+        scan0[0] = protocol::cmd::GET_KEYBOARD_VALUE;
+        mock.push_input_response(scan0);
+
+        let mut dev = AtkRs7Device::open(mock, false, None).unwrap();
+        let samples = dev
+            .read_live_key_travel_focused(&[KeyIndex::new(49), KeyIndex::new(51), KeyIndex::new(4)])
+            .unwrap();
+        assert_eq!(
+            samples,
+            vec![
+                KeyTravelSample::new(KeyIndex::new(49), TravelHundredthsMm::from_hundredths(200)),
+                KeyTravelSample::new(KeyIndex::new(4), TravelHundredthsMm::from_hundredths(120)),
+            ]
+        );
+
+        let sent = dev.transport().inner().recorded_writes();
+        let live_offsets: Vec<u16> = sent
+            .iter()
+            .filter(|w| {
+                w.bytes.len() == RS7_TX_REPORT_LEN
+                    && w.bytes[1] == protocol::cmd::GET_KEYBOARD_VALUE
+                    && w.bytes[2] == protocol::sub::CUSTOM_ID
+                    && w.bytes[3] == protocol::sub::CALIBRATION_LIVE_BUFFER
+            })
+            .map(|w| u16::from_be_bytes([w.bytes[6], w.bytes[7]]))
+            .collect();
+        assert_eq!(live_offsets, vec![48, 4, 0]);
     }
 }
