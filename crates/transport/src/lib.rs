@@ -13,7 +13,7 @@ pub mod traits;
 
 pub use descriptor::{HidBusType, HidDeviceDescriptor};
 pub use error::{TransportError, TransportResult};
-pub use guard::GuardedTransport;
+pub use guard::{GuardedTransport, ReadMatch};
 pub use hidapi_backend::{HidapiEnumerator, HidapiTransport};
 pub use mock::{ExpectedWrite, MockHidTransport, RecordedWrite};
 pub use packet::{
@@ -153,5 +153,40 @@ mod tests {
         let mut buf = [0u8; 8];
         let len = mock.get_feature_report(&mut buf).unwrap();
         assert_eq!(&buf[..len], &[0x08, 0x04, 0x55]);
+    }
+
+    #[test]
+    fn read_matching_input_skips_noise_and_reports_timeout_or_exhaustion() {
+        let mut mock = MockHidTransport::new(sample_descriptor());
+        mock.push_stale_input_report(vec![0xAA; 7]);
+        mock.push_input_response(vec![0x00; 7]);
+        mock.push_input_response(vec![0x11, 0x01, 0x05, 0x2C, 0x42, 0x00, 0x00]);
+        let mut guarded = GuardedTransport::new(mock);
+
+        assert_eq!(guarded.drain_input_reports().unwrap(), 1);
+        let mut buf = [0u8; 20];
+        let matched = guarded
+            .read_matching_input(&mut buf, Duration::from_millis(200), 16, |frame| {
+                (frame[0] == 0x11).then_some(frame[4])
+            })
+            .unwrap();
+        assert_eq!(matched, ReadMatch::Matched(0x42));
+
+        // Empty queue -> TimedOut
+        let timed_out = guarded
+            .read_matching_input::<u8, _>(&mut buf, Duration::from_millis(50), 16, |_| None)
+            .unwrap();
+        assert_eq!(timed_out, ReadMatch::TimedOut);
+
+        // Non-matching frames exceeding max_reads -> WindowExhausted
+        let mut noisy = MockHidTransport::new(sample_descriptor());
+        for _ in 0..4 {
+            noisy.push_input_response(vec![0x00; 7]);
+        }
+        let mut guarded = GuardedTransport::new(noisy);
+        let exhausted = guarded
+            .read_matching_input::<u8, _>(&mut buf, Duration::from_millis(200), 3, |_| None)
+            .unwrap();
+        assert_eq!(exhausted, ReadMatch::WindowExhausted);
     }
 }

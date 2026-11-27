@@ -1916,6 +1916,24 @@ impl AgnoPeriphApp {
             )
     }
 
+    /// Builds a Markdown diagnostic report (selected device state, active error/warnings,
+    /// and recent TX/RX HID hex frames) suitable for bug reports and `MockHidTransport` replay.
+    pub fn diagnostic_report(&self) -> String {
+        inspector_drawer::build_diagnostic_report(self)
+    }
+
+    /// Copies [`Self::diagnostic_report`] to the OS clipboard and shows a confirmation toast.
+    pub fn copy_diagnostics(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let report = self.diagnostic_report();
+        cx.write_to_clipboard(ClipboardItem::new_string(report));
+        window.push_notification(
+            gpui_kit::component::notification::Notification::success(
+                "Copied diagnostic report to clipboard.",
+            ),
+            cx,
+        );
+    }
+
     fn render_notices(&self, cx: &mut Context<Self>) -> Div {
         let update = crate::updates::render_notice(self, cx);
         v_flex()
@@ -1932,11 +1950,30 @@ impl AgnoPeriphApp {
                                 .flex_1(),
                         )
                         .child(
-                            Button::new("dismiss-banner")
-                                .ghost()
-                                .small()
-                                .label("Dismiss")
-                                .on_click(cx.listener(|this, _, _, cx| this.dismiss_banner(cx))),
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("copy-banner-diagnostics")
+                                        .outline()
+                                        .small()
+                                        .icon(IconName::Copy)
+                                        .label("Copy diagnostics")
+                                        .tooltip(
+                                            "Copy device state, error, and recent HID hex trace",
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.copy_diagnostics(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("dismiss-banner")
+                                        .ghost()
+                                        .small()
+                                        .label("Dismiss")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.dismiss_banner(cx);
+                                        })),
+                                ),
                         ),
                 )
             })

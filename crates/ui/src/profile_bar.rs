@@ -480,6 +480,7 @@ fn render_profile_tools(
         .dropdown_menu(move |menu, _, _| {
             let import = file_entity.clone();
             let export = file_entity.clone();
+            let diag = file_entity.clone();
             menu.item(
                 PopupMenuItem::new("Import from JSON…")
                     .icon(Icon::new(IconName::Download))
@@ -492,6 +493,14 @@ fn render_profile_tools(
                     .icon(Icon::new(IconName::Upload))
                     .on_click(move |_, window, cx| {
                         let _ = export.update(cx, |this, cx| this.begin_export(window, cx));
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Copy diagnostics")
+                    .icon(Icon::new(IconName::Copy))
+                    .on_click(move |_, window, cx| {
+                        let _ = diag.update(cx, |this, cx| this.copy_diagnostics(window, cx));
                     }),
             )
         });
@@ -519,36 +528,48 @@ pub(crate) fn render(
             .child(tools)
             .into_any_element();
     }
-    let (slots, active, prefix): (Vec<u8>, u8, &'static str) = if let Some(profiles) = hardware {
-        (
-            (0..profiles.capabilities.slot_count).collect(),
-            profiles.snapshot.active_slot.index(),
-            "profile",
-        )
-    } else {
-        let sw = app.config().software_profiles.get(id.as_str());
-        (
-            sw.map_or_else(
-                || (0..4).collect(),
-                |sw| sw.slots.iter().map(|s| s.slot).collect(),
-            ),
-            sw.map_or(0, |sw| sw.active_slot),
-            "preset",
-        )
-    };
-    let buttons = slots.iter().map(|&slot| {
+    let (slots, active, prefix): (Vec<(u8, bool)>, u8, &'static str) =
+        if let Some(profiles) = hardware {
+            let entries = (0..profiles.capabilities.slot_count)
+                .map(|slot| {
+                    let enabled = profiles
+                        .snapshot
+                        .profiles
+                        .iter()
+                        .find(|info| info.slot.index() == slot)
+                        .is_none_or(agnoperiph_core::ProfileInfo::is_enabled);
+                    (slot, enabled)
+                })
+                .collect();
+            (entries, profiles.snapshot.active_slot.index(), "profile")
+        } else {
+            let sw = app.config().software_profiles.get(id.as_str());
+            (
+                sw.map_or_else(
+                    || (0..4).map(|slot| (slot, true)).collect(),
+                    |sw| sw.slots.iter().map(|s| (s.slot, true)).collect(),
+                ),
+                sw.map_or(0, |sw| sw.active_slot),
+                "preset",
+            )
+        };
+    let buttons = slots.iter().map(|&(slot, enabled)| {
         let label = app.config().preset_name(&id, ProfileSlot::new(slot));
         let device = id.clone();
-        Button::new((prefix, u64::from(slot)))
+        let mut button = Button::new((prefix, u64::from(slot)))
             .label(label.clone())
             .accessibility_label(label)
             .selected(slot == active)
-            .disabled(busy)
+            .disabled(busy || !enabled)
             .on_click(cx.listener(move |this, _, window, cx| {
-                if slot != active {
+                if enabled && slot != active {
                     this.request_profile_switch(&device, slot, window, cx);
                 }
-            }))
+            }));
+        if !enabled {
+            button = button.tooltip("Disabled in onboard memory");
+        }
+        button
     });
     let rename_device = id.clone();
     let theme = cx.theme();

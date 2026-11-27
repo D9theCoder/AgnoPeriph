@@ -771,7 +771,19 @@ pub fn validate_change(snapshot: &DeviceSnapshot, change: &SettingChange) -> Cor
         }
         SettingChange::Profile(slot) => {
             let profiles = require(snapshot.profiles.as_ref(), "profiles")?;
-            profiles.capabilities.validate_slot(*slot)
+            profiles.capabilities.validate_slot(*slot)?;
+            if profiles
+                .snapshot
+                .profiles
+                .iter()
+                .find(|info| info.slot == *slot)
+                .is_some_and(|info| !info.is_enabled())
+            {
+                return Err(CoreError::Validation(format!(
+                    "{slot} is disabled in onboard memory"
+                )));
+            }
+            Ok(())
         }
     }
 }
@@ -2285,5 +2297,28 @@ mod tests {
                 colorful: false,
             }
         );
+    }
+
+    #[test]
+    fn validate_change_rejects_disabled_onboard_profile_slot() {
+        let mock = MockPeripheralService::new();
+        let mut mouse = mock
+            .refresh()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.profiles.is_some())
+            .unwrap();
+        let profiles = mouse.profiles.as_mut().unwrap();
+        profiles.snapshot.profiles = vec![
+            agnoperiph_core::ProfileInfo::new(ProfileSlot::new(0), true),
+            agnoperiph_core::ProfileInfo::new(ProfileSlot::new(1), false),
+            agnoperiph_core::ProfileInfo::new(ProfileSlot::new(2), false),
+        ];
+
+        assert!(validate_change(&mouse, &SettingChange::Profile(ProfileSlot::new(0))).is_ok());
+        assert!(matches!(
+            validate_change(&mouse, &SettingChange::Profile(ProfileSlot::new(1))),
+            Err(CoreError::Validation(_))
+        ));
     }
 }

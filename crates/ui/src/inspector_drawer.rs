@@ -3,6 +3,7 @@
 //! Packets are pre-formatted once when the trace log changes and rendered through a
 //! virtualized [`uniform_list`] so hundreds of frames stay within high-refresh frame budgets.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use agnoperiph_transport::{PacketDirection, PacketOutcome, PacketTraceEntry};
@@ -16,9 +17,264 @@ use gpui_kit::component::{
 use gpui_kit::*;
 
 use crate::app::AgnoPeriphApp;
+use crate::backend::DeviceSnapshot;
 
 /// Newest frames retained for display; older ones stay in the bounded service log.
 const VISIBLE_ROWS: usize = 200;
+/// Maximum recent frames included in a copied diagnostic report (oldest -> newest).
+const DIAGNOSTIC_TRACE_LIMIT: usize = 120;
+
+/// Builds a self-contained Markdown diagnostic report (app info, active error, selected
+/// device state, warnings, connected devices, and recent TX/RX HID hex frames) ready to
+/// paste into an issue report or replay in `MockHidTransport`.
+///
+/// Raw serial numbers and OS device paths are redacted so personal identifiers are not
+/// leaked when sharing diagnostics publicly.
+pub(crate) fn build_diagnostic_report(app: &AgnoPeriphApp) -> String {
+    let mut out = String::with_capacity(2048);
+    let _ = writeln!(out, "## AgnoPeriph Diagnostic Report");
+    let _ = writeln!(
+        out,
+        "- App: AgnoPeriph v{} ({} / {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    let _ = writeln!(
+        out,
+        "- Mode: {}",
+        if app.is_dry_run() { "dry-run" } else { "live" }
+    );
+    let _ = writeln!(out, "- Connected devices: {}", app.devices().len());
+
+    if let Some(banner) = app.banner() {
+        let _ = writeln!(out, "\n### Active Error");
+        let _ = writeln!(out, "- Title: {}", banner.title());
+        let _ = writeln!(out, "- Message: {}", banner.message());
+    }
+
+    if let Some(selected) = app.selected_raw() {
+        let _ = writeln!(out, "\n### Selected Device");
+        write_device_details(&mut out, selected);
+    }
+
+    let selected_id = app.selected_raw().map(DeviceSnapshot::id);
+    let others: Vec<&DeviceSnapshot> = app
+        .devices()
+        .iter()
+        .filter(|d| Some(d.id()) != selected_id)
+        .collect();
+    if !others.is_empty() {
+        let _ = writeln!(out, "\n### Other Connected Devices");
+        for dev in others {
+            let fw = dev.info.firmware_version.as_deref().unwrap_or("unknown");
+            let _ = writeln!(
+                out,
+                "- {} ({}, {}, {:04X}:{:04X}, fw={fw}, warnings={})",
+                dev.info.model_name,
+                dev.info.vendor,
+                dev.info.connection,
+                dev.info.vid,
+                dev.info.pid,
+                dev.warnings.len(),
+            );
+        }
+    }
+
+    let packets = app.packets();
+    let start = packets.len().saturating_sub(DIAGNOSTIC_TRACE_LIMIT);
+    let slice = &packets[start..];
+    let _ = writeln!(
+        out,
+        "\n### Recent HID Packet Trace ({} of {} frames, oldest -> newest)",
+        slice.len(),
+        packets.len(),
+    );
+    if slice.is_empty() {
+        let _ = writeln!(out, "(no HID packets recorded yet)");
+    } else {
+        let _ = writeln!(out, "```text");
+        for entry in slice {
+            let dir = match entry.direction {
+                PacketDirection::HostToDevice => "TX",
+                PacketDirection::DeviceToHost => "RX",
+            };
+            let hex = entry.hex_spaced();
+            match &entry.note {
+                Some(note) => {
+                    let _ = writeln!(
+                        out,
+                        "#{:04} {dir} {:7} [{:11}] ({}) {hex}  // {note}",
+                        entry.sequence, entry.kind, entry.outcome, entry.device_label,
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "#{:04} {dir} {:7} [{:11}] ({}) {hex}",
+                        entry.sequence, entry.kind, entry.outcome, entry.device_label,
+                    );
+                }
+            }
+        }
+        let _ = writeln!(out, "```");
+    }
+
+    out
+}
+
+fn write_device_details(out: &mut String, device: &DeviceSnapshot) {
+    let info = &device.info;
+    let _ = writeln!(out, "- Model: {} ({})", info.model_name, info.vendor);
+    let _ = writeln!(
+        out,
+        "- Connection: {} (VID 0x{:04X}, PID 0x{:04X})",
+        info.connection, info.vid, info.pid,
+    );
+    let _ = writeln!(
+        out,
+        "- Firmware: {}",
+        info.firmware_version.as_deref().unwrap_or("unknown")
+    );
+    let _ = writeln!(
+        out,
+        "- Serial: {}",
+        if info.serial_number.is_some() {
+            "present (redacted)"
+        } else {
+            "none"
+        }
+    );
+
+    let caps = device.capabilities;
+    let mut cap_names = Vec::new();
+    if caps.has_pointer() {
+        cap_names.push("pointer");
+    }
+    if caps.has_hall_effect() {
+        cap_names.push("hall_effect");
+    }
+    if caps.has_rgb() {
+        cap_names.push("rgb");
+    }
+    if caps.has_battery() {
+        cap_names.push("battery");
+    }
+    if caps.has_profiles() {
+        cap_names.push("profiles");
+    }
+    if caps.has_keymap() {
+        cap_names.push("keymap");
+    }
+    if caps.has_macros() {
+        cap_names.push("macros");
+    }
+    if caps.has_keyboard_config() {
+        cap_names.push("keyboard_config");
+    }
+    let _ = writeln!(
+        out,
+        "- Capabilities: {}",
+        if cap_names.is_empty() {
+            "none".to_owned()
+        } else {
+            cap_names.join(", ")
+        }
+    );
+
+    if let Some(battery) = &device.battery {
+        let pct = battery
+            .percentage
+            .map_or_else(|| "unknown".to_owned(), |p| format!("{p}%"));
+        let mv = battery
+            .voltage_mv
+            .map_or_else(String::new, |v| format!(", {v} mV"));
+        let _ = writeln!(out, "- Battery: {pct} ({:?}{mv})", battery.state);
+    }
+
+    if let Some(pointer) = &device.pointer {
+        let snap = &pointer.snapshot;
+        let caps = &pointer.capabilities;
+        let stages: Vec<String> = snap
+            .dpi_stages
+            .iter()
+            .map(|s| s.x.value().to_string())
+            .collect();
+        let rates: Vec<String> = caps
+            .supported_polling_rates
+            .iter()
+            .map(|r| r.as_hz().to_string())
+            .collect();
+        let _ = writeln!(
+            out,
+            "- Pointer: active_stage={}, stages=[{}], rate={} Hz, dpi_bounds={}..={} step {}, supported_rates=[{}]",
+            snap.active_dpi_stage,
+            stages.join(", "),
+            snap.polling_rate.as_hz(),
+            caps.dpi_min,
+            caps.dpi_max,
+            caps.dpi_step,
+            rates.join(", "),
+        );
+    }
+
+    if let Some(profiles) = &device.profiles {
+        let snap = &profiles.snapshot;
+        let slots: Vec<String> = snap
+            .profiles
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}:{}",
+                    p.slot.display_number(),
+                    if p.is_enabled() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "- Profiles: active={}, mode={}, slot_count={}, slots=[{}]",
+            snap.active_slot,
+            snap.mode,
+            profiles.capabilities.slot_count,
+            slots.join(", "),
+        );
+    }
+
+    if let Some(he) = &device.hall_effect {
+        let snap = &he.snapshot;
+        let _ = writeln!(
+            out,
+            "- Hall Effect: keys={}, socd_pairs={}, rapid_switch_pairs={}, dks={}, mod_tap={}, toggle={}",
+            snap.keys.len(),
+            snap.socd_pairs.len(),
+            snap.rapid_switch_pairs.len(),
+            snap.dks_bindings.len(),
+            snap.mod_tap_bindings.len(),
+            snap.toggle_bindings.len(),
+        );
+    }
+
+    if let Some(rgb) = &device.rgb {
+        let _ = writeln!(
+            out,
+            "- RGB: zones={}, per_key={}",
+            rgb.snapshot.zones.len(),
+            rgb.capabilities.supports_per_key_rgb,
+        );
+    }
+
+    if !device.warnings.is_empty() {
+        let _ = writeln!(out, "- Warnings:");
+        for w in &device.warnings {
+            let _ = writeln!(out, "  - {}: {}", w.capability, w.message);
+        }
+    }
+}
 
 /// Pre-formatted packet row cached on [`AgnoPeriphApp`] to avoid per-frame string allocations.
 #[derive(Debug, Clone)]
@@ -105,6 +361,19 @@ pub(crate) fn render(
         .child(
             h_flex()
                 .gap_1()
+                .child(
+                    Button::new("inspector-copy-diagnostics")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Copy)
+                        .label("Copy diagnostics")
+                        .tooltip(
+                            "Copy device state, warnings, and recent HID hex trace to clipboard",
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.copy_diagnostics(window, cx);
+                        })),
+                )
                 .child(
                     Button::new("inspector-clear")
                         .ghost()

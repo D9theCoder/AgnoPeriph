@@ -2,7 +2,7 @@
 
 use agnoperiph_core::{
     BatteryStatus, Brightness, ChargingState, CoreError, CoreResult, PollingRateHz, ProfileMode,
-    RgbColor, RgbDirection, RgbEffect, RgbEffectKind,
+    ProfileSlot, RgbColor, RgbDirection, RgbEffect, RgbEffectKind,
 };
 use agnoperiph_transport::FixedReportValidator;
 
@@ -30,6 +30,114 @@ pub const SOFTWARE_ID: u8 = 0x0C;
 /// Error sub-IDs returned in byte 2.
 pub const HIDPP10_ERROR_SUB_ID: u8 = 0x8F;
 pub const HIDPP20_ERROR_SUB_ID: u8 = 0xFF;
+
+/// Standard HID++ 2.0 error codes returned in byte 5 of an `0xFF` error frame.
+pub const HIDPP20_ERR_INVALID_ARGUMENT: u8 = 0x02;
+pub const HIDPP20_ERR_BUSY: u8 = 0x08;
+
+/// Human-readable name for a HID++ 2.0 error code.
+pub const fn hidpp20_error_name(code: u8) -> &'static str {
+    match code {
+        0x01 => "UNKNOWN",
+        0x02 => "INVALID_ARGUMENT",
+        0x03 => "OUT_OF_RANGE",
+        0x04 => "HW_ERROR",
+        0x05 => "NOT_ALLOWED",
+        0x06 => "INVALID_FEATURE_INDEX",
+        0x07 => "INVALID_FUNCTION_ID",
+        0x08 => "BUSY",
+        0x09 => "UNSUPPORTED",
+        0x0A => "UNKNOWN_DEVICE",
+        _ => "UNKNOWN_ERROR",
+    }
+}
+
+/// Decodes one `DeviceFWVersion` (`0x0003`, func `1`) entity response into `(entity_kind, version)`.
+///
+/// Only `Firmware` (`0x00`) and `Bootloader` (`0x01`) entities carry the 3-character ASCII
+/// prefix and `major.minor.build` version tuple.
+pub fn decode_firmware_entity(params: &[u8; 16]) -> Option<(u8, String)> {
+    let kind = params[0] & 0x0F;
+    if kind != 0x00 && kind != 0x01 {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&params[1..4])
+        .trim_matches('\0')
+        .trim()
+        .to_owned();
+    if prefix.is_empty() {
+        return None;
+    }
+    let build = u16::from_be_bytes([params[6], params[7]]);
+    Some((
+        kind,
+        format!("{prefix} {:02X}.{:02X}.{build:04X}", params[4], params[5]),
+    ))
+}
+
+/// One entry in a Logitech `OnboardProfiles` (`0x8100`) sector directory (`0x0000` writeable or `0x0100` ROM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnboardProfileEntry {
+    /// Big-endian 16-bit sector address (`(mem_type << 8) | page`, e.g. `0x0001` writeable or `0x0101` ROM).
+    pub sector: u16,
+    /// Whether this profile slot is enabled in the device's directory.
+    pub enabled: bool,
+}
+
+/// Parses 4-byte directory entries `[mem_type, page, enabled, reserved]` from an `0x8100`
+/// directory sector (`0x0000` writeable or `0x0100` ROM), stopping at `0xFFFF` or `max_entries`.
+///
+/// Returns an empty `Vec` when the sector begins with all `0x00` or all `0xFF` bytes so the
+/// caller can fall back from writeable memory (`0x0000`) to ROM (`0x0100`).
+pub fn parse_profile_directory(raw: &[u8], max_entries: usize) -> Vec<OnboardProfileEntry> {
+    if raw.len() < 4 || raw[..4] == [0x00; 4] || raw[..4] == [0xFF; 4] {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    let (chunks, _) = raw.as_chunks::<4>();
+    for &[bank, page, enabled, _reserved] in chunks {
+        if entries.len() >= max_entries {
+            break;
+        }
+        let sector = u16::from_be_bytes([bank, page]);
+        if sector == 0xFFFF || sector == 0x0000 {
+            break;
+        }
+        // Only Writeable (0x00) and ROM (0x01) memory banks with 1-based page indices are valid.
+        if (bank != 0x00 && bank != 0x01) || page == 0 {
+            break;
+        }
+        entries.push(OnboardProfileEntry {
+            sector,
+            enabled: enabled != 0,
+        });
+    }
+    entries
+}
+
+/// Maps an `0x8100` `GetCurrentProfile` sector address (`0x0001`, `0x0101`, ...) onto a zero-based [`ProfileSlot`].
+pub fn resolve_active_profile_slot(
+    active_sector: u16,
+    entries: &[OnboardProfileEntry],
+    slot_count: u8,
+) -> ProfileSlot {
+    let max_ix = slot_count.saturating_sub(1);
+    if active_sector != 0
+        && let Some(ix) = entries.iter().position(|e| e.sector == active_sector)
+    {
+        return ProfileSlot::new(u8::try_from(ix).unwrap_or(0).min(max_ix));
+    }
+    if active_sector == 0 {
+        let first_enabled = entries
+            .iter()
+            .position(|e| e.enabled)
+            .and_then(|ix| u8::try_from(ix).ok())
+            .unwrap_or(0);
+        return ProfileSlot::new(first_enabled.min(max_ix));
+    }
+    let page = u8::try_from(active_sector & 0x00FF).unwrap_or(1);
+    ProfileSlot::new(page.saturating_sub(1).min(max_ix))
+}
 
 /// Standard HID++ 2.0 Feature IDs.
 pub mod feature {

@@ -81,6 +81,7 @@ impl<T: HidTransport> MchoseDevice<T> {
         let mut busy = 0;
         let mut timeouts = 0;
         while timeouts < READ_ATTEMPTS {
+            let _ = self.transport.drain_input_reports();
             self.transport.send_query_output_report(&frame)?;
             match self.v3_await(cmd)? {
                 Outcome::Payload(payload) => return Ok(payload),

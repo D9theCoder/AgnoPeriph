@@ -17,7 +17,7 @@ use agnoperiph_core::{
     RgbZoneId, RgbZoneInfo, RgbZoneState, TravelHundredthsMm, VendorKind,
 };
 use agnoperiph_transport::{
-    FixedReportValidator, GuardedTransport, HidTransport, PacketSink, ReportKind, TransportError,
+    FixedReportValidator, GuardedTransport, HidTransport, PacketSink, ReadMatch, ReportKind,
 };
 
 /// Vendor HID Usage Page for GTech `0xFF01` keyboards (ATK68 / ATK75 / EDGE / Hex80).
@@ -27,7 +27,7 @@ pub const ATK_FF01_PAYLOAD_LEN: usize = 64;
 pub const ATK_FF01_TX_LEN: usize = 65;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(800);
-const MAX_READ_ATTEMPTS: usize = 16;
+const MAX_READ_ATTEMPTS: usize = 64;
 const FF01_PROFILE_COUNT: u8 = 4;
 const FF01_BRIGHTNESS_MAX: u8 = 8;
 const FF01_SPEED_MAX: u8 = 4;
@@ -445,23 +445,20 @@ impl<T: HidTransport> AtkFf01Keyboard<T> {
         }
 
         let mut rx = [0u8; ATK_FF01_TX_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let n = match self.transport.read_input_report(&mut rx, READ_TIMEOUT) {
-                Ok(len) => len,
-                Err(TransportError::Timeout { .. }) => {
-                    return Err(CoreError::NotConnected(format!(
-                        "timed out waiting for ATK 0xFF01 reply to 0x{cmd:02X}"
-                    )));
-                }
-                Err(err) => return Err(err.into()),
-            };
-            if let Some(data) = unwrap_ff01_rx(&rx[..n], cmd)? {
-                return Ok(data);
-            }
+        match self.transport.try_read_matching_input(
+            &mut rx,
+            READ_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |frame| unwrap_ff01_rx(frame, cmd),
+        )? {
+            ReadMatch::Matched(data) => Ok(data),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
+                "timed out waiting for ATK 0xFF01 reply to 0x{cmd:02X}"
+            ))),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(format!(
+                "no matching ATK 0xFF01 reply for 0x{cmd:02X}"
+            ))),
         }
-        Err(CoreError::Protocol(format!(
-            "no matching ATK 0xFF01 reply for 0x{cmd:02X}"
-        )))
     }
 
     fn discover_readonly(&mut self) -> CoreResult<()> {

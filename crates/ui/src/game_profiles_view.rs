@@ -400,16 +400,36 @@ impl AgnoPeriphApp {
     /// Preset slots offered for `device` with their display names.
     pub(crate) fn preset_slots(&self, device: &DeviceSnapshot) -> Vec<(u8, String)> {
         let id = device.id();
-        let count = match &device.profiles {
-            Some(profiles) => profiles.capabilities.slot_count,
-            None if device.capabilities.has_hall_effect() => self
-                .config
+        if let Some(profiles) = &device.profiles {
+            let enabled: Vec<u8> = (0..profiles.capabilities.slot_count)
+                .filter(|&slot| {
+                    profiles
+                        .snapshot
+                        .profiles
+                        .iter()
+                        .find(|info| info.slot.index() == slot)
+                        .is_none_or(agnoperiph_core::ProfileInfo::is_enabled)
+                })
+                .collect();
+            let slots = if enabled.is_empty() {
+                (0..profiles.capabilities.slot_count).collect()
+            } else {
+                enabled
+            };
+            return slots
+                .into_iter()
+                .map(|slot| (slot, self.config.preset_name(id, ProfileSlot::new(slot))))
+                .collect();
+        }
+        let count = if device.capabilities.has_hall_effect() {
+            self.config
                 .software_profiles
                 .get(id.as_str())
                 .map_or(DEFAULT_SOFTWARE_PROFILE_SLOTS, |sw| {
                     u8::try_from(sw.slots.len()).unwrap_or(DEFAULT_SOFTWARE_PROFILE_SLOTS)
-                }),
-            None => 0,
+                })
+        } else {
+            0
         };
         (0..count)
             .map(|slot| (slot, self.config.preset_name(id, ProfileSlot::new(slot))))

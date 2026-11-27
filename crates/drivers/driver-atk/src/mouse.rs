@@ -15,7 +15,7 @@ use agnoperiph_core::{
     ProfileSnapshot, VendorKind,
 };
 use agnoperiph_transport::{
-    FixedReportValidator, GuardedTransport, HidTransport, PacketSink, ReportKind, TransportError,
+    FixedReportValidator, GuardedTransport, HidTransport, PacketSink, ReadMatch, ReportKind,
 };
 
 /// USB Vendor ID for Shenzhen Yizhita / ATK / VXE hardware.
@@ -35,7 +35,7 @@ pub const ATK_MOUSE_MAX_CHUNK: usize = 10;
 const CHECKSUM_TARGET: u8 = 0x55;
 
 const READ_TIMEOUT: Duration = Duration::from_millis(600);
-const MAX_READ_ATTEMPTS: usize = 8;
+const MAX_READ_ATTEMPTS: usize = 64;
 
 /// Wire command IDs for the `0x08` EEPROM protocol.
 pub mod cmd {
@@ -835,23 +835,20 @@ impl<T: HidTransport> AtkMouseDevice<T> {
         }
 
         let mut rx = [0u8; ATK_MOUSE_TX_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let n = match self.transport.read_input_report(&mut rx, READ_TIMEOUT) {
-                Ok(len) => len,
-                Err(TransportError::Timeout { .. }) => {
-                    return Err(CoreError::NotConnected(format!(
-                        "timed out waiting for ATK/VGN mouse reply to cmd 0x{expected_cmd:02X}"
-                    )));
-                }
-                Err(err) => return Err(err.into()),
-            };
-            if let Some(payload) = unwrap_mouse_rx(&rx[..n], expected_cmd) {
-                return Ok(payload);
-            }
+        match self.transport.read_matching_input(
+            &mut rx,
+            READ_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |frame| unwrap_mouse_rx(frame, expected_cmd),
+        )? {
+            ReadMatch::Matched(payload) => Ok(payload),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
+                "timed out waiting for ATK/VGN mouse reply to cmd 0x{expected_cmd:02X}"
+            ))),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(format!(
+                "no matching ATK/VGN mouse reply for cmd 0x{expected_cmd:02X}"
+            ))),
         }
-        Err(CoreError::Protocol(format!(
-            "no matching ATK/VGN mouse reply for cmd 0x{expected_cmd:02X}"
-        )))
     }
 
     fn discover_readonly(&mut self) -> CoreResult<()> {

@@ -14,7 +14,7 @@ use agnoperiph_core::{
     PointerCapabilities, PointerDevice, PointerSnapshot, PollingRateHz, ProfileCapabilities,
     ProfileInfo, ProfileManager, ProfileMode, ProfileSlot, ProfileSnapshot, VendorKind,
 };
-use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
+use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, ReadMatch};
 
 use crate::protocol::{
     Command, PULSAR_MAX_PAYLOAD, PULSAR_PACKET_LEN, PULSAR_USAGE_ID, PULSAR_USAGE_PAGE, PULSAR_VID,
@@ -24,7 +24,7 @@ use crate::protocol::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(600);
-const MAX_READ_ATTEMPTS: usize = 6;
+const MAX_READ_ATTEMPTS: usize = 64;
 const MAX_ONLINE_POLLS: usize = 10;
 
 /// Declarative `DriverDescriptor` for Pulsar Report-8 (`VID 0x3710`, `0xFF02:0x0002`) peripherals.
@@ -161,6 +161,10 @@ impl<T: HidTransport> PulsarDevice<T> {
         let req = encode_request(cmd, address, payload)?;
         let is_mutating = matches!(cmd, Command::WriteFlash | Command::SetCurrentConfig);
 
+        if !is_mutating || !self.transport.is_dry_run() {
+            let _ = self.transport.drain_input_reports();
+        }
+
         if is_mutating {
             self.transport.send_output_report(&req)?;
             if self.transport.is_dry_run() {
@@ -177,33 +181,34 @@ impl<T: HidTransport> PulsarDevice<T> {
         }
 
         let mut buf = [0u8; PULSAR_PACKET_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let read_len = match self.transport.read_input_report(&mut buf, READ_TIMEOUT) {
-                Ok(n) => n,
-                Err(TransportError::Timeout { .. }) => {
-                    return Err(CoreError::NotConnected(format!(
-                        "timed out waiting for Pulsar reply to {cmd:?}"
-                    )));
+        match self.transport.try_read_matching_input(
+            &mut buf,
+            READ_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |frame| {
+                if let Some(reply) = decode_reply(frame)
+                    && reply.command == cmd
+                    && (ignore_len || reply.declared_len == payload.len())
+                {
+                    if reply.error != 0 {
+                        return Err(CoreError::Protocol(format!(
+                            "Pulsar returned error status 0x{:02X} for {cmd:?}",
+                            reply.error
+                        )));
+                    }
+                    return Ok(Some(reply));
                 }
-                Err(err) => return Err(err.into()),
-            };
-            if let Some(reply) = decode_reply(&buf[..read_len])
-                && reply.command == cmd
-                && (ignore_len || reply.declared_len == payload.len())
-            {
-                if reply.error != 0 {
-                    return Err(CoreError::Protocol(format!(
-                        "Pulsar returned error status 0x{:02X} for {cmd:?}",
-                        reply.error
-                    )));
-                }
-                return Ok(reply);
-            }
+                Ok(None)
+            },
+        )? {
+            ReadMatch::Matched(reply) => Ok(reply),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
+                "timed out waiting for Pulsar reply to {cmd:?}"
+            ))),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(format!(
+                "no matching Pulsar reply for {cmd:?}"
+            ))),
         }
-
-        Err(CoreError::Protocol(format!(
-            "no matching Pulsar reply for {cmd:?}"
-        )))
     }
 
     fn set_device_online(&mut self, enabled: bool) -> CoreResult<()> {
@@ -667,5 +672,27 @@ mod tests {
             .filter(|e| e.outcome == PacketOutcome::DryRunSuppressed)
             .count();
         assert_eq!(suppressed, 7);
+    }
+
+    #[test]
+    fn drains_stale_reports_and_skips_notification_bursts() {
+        let mut mock = MockHidTransport::new(pulsar_desc());
+        for _ in 0..16 {
+            mock.push_stale_input_report(vec![0x00; PULSAR_PACKET_LEN]);
+        }
+        // 10 unrelated frames mid-flight before the real EncryptionData reply (exceeds old cap of 6)
+        for _ in 0..10 {
+            mock.push_input_response(reply(Command::BatteryLevel, 0, 2, &[90, 0]));
+        }
+        mock.push_input_response(reply(
+            Command::EncryptionData,
+            0,
+            8,
+            &[0, 0, 0, 0, 0x57, 0x04, 5, 3],
+        ));
+        mock.push_input_response(reply(Command::ReadVersionId, 0, 2, &[0x01, 0x18]));
+
+        let dev = PulsarDevice::open(mock, true, None).unwrap();
+        assert_eq!(dev.info().firmware_version.as_deref(), Some("v1.18"));
     }
 }

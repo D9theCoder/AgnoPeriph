@@ -17,7 +17,7 @@ use agnoperiph_core::{
     PollingRateHz, ProfileCapabilities, ProfileInfo, ProfileManager, ProfileMode, ProfileSlot,
     ProfileSnapshot, VendorKind,
 };
-use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
+use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, ReadMatch};
 
 use crate::atlantis::{
     ATLANTIS_MAX_PAYLOAD, ATLANTIS_PACKET_LEN, ATLANTIS_PRODUCTS, AtlantisProductProfile,
@@ -28,7 +28,7 @@ use crate::atlantis::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(600);
-const MAX_READ_ATTEMPTS: usize = 6;
+const MAX_READ_ATTEMPTS: usize = 64;
 
 /// Returns true for firmware images that store the packed macro slots (`v2.x` and later).
 fn firmware_supports_macros(version: &str) -> bool {
@@ -219,33 +219,34 @@ impl<T: HidTransport> LamzuAtlantisDevice<T> {
         }
 
         let mut buf = [0u8; ATLANTIS_PACKET_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let read_len = match self.transport.read_input_report(&mut buf, READ_TIMEOUT) {
-                Ok(n) => n,
-                Err(TransportError::Timeout { .. }) => {
-                    return Err(CoreError::NotConnected(format!(
-                        "timed out waiting for Lamzu Atlantis reply to {cmd:?}"
-                    )));
+        match self.transport.try_read_matching_input(
+            &mut buf,
+            READ_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |frame| {
+                if let Some(reply) = decode_reply(frame)
+                    && reply.command == cmd
+                    && (ignore_len || reply.declared_len == payload.len())
+                {
+                    if reply.error != 0 {
+                        return Err(CoreError::Protocol(format!(
+                            "Lamzu Atlantis returned error status 0x{:02X} for {cmd:?}",
+                            reply.error
+                        )));
+                    }
+                    return Ok(Some(reply));
                 }
-                Err(err) => return Err(err.into()),
-            };
-            if let Some(reply) = decode_reply(&buf[..read_len])
-                && reply.command == cmd
-                && (ignore_len || reply.declared_len == payload.len())
-            {
-                if reply.error != 0 {
-                    return Err(CoreError::Protocol(format!(
-                        "Lamzu Atlantis returned error status 0x{:02X} for {cmd:?}",
-                        reply.error
-                    )));
-                }
-                return Ok(reply);
-            }
+                Ok(None)
+            },
+        )? {
+            ReadMatch::Matched(reply) => Ok(reply),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
+                "timed out waiting for Lamzu Atlantis reply to {cmd:?}"
+            ))),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(format!(
+                "no matching Lamzu Atlantis reply for {cmd:?}"
+            ))),
         }
-
-        Err(CoreError::Protocol(format!(
-            "no matching Lamzu Atlantis reply for {cmd:?}"
-        )))
     }
 
     fn read_flash_raw(&mut self, address: u16, len: usize) -> CoreResult<Vec<u8>> {

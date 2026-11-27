@@ -67,6 +67,17 @@ crates/cli           ──┼──▶ crates/drivers/* ──▶ crates/transp
 - **Capability-Driven Composition:**
   - UI and CLI code must render and dispatch purely via `Peripheral::capabilities()` and `as_pointer()`, `as_hall_effect()`, `as_rgb()`, `as_battery()`, `as_profiles()`. Never hardcode vendor-specific UI branches when a capability trait expresses the feature.
 
+### 4.1 Driver Reliability & Unowned-Hardware Hygiene
+When implementing or maintaining drivers for hardware you cannot test physically, follow these rules:
+1. **Port the full state machine, not just the wire bytes:** Audit mature reference daemons (`Solaar`, `libratbag`, `OpenMouse`, `OpenRGB`) for preconditions (e.g., switching Host mode → Onboard mode before selecting a profile), directory/ROM fallbacks when writeable flash is empty or uninitialized, disabled-slot filtering, transient error retries (`Busy`/NAK), and multi-entity descriptor selection (prefer main application firmware over bootloader entities).
+2. **Enforce Windows HID queue hygiene on every exchange:** Long-lived Windows HID handles accumulate unsolicited notifications (battery, wireless status, DPI/profile events) in the OS input buffer. Always drain stale input reports (`drain_input_reports()`) before transmitting a request, read with a wall-clock deadline plus a generous non-matching packet cap (not a tiny fixed retry count like `6`–`8`), and prefer shared request/reply helpers in `agnoperiph-transport` over hand-rolled per-driver loops.
+3. **Test hostile hardware states in `MockHidTransport`:** Every driver test suite must go beyond happy-path replies and cover:
+   - Stale OS buffer frames (`push_stale_input_report`) plus mid-flight unsolicited notification bursts.
+   - Factory-fresh / unconfigured states (Host mode, unwritten `0x00`/`0xFF` flash, ROM fallbacks, disabled profile slots).
+   - Transient device errors (`Busy`/NAK) and non-matching frames.
+   - Multi-entity responses (e.g., bootloader entity listed before main firmware) and split Windows HID collections.
+4. **Stay conservative & make field issues replayable:** When a mutating command cannot be verified on physical hardware, gate it strictly on read-only capabilities (e.g., disable uninitialized profile slots in the UI rather than blindly rewriting flash) and preserve full TX/RX hex traces via `PacketSink` so real-device bug reports can be replayed directly in `MockHidTransport` regression tests.
+
 ---
 
 ## 5. Protocol Discovery & `morluto/rea` MCP Rules

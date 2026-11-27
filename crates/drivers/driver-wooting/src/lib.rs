@@ -16,16 +16,17 @@ use agnoperiph_core::{
     RgbCapabilities, RgbColor, RgbController, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId,
     RgbZoneInfo, RgbZoneState, TravelHundredthsMm, VendorKind,
 };
-use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
+use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, ReadMatch};
 
 use crate::protocol::{
     WOOTING_CONFIG_USAGE_ID, WOOTING_CONFIG_USAGE_PAGE, WOOTING_CONFIG_USAGE_PAGE_LEGACY,
     WOOTING_PRODUCTS, WOOTING_VID, WootingProductProfile, cmd, decode_active_profile,
     decode_layout, decode_profile_actuation, decode_version, encode_command, encode_single_color,
-    lookup_product, wooting_validator,
+    lookup_product, normalize_reply, wooting_validator,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(400);
+const MAX_READ_ATTEMPTS: usize = 32;
 const PROFILE_SLOT_COUNT: u8 = 4;
 
 /// Declarative `DriverDescriptor` claiming Wooting HE keyboards on `0xFF55:0x0001` & `0x1337`.
@@ -197,14 +198,26 @@ impl<T: HidTransport> WootingDevice<T> {
         p3: u8,
     ) -> CoreResult<Vec<u8>> {
         let frame = encode_command(command_id, p0, p1, p2, p3, self.multi_report);
+        let _ = self.transport.drain_input_reports();
         self.transport.send_query_feature_report(&frame)?;
         let mut buf = [0u8; 256];
-        match self.transport.read_input_report(&mut buf, READ_TIMEOUT) {
-            Ok(n) if n > 0 => Ok(buf[..n].to_vec()),
-            Ok(_) | Err(TransportError::Timeout { .. }) => Err(CoreError::NotConnected(format!(
+        match self.transport.read_matching_input(
+            &mut buf,
+            READ_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |raw| {
+                normalize_reply(raw)
+                    .is_some_and(|reply| reply.get(2) == Some(&command_id))
+                    .then(|| raw.to_vec())
+            },
+        )? {
+            ReadMatch::Matched(reply) => Ok(reply),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
                 "timed out waiting for Wooting reply to 0x{command_id:02X}"
             ))),
-            Err(err) => Err(err.into()),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(format!(
+                "no matching Wooting reply for 0x{command_id:02X}"
+            ))),
         }
     }
 
@@ -534,5 +547,49 @@ mod tests {
             .filter(|e| e.outcome == PacketOutcome::DryRunSuppressed)
             .count();
         assert_eq!(suppressed, 1);
+    }
+
+    #[test]
+    fn drains_stale_reports_and_skips_unmatched_frames_before_matching_reply() {
+        let mut mock = MockHidTransport::new(wooting_60he_plus_desc());
+        for _ in 0..10 {
+            mock.push_stale_input_report(vec![0x00; 16]);
+        }
+        // Unrelated frame mid-flight followed by the real GetVersion reply.
+        mock.push_input_response(vec![
+            WOOTING_MAGIC_MULTI,
+            WOOTING_MAGIC_WORD_1,
+            cmd::GET_SERIAL,
+            WOOTING_STATUS_OK,
+            0,
+            0,
+        ]);
+        mock.push_input_response(vec![
+            WOOTING_MAGIC_MULTI,
+            WOOTING_MAGIC_WORD_1,
+            cmd::GET_VERSION,
+            WOOTING_STATUS_OK,
+            0x03,
+            0x00,
+            0x02,
+            0x0D,
+            0x00,
+        ]);
+        mock.push_input_response(vec![
+            WOOTING_MAGIC_MULTI,
+            WOOTING_MAGIC_WORD_1,
+            cmd::GET_DEVICE_CONFIG,
+            WOOTING_STATUS_OK,
+            0x07,
+            0x00,
+            0,
+            0,
+            0,
+            0x01,
+        ]);
+
+        let dev = WootingDevice::open(mock, true, None).unwrap();
+        assert_eq!(dev.info().firmware_version.as_deref(), Some("v2.13.0"));
+        assert_eq!(dev.layout(), Some("ISO"));
     }
 }

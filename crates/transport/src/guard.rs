@@ -3,14 +3,25 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::descriptor::HidDeviceDescriptor;
-use crate::error::TransportResult;
+use crate::error::{TransportError, TransportResult};
 use crate::packet::{
     NoOpValidator, PacketDirection, PacketOutcome, PacketTraceEntry, PacketValidator, ReportKind,
 };
 use crate::traits::{HidTransport, NoOpPacketSink, PacketSink};
+
+/// Result of reading input reports until a matcher accepts one or the window closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadMatch<R> {
+    /// A matching reply was decoded by the caller's predicate.
+    Matched(R),
+    /// The underlying read timed out or the wall-clock deadline elapsed before a match arrived.
+    TimedOut,
+    /// `max_reads` non-matching input reports arrived within the deadline without matching.
+    WindowExhausted,
+}
 
 /// Wraps any [`HidTransport`] to enforce AgnoPeriph's non-negotiable wire safety rules:
 ///
@@ -131,6 +142,57 @@ impl<T: HidTransport> GuardedTransport<T> {
             Some("read-only feature query".to_owned()),
         );
         Ok(())
+    }
+
+    /// Reads input reports into `buf` until `matcher` returns `Some(value)`, the wall-clock
+    /// `timeout` expires, or `max_reads` non-matching frames have been skipped.
+    ///
+    /// Pair with [`HidTransport::drain_input_reports`] before sending a request so stale
+    /// notifications buffered in a long-lived Windows HID handle cannot crowd out the reply.
+    pub fn read_matching_input<R, F>(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Duration,
+        max_reads: usize,
+        mut matcher: F,
+    ) -> TransportResult<ReadMatch<R>>
+    where
+        F: FnMut(&[u8]) -> Option<R>,
+    {
+        self.try_read_matching_input(buf, timeout, max_reads, |frame| Ok(matcher(frame)))
+    }
+
+    /// Fallible variant of [`Self::read_matching_input`] for decoders that can surface
+    /// protocol errors while inspecting a frame.
+    pub fn try_read_matching_input<R, E, F>(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Duration,
+        max_reads: usize,
+        mut matcher: F,
+    ) -> Result<ReadMatch<R>, E>
+    where
+        E: From<TransportError>,
+        F: FnMut(&[u8]) -> Result<Option<R>, E>,
+    {
+        let deadline = Instant::now() + timeout;
+        for _ in 0..max_reads.max(1) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(ReadMatch::TimedOut);
+            };
+            if remaining.is_zero() {
+                return Ok(ReadMatch::TimedOut);
+            }
+            let read_len = match self.read_input_report(buf, remaining) {
+                Ok(n) => n,
+                Err(TransportError::Timeout { .. }) => return Ok(ReadMatch::TimedOut),
+                Err(err) => return Err(err.into()),
+            };
+            if let Some(matched) = matcher(&buf[..read_len])? {
+                return Ok(ReadMatch::Matched(matched));
+            }
+        }
+        Ok(ReadMatch::WindowExhausted)
     }
 
     fn next_seq(&self) -> u64 {

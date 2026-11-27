@@ -3000,3 +3000,24 @@ fn hardware_sync_detects_direct_keyboard_rgb_and_auto_saves_to_active_preset(
     // Raw snapshot was NOT overwritten while the draft is dirty.
     assert_eq!(zone_effect(&keyboard_snapshot(cx, &app), 0), onboard_effect);
 }
+
+#[gpui_kit::test]
+fn copy_diagnostics_writes_device_state_error_and_hid_trace_to_clipboard(cx: &mut TestAppContext) {
+    let (handle, _app) = open_app(cx, MockPeripheralService::new());
+
+    // Trigger a dry-run write so the packet log has real TX frames, then copy from the open inspector.
+    click(cx, handle, ("polling-rate", 500u64));
+    apply(cx, handle);
+    click(cx, handle, "inspector-copy-diagnostics");
+
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("diagnostic report must be copied to clipboard");
+    assert!(copied.contains("## AgnoPeriph Diagnostic Report"));
+    assert!(copied.contains("### Selected Device"));
+    assert!(copied.contains("Lamzu Atlantis"));
+    assert!(copied.contains("### Recent HID Packet Trace"));
+    assert!(copied.contains("TX OUTPUT"));
+    assert!(!copied.contains("SN-"));
+}

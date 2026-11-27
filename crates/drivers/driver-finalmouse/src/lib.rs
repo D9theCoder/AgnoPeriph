@@ -168,6 +168,7 @@ impl<T: HidTransport> FinalmouseDevice<T> {
     }
 
     fn poll_telemetry(&mut self) -> CoreResult<()> {
+        let _ = self.transport.drain_input_reports();
         let tx = self.profile.tx_report_id();
         match self.profile.family {
             FinalmouseFamily::UltralightX => {

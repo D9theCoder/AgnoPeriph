@@ -15,7 +15,7 @@ use agnoperiph_core::{
     RgbController, RgbEffect, RgbEffectKind, RgbSnapshot, RgbZoneId, RgbZoneInfo, RgbZoneState,
     VendorKind,
 };
-use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
+use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, ReadMatch};
 
 use crate::protocol::{
     EXCLUDED_KEYCHRON_MOUSE_PIDS, VIA_MAX_CHUNK, VIA_PAYLOAD_LEN, VIA_TX_LEN, VIA_USAGE_ID,
@@ -28,7 +28,7 @@ use crate::protocol::{
 };
 
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_READ_ATTEMPTS: usize = 6;
+const MAX_READ_ATTEMPTS: usize = 64;
 const DEFAULT_ROWS: u8 = 6;
 const DEFAULT_COLS: u8 = 16;
 
@@ -193,12 +193,16 @@ impl<T: HidTransport> ViaKeyboardDevice<T> {
 
     fn send_query(&mut self, payload: [u8; VIA_PAYLOAD_LEN]) -> CoreResult<[u8; VIA_PAYLOAD_LEN]> {
         let tx = wrap_tx(payload);
+        let _ = self.transport.drain_input_reports();
         self.transport.send_query_output_report(&tx)?;
         self.read_matching_reply(payload[0])
     }
 
     fn send_write(&mut self, payload: [u8; VIA_PAYLOAD_LEN]) -> CoreResult<[u8; VIA_PAYLOAD_LEN]> {
         let tx = wrap_tx(payload);
+        if !self.transport.is_dry_run() {
+            let _ = self.transport.drain_input_reports();
+        }
         self.transport.send_output_report(&tx)?;
         if self.transport.is_dry_run() {
             return Ok(payload);
@@ -208,29 +212,31 @@ impl<T: HidTransport> ViaKeyboardDevice<T> {
 
     fn read_matching_reply(&mut self, expected_cmd: u8) -> CoreResult<[u8; VIA_PAYLOAD_LEN]> {
         let mut buf = [0u8; VIA_TX_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let n = match self.transport.read_input_report(&mut buf, READ_TIMEOUT) {
-                Ok(n) => n,
-                Err(TransportError::Timeout { .. }) => {
-                    return Err(CoreError::NotConnected(format!(
-                        "timed out waiting for VIA reply to 0x{expected_cmd:02X}"
-                    )));
+        match self.transport.try_read_matching_input(
+            &mut buf,
+            READ_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |frame| {
+                let Some(rx) = unwrap_rx(frame) else {
+                    return Ok(None);
+                };
+                if rx[0] == cmd::UNHANDLED {
+                    return Err(CoreError::UnsupportedCapability("via_command_unhandled"));
                 }
-                Err(err) => return Err(err.into()),
-            };
-            let Some(rx) = unwrap_rx(&buf[..n]) else {
-                continue;
-            };
-            if rx[0] == cmd::UNHANDLED {
-                return Err(CoreError::UnsupportedCapability("via_command_unhandled"));
-            }
-            if rx[0] == expected_cmd {
-                return Ok(rx);
-            }
+                if rx[0] == expected_cmd {
+                    return Ok(Some(rx));
+                }
+                Ok(None)
+            },
+        )? {
+            ReadMatch::Matched(rx) => Ok(rx),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
+                "timed out waiting for VIA reply to 0x{expected_cmd:02X}"
+            ))),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(format!(
+                "no matching VIA reply for command 0x{expected_cmd:02X}"
+            ))),
         }
-        Err(CoreError::Protocol(format!(
-            "no matching VIA reply for command 0x{expected_cmd:02X}"
-        )))
     }
 }
 
@@ -626,5 +632,25 @@ mod tests {
             .count();
         // 1 keybind + 1 macro chunk + 4 RGB writes (effect, brightness, color, save) = 6
         assert_eq!(suppressed, 6);
+    }
+
+    #[test]
+    fn drains_stale_reports_and_skips_unrelated_via_frames() {
+        let mut mock = MockHidTransport::new(keychron_q1_desc());
+        for _ in 0..16 {
+            mock.push_stale_input_report(vec![0x00; VIA_TX_LEN]);
+        }
+        // 10 unrelated frames before GET_PROTOCOL_VERSION (exceeds old cap of 6)
+        for _ in 0..10 {
+            mock.push_input_response(via_reply(&[cmd::GET_KEYBOARD_VALUE, 0x02, 0, 0]));
+        }
+        mock.push_input_response(via_reply(&[cmd::GET_PROTOCOL_VERSION, 0x00, 0x0C]));
+        mock.push_input_response(via_reply(&[cmd::GET_KEYBOARD_VALUE, 0x04, 0, 1, 2, 3]));
+        mock.push_input_response(via_reply(&[cmd::DYNAMIC_KEYMAP_GET_LAYER_COUNT, 2]));
+        mock.push_input_response(via_reply(&[cmd::MACRO_GET_COUNT, 0]));
+        mock.push_input_response(via_reply(&[cmd::UNHANDLED]));
+
+        let dev = ViaKeyboardDevice::open(mock, true, None).unwrap();
+        assert_eq!(dev.protocol_version(), 12);
     }
 }

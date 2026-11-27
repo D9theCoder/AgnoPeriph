@@ -28,17 +28,24 @@ use agnoperiph_core::{
 
 use crate::keyboard::FnInversionVariant;
 use crate::rgb::LedDescriptor;
-use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, TransportError};
+use agnoperiph_transport::{GuardedTransport, HidTransport, PacketSink, ReadMatch};
 
 use crate::protocol::{
-    HIDPP_USAGE_PAGE_USB, HidppReply, LOGITECH_VID, LONG_REPORT_LEN, decode_battery_status,
-    decode_battery_voltage, decode_dpi_list, decode_profile_mode, decode_report_rate_mask,
-    decode_unified_battery, encode_long_request, encode_profile_mode, feature, hidpp_validator,
-    is_excluded_webcam_pid, is_receiver_pid, match_reply, polling_rate_from_ms, polling_rate_to_ms,
+    HIDPP_USAGE_PAGE_USB, HIDPP20_ERR_BUSY, HIDPP20_ERR_INVALID_ARGUMENT, HidppReply, LOGITECH_VID,
+    OnboardProfileEntry, decode_battery_status, decode_battery_voltage, decode_dpi_list,
+    decode_firmware_entity, decode_profile_mode, decode_report_rate_mask, decode_unified_battery,
+    encode_long_request, encode_profile_mode, feature, hidpp_validator, hidpp20_error_name,
+    is_excluded_webcam_pid, is_receiver_pid, match_reply, parse_profile_directory,
+    polling_rate_from_ms, polling_rate_to_ms, resolve_active_profile_slot,
 };
 
-const READ_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_READ_ATTEMPTS: usize = 8;
+const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(1_000);
+const MAX_READ_ATTEMPTS: usize = 128;
+const MAX_BUSY_RETRIES: usize = 2;
+const READ_BUF_LEN: usize = 64;
+const DEFAULT_PROFILE_SECTOR_SIZE: u16 = 256;
+const MEMORY_TYPE_WRITEABLE: u8 = 0x00;
+const MEMORY_TYPE_ROM: u8 = 0x01;
 
 /// Returns the declarative `DriverDescriptor` for registering Logitech HID++ in `DeviceRegistry`.
 pub fn driver_descriptor() -> DriverDescriptor {
@@ -95,6 +102,8 @@ pub struct LogitechHidppDevice<T: HidTransport> {
     feature_indices: HashMap<u16, u8>,
     pointer_caps: Option<PointerCapabilities>,
     profile_caps: Option<ProfileCapabilities>,
+    profile_sector_size: u16,
+    profile_entries: Vec<OnboardProfileEntry>,
     ping_marker: u8,
     report_rates: Vec<PollingRateHz>,
     led: Option<LedDescriptor>,
@@ -184,6 +193,8 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
             feature_indices: HashMap::new(),
             pointer_caps: None,
             profile_caps: None,
+            profile_sector_size: DEFAULT_PROFILE_SECTOR_SIZE,
+            profile_entries: Vec::new(),
             ping_marker: 0x5A,
             report_rates: Vec::new(),
             led: None,
@@ -218,7 +229,8 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
         match self.exchange(feature_index, function, params, mutating)? {
             HidppReply::Ok(data) => Ok(data),
             HidppReply::Hidpp20Error(code) => Err(CoreError::Protocol(format!(
-                "HID++ 2.0 error 0x{code:02X} on feat_idx={feature_index} func={function}"
+                "HID++ 2.0 error 0x{code:02X} ({}) on feat_idx={feature_index} func={function}",
+                hidpp20_error_name(code)
             ))),
             HidppReply::Hidpp10Error(code) => Err(CoreError::Protocol(format!(
                 "HID++ 1.0 error 0x{code:02X} on slot 0x{:02X}",
@@ -237,38 +249,50 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
         mutating: bool,
     ) -> CoreResult<HidppReply> {
         let req = encode_long_request(self.device_index, feature_index, function, params);
-        if mutating {
-            self.transport.send_output_report(&req)?;
-            if self.transport.is_dry_run() {
-                return Ok(HidppReply::Ok([0u8; 16]));
+        for attempt in 0..=MAX_BUSY_RETRIES {
+            if !mutating || !self.transport.is_dry_run() {
+                let _ = self.transport.drain_input_reports();
             }
-        } else {
-            self.transport.send_query_output_report(&req)?;
-        }
 
-        let mut buf = [0u8; LONG_REPORT_LEN];
-        for _ in 0..MAX_READ_ATTEMPTS {
-            let read_len = match self.transport.read_input_report(&mut buf, READ_TIMEOUT) {
-                Ok(n) => n,
-                Err(TransportError::Timeout { .. }) => {
-                    return Err(CoreError::NotConnected(format!(
-                        "timed out waiting for Logitech HID++ reply (slot 0x{:02X})",
-                        self.device_index
-                    )));
+            if mutating {
+                self.transport.send_output_report(&req)?;
+                if self.transport.is_dry_run() {
+                    return Ok(HidppReply::Ok([0u8; 16]));
                 }
-                Err(err) => return Err(err.into()),
-            };
-
-            if let Some(reply) =
-                match_reply(&buf[..read_len], self.device_index, feature_index, function)
-            {
-                return Ok(reply);
+            } else {
+                self.transport.send_query_output_report(&req)?;
             }
+
+            let reply = self.read_matching_reply(feature_index, function)?;
+            if reply == HidppReply::Hidpp20Error(HIDPP20_ERR_BUSY) && attempt < MAX_BUSY_RETRIES {
+                let backoff_ms = 50u64 * u64::try_from(attempt + 1).unwrap_or(1);
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+                continue;
+            }
+            return Ok(reply);
         }
 
-        Err(CoreError::Protocol(
-            "no matching HID++ reply received within read window".to_owned(),
-        ))
+        unreachable!("busy retry loop always returns on final attempt")
+    }
+
+    fn read_matching_reply(&mut self, feature_index: u8, function: u8) -> CoreResult<HidppReply> {
+        let device_index = self.device_index;
+        let mut buf = [0u8; READ_BUF_LEN];
+        match self.transport.read_matching_input(
+            &mut buf,
+            EXCHANGE_TIMEOUT,
+            MAX_READ_ATTEMPTS,
+            |frame| match_reply(frame, device_index, feature_index, function),
+        )? {
+            ReadMatch::Matched(reply) => Ok(reply),
+            ReadMatch::TimedOut => Err(CoreError::NotConnected(format!(
+                "timed out waiting for Logitech HID++ reply (slot 0x{:02X})",
+                self.device_index
+            ))),
+            ReadMatch::WindowExhausted => Err(CoreError::Protocol(
+                "no matching HID++ reply received within read window".to_owned(),
+            )),
+        }
     }
 
     /// Returns the cached feature index without querying the device.
@@ -402,19 +426,27 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
             }
         }
 
-        // 3. Firmware version (0x0003)
+        // 3. Firmware version (0x0003) — prefer Main Firmware (entity type 0x00) over Bootloader (0x01)
         if self.resolve_feature(feature::DEVICE_FW_VERSION)?.is_some() {
             let count_resp = self.call_feature(feature::DEVICE_FW_VERSION, 0, &[], false)?;
-            if count_resp[0] > 0 {
-                let entity = self.call_feature(feature::DEVICE_FW_VERSION, 1, &[0], false)?;
-                let prefix = String::from_utf8_lossy(&entity[1..4])
-                    .trim_matches('\0')
-                    .to_owned();
-                let build = u16::from_be_bytes([entity[6], entity[7]]);
-                self.info.firmware_version = Some(format!(
-                    "{prefix} {:02X}.{:02X}.{build:04X}",
-                    entity[4], entity[5]
-                ));
+            let entity_count = count_resp[0].min(8);
+            let mut main_fw: Option<String> = None;
+            let mut fallback_fw: Option<String> = None;
+            for entity_ix in 0..entity_count {
+                let entity =
+                    self.call_feature(feature::DEVICE_FW_VERSION, 1, &[entity_ix], false)?;
+                if let Some((kind, version)) = decode_firmware_entity(&entity) {
+                    if kind == 0x00 {
+                        main_fw = Some(version);
+                        break;
+                    }
+                    if fallback_fw.is_none() {
+                        fallback_fw = Some(version);
+                    }
+                }
+            }
+            if let Some(version) = main_fw.or(fallback_fw) {
+                self.info.firmware_version = Some(version);
             }
         }
 
@@ -445,9 +477,16 @@ impl<T: HidTransport> LogitechHidppDevice<T> {
 
         // 6. Onboard profiles capability probe (0x8100)
         self.profile_caps = None;
+        self.profile_entries.clear();
         if self.resolve_feature(feature::ONBOARD_PROFILES)?.is_some() {
             let info_resp = self.call_feature(feature::ONBOARD_PROFILES, 0, &[], false)?;
             let slot_count = info_resp[3].max(1);
+            let raw_sector_size = u16::from_be_bytes([info_resp[7], info_resp[8]]);
+            self.profile_sector_size = if raw_sector_size >= 16 {
+                raw_sector_size
+            } else {
+                DEFAULT_PROFILE_SECTOR_SIZE
+            };
             self.profile_caps = Some(ProfileCapabilities::new(slot_count, true, false));
         }
 
@@ -622,6 +661,104 @@ impl<T: HidTransport> PointerDevice for LogitechHidppDevice<T> {
     }
 }
 
+fn disabled_profile_error(slot: ProfileSlot) -> CoreError {
+    CoreError::Validation(format!(
+        "{slot} is disabled in the device's onboard memory. Enable it in Logitech Onboard Memory Manager or G HUB before switching to it."
+    ))
+}
+
+impl<T: HidTransport> LogitechHidppDevice<T> {
+    /// Reads the 4-byte-per-entry profile directory from `mem_type` (`0x00` writeable or `0x01` ROM),
+    /// page `0`, via `OnboardProfiles.MemoryRead` (`0x8100`, func `5`).
+    fn read_directory_bank(
+        &mut self,
+        mem_type: u8,
+        slot_count: u8,
+    ) -> CoreResult<Vec<OnboardProfileEntry>> {
+        let sector_size = usize::from(self.profile_sector_size.max(16));
+        let needed_bytes = (usize::from(slot_count) * 4 + 4).min(sector_size);
+        let max_offset = sector_size.saturating_sub(16);
+        let mut raw = Vec::with_capacity(needed_bytes);
+        let mut offset = 0usize;
+
+        while raw.len() < needed_bytes {
+            let read_off = offset.min(max_offset);
+            let [off_hi, off_lo] = u16::try_from(read_off).unwrap_or(0).to_be_bytes();
+            let chunk = self.call_feature(
+                feature::ONBOARD_PROFILES,
+                5,
+                &[mem_type, 0x00, off_hi, off_lo],
+                false,
+            )?;
+
+            if offset == 0 && (chunk[..4] == [0x00; 4] || chunk[..4] == [0xFF; 4]) {
+                return Ok(Vec::new());
+            }
+
+            let skip = offset.saturating_sub(read_off);
+            let slice = &chunk[skip..];
+            raw.extend_from_slice(slice);
+
+            // Stop early as soon as a 4-byte entry hits the 0xFFFF/0x0000 terminator.
+            let (entries, _) = slice.as_chunks::<4>();
+            if entries
+                .iter()
+                .any(|&[hi, lo, _, _]| matches!(u16::from_be_bytes([hi, lo]), 0xFFFF | 0x0000))
+            {
+                break;
+            }
+            offset += 16;
+        }
+
+        Ok(parse_profile_directory(&raw, usize::from(slot_count)))
+    }
+
+    /// Populates `self.profile_entries` from the active `0x8100` profile directory
+    /// (`0x0000` writeable memory or `0x0100` ROM fallback).
+    fn refresh_profile_directory(&mut self, active_sector: u16) -> CoreResult<()> {
+        let slot_count = self.profile_capabilities().slot_count;
+        let prefer_rom = (active_sector >> 8) == u16::from(MEMORY_TYPE_ROM);
+        let banks: &[u8] = if prefer_rom {
+            &[MEMORY_TYPE_ROM]
+        } else {
+            &[MEMORY_TYPE_WRITEABLE, MEMORY_TYPE_ROM]
+        };
+
+        for &bank in banks {
+            match self.read_directory_bank(bank, slot_count) {
+                Ok(entries) if !entries.is_empty() => {
+                    self.profile_entries = entries;
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(CoreError::Protocol(msg)) => {
+                    // Some devices (e.g. G305) return ERR_INVALID_ARGUMENT on unwritten
+                    // writeable flash sectors; fall through to the ROM bank.
+                    tracing::debug!(bank, "0x8100 directory read returned protocol error: {msg}");
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        // Defensive fallback if neither bank answered (e.g. legacy firmware without MemoryRead).
+        self.profile_entries = (1..=slot_count)
+            .map(|page| OnboardProfileEntry {
+                sector: u16::from(page),
+                enabled: true,
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn read_active_profile_sector(&mut self, mode: ProfileMode) -> CoreResult<u16> {
+        match self.call_feature(feature::ONBOARD_PROFILES, 4, &[], false) {
+            Ok(resp) => Ok(u16::from_be_bytes([resp[0], resp[1]])),
+            Err(CoreError::Protocol(_)) if mode == ProfileMode::HostControlled => Ok(0),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 impl<T: HidTransport> ProfileManager for LogitechHidppDevice<T> {
     fn profile_capabilities(&self) -> ProfileCapabilities {
         self.profile_caps
@@ -634,13 +771,20 @@ impl<T: HidTransport> ProfileManager for LogitechHidppDevice<T> {
         let mode_resp = self.call_feature(feature::ONBOARD_PROFILES, 2, &[], false)?;
         let mode = decode_profile_mode(mode_resp[0])?;
 
-        let active_resp = self.call_feature(feature::ONBOARD_PROFILES, 4, &[], false)?;
-        let sector = u16::from_be_bytes([active_resp[0], active_resp[1]]);
-        let slot_ix = u8::try_from(sector.saturating_sub(1)).unwrap_or(0);
-        let active_slot = ProfileSlot::new(slot_ix.min(caps.slot_count.saturating_sub(1)));
+        let active_sector = self.read_active_profile_sector(mode)?;
+        self.refresh_profile_directory(active_sector)?;
+
+        let active_slot =
+            resolve_active_profile_slot(active_sector, &self.profile_entries, caps.slot_count);
 
         let profiles = (0..caps.slot_count)
-            .map(|ix| ProfileInfo::new(ProfileSlot::new(ix), true))
+            .map(|ix| {
+                let enabled = self
+                    .profile_entries
+                    .get(usize::from(ix))
+                    .is_some_and(|e| e.enabled);
+                ProfileInfo::new(ProfileSlot::new(ix), enabled)
+            })
             .collect();
 
         Ok(ProfileSnapshot::new(active_slot, mode, profiles))
@@ -649,9 +793,86 @@ impl<T: HidTransport> ProfileManager for LogitechHidppDevice<T> {
     fn set_active_profile(&mut self, slot: ProfileSlot) -> CoreResult<()> {
         let caps = self.profile_capabilities();
         caps.validate_slot(slot)?;
-        let sector = u16::from(slot.index()) + 1;
-        self.call_feature(feature::ONBOARD_PROFILES, 3, &sector.to_be_bytes(), true)?;
-        Ok(())
+
+        // Check current mode (read-only) and ensure we have the live directory before any write.
+        let mode_resp = self.call_feature(feature::ONBOARD_PROFILES, 2, &[], false)?;
+        let current_mode = decode_profile_mode(mode_resp[0])?;
+
+        if self.profile_entries.is_empty() {
+            let active_sector = self.read_active_profile_sector(current_mode)?;
+            self.refresh_profile_directory(active_sector)?;
+        }
+
+        let initial_entry = self
+            .profile_entries
+            .get(usize::from(slot.index()))
+            .copied()
+            .filter(|e| e.enabled)
+            .ok_or_else(|| disabled_profile_error(slot))?;
+
+        // Logitech 0x8100 rejects SetCurrentProfile (func 3) with INVALID_ARGUMENT (0x02)
+        // when the device is in Host Controlled mode (mode 2). Switch to Onboard Memory
+        // mode (mode 1) first, matching Solaar and libratbag.
+        let mut target_entry = initial_entry;
+        if current_mode != ProfileMode::OnboardMemory {
+            self.call_feature(
+                feature::ONBOARD_PROFILES,
+                1,
+                &[encode_profile_mode(ProfileMode::OnboardMemory)],
+                true,
+            )?;
+            if !self.transport.is_dry_run() {
+                // Entering onboard mode may activate either Writeable (0x00xx) or ROM (0x01xx)
+                // memory depending on flash CRC; re-check the active bank so func 3 receives an
+                // address from the directory the firmware actually loaded.
+                let active_sector = self.read_active_profile_sector(ProfileMode::OnboardMemory)?;
+                self.refresh_profile_directory(active_sector)?;
+                target_entry = self
+                    .profile_entries
+                    .get(usize::from(slot.index()))
+                    .copied()
+                    .filter(|e| e.enabled)
+                    .ok_or_else(|| disabled_profile_error(slot))?;
+            }
+        }
+
+        let idx = self
+            .resolve_feature(feature::ONBOARD_PROFILES)?
+            .ok_or(CoreError::UnsupportedCapability("hidpp_feature"))?;
+
+        match self.exchange(idx, 3, &target_entry.sector.to_be_bytes(), true)? {
+            HidppReply::Ok(_) => Ok(()),
+            HidppReply::Hidpp20Error(HIDPP20_ERR_INVALID_ARGUMENT)
+                if !self.transport.is_dry_run() =>
+            {
+                // Directory may have changed externally or fallen back to ROM; refresh once
+                // from the live bank and retry if the sector address changed.
+                let active_sector = self.read_active_profile_sector(ProfileMode::OnboardMemory)?;
+                self.refresh_profile_directory(active_sector)?;
+                let refreshed = self
+                    .profile_entries
+                    .get(usize::from(slot.index()))
+                    .copied()
+                    .filter(|e| e.enabled)
+                    .ok_or_else(|| disabled_profile_error(slot))?;
+                if refreshed.sector != target_entry.sector {
+                    self.call_index(idx, 3, &refreshed.sector.to_be_bytes(), true)?;
+                    return Ok(());
+                }
+                Err(CoreError::Protocol(format!(
+                    "HID++ 2.0 error 0x{HIDPP20_ERR_INVALID_ARGUMENT:02X} ({}) on feat_idx={idx} func=3",
+                    hidpp20_error_name(HIDPP20_ERR_INVALID_ARGUMENT)
+                )))
+            }
+            HidppReply::Hidpp20Error(code) => Err(CoreError::Protocol(format!(
+                "HID++ 2.0 error 0x{code:02X} ({}) on feat_idx={idx} func=3",
+                hidpp20_error_name(code)
+            ))),
+            HidppReply::Hidpp10Error(code) => Err(CoreError::Protocol(format!(
+                "HID++ 1.0 error 0x{code:02X} on slot 0x{:02X}",
+                self.device_index
+            ))),
+        }
     }
 
     fn set_profile_mode(&mut self, mode: ProfileMode) -> CoreResult<()> {
@@ -670,11 +891,32 @@ mod tests {
     };
 
     pub(crate) fn make_reply(dev_idx: u8, feat_idx: u8, func: u8, params: &[u8]) -> Vec<u8> {
-        let mut frame = vec![0u8; LONG_REPORT_LEN];
+        let mut frame = vec![0u8; crate::protocol::LONG_REPORT_LEN];
         frame[0] = crate::protocol::REPORT_ID_LONG;
         frame[1] = dev_idx;
         frame[2] = feat_idx;
         frame[3] = ((func & 0x0F) << 4) | crate::protocol::SOFTWARE_ID;
+        frame[4..4 + params.len()].copy_from_slice(params);
+        frame
+    }
+
+    fn make_hidpp20_error(dev_idx: u8, feat_idx: u8, func: u8, code: u8) -> Vec<u8> {
+        let mut frame = vec![0u8; crate::protocol::LONG_REPORT_LEN];
+        frame[0] = crate::protocol::REPORT_ID_LONG;
+        frame[1] = dev_idx;
+        frame[2] = crate::protocol::HIDPP20_ERROR_SUB_ID;
+        frame[3] = feat_idx;
+        frame[4] = ((func & 0x0F) << 4) | crate::protocol::SOFTWARE_ID;
+        frame[5] = code;
+        frame
+    }
+
+    fn make_notification(dev_idx: u8, feat_idx: u8, event: u8, params: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; crate::protocol::LONG_REPORT_LEN];
+        frame[0] = crate::protocol::REPORT_ID_LONG;
+        frame[1] = dev_idx;
+        frame[2] = feat_idx;
+        frame[3] = (event & 0x0F) << 4; // sw_id == 0 => unsolicited notification
         frame[4..4 + params.len()].copy_from_slice(params);
         frame
     }
@@ -724,8 +966,13 @@ mod tests {
         mock.push_input_response(make_reply(1, 0x06, 0, &[0x8B]));
         // 7. GetFeature(0x8100 OnboardProfiles) -> idx 7
         mock.push_input_response(make_reply(1, 0x00, 0, &[0x07]));
-        //    OnboardProfiles.Info(): 5 profiles
-        mock.push_input_response(make_reply(1, 0x07, 0, &[0x01, 0x04, 0x01, 0x05]));
+        //    OnboardProfiles.Info(): 5 profiles, 1 OOB, 5 buttons, 6 sectors, 256-byte sector
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            0,
+            &[0x01, 0x04, 0x01, 0x05, 0x01, 0x05, 0x06, 0x01, 0x00],
+        ));
         // 8. Keyboard feature probes (feature::KEYBOARD_PROBE_ORDER) -> all absent
         for _ in feature::KEYBOARD_PROBE_ORDER {
             mock.push_input_response(make_reply(1, 0x00, 0, &[0x00]));
@@ -742,9 +989,28 @@ mod tests {
         // Pointer state: DPI = 800 (0x0320), ReportRate = 1 ms (1000 Hz)
         mock.push_input_response(make_reply(1, 0x05, 2, &[0x00, 0x03, 0x20, 0x03, 0x20]));
         mock.push_input_response(make_reply(1, 0x06, 1, &[0x01]));
-        // Profile state: OnboardMemory (1), active sector 2 (slot index 1)
+        // Profile state: OnboardMemory (1), active sector 2 (slot index 1), writeable directory
         mock.push_input_response(make_reply(1, 0x07, 2, &[0x01]));
         mock.push_input_response(make_reply(1, 0x07, 4, &[0x00, 0x02]));
+        // Sector 0x0000 directory: 5 enabled writeable profiles (2 reads: off 0 & off 16)
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[
+                0x00, 0x01, 0x01, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x04,
+                0x01, 0x00,
+            ],
+        ));
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[
+                0x00, 0x05, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF,
+            ],
+        ));
 
         let mut dev = LogitechHidppDevice::open(mock, Some(1), false, None).unwrap();
         assert_eq!(dev.info().model_name, "PRO X SL 2");
@@ -847,5 +1113,191 @@ mod tests {
         assert_eq!(batt.voltage_mv, Some(4000));
         assert_eq!(batt.percentage, Some(81));
         assert_eq!(batt.state, ChargingState::Discharging);
+    }
+
+    #[test]
+    fn prefers_main_firmware_entity_over_bootloader() {
+        let desc = HidDeviceDescriptor::new(
+            LOGITECH_VID,
+            0xC547,
+            HIDPP_USAGE_PAGE_USB,
+            0x0002,
+            2,
+            "mock://logitech/pro-x-wireless",
+        );
+        let mut mock = MockHidTransport::new(desc);
+        mock.push_input_response(make_reply(1, 0x00, 1, &[0x04, 0x02, 0x5A]));
+        mock.push_input_response(make_reply(1, 0x00, 0, &[0x02]));
+        mock.push_input_response(make_reply(1, 0x02, 0, &[14]));
+        mock.push_input_response(make_reply(1, 0x02, 1, b"PRO X Wireless"));
+        mock.push_input_response(make_reply(1, 0x00, 0, &[0x03]));
+        mock.push_input_response(make_reply(1, 0x03, 0, &[2]));
+        // Entity 0 is Bootloader (type 0x01), Entity 1 is Main Firmware (type 0x00)
+        mock.push_input_response(make_reply(
+            1,
+            0x03,
+            1,
+            &[0x01, b'B', b'L', b'1', 0x25, 0x00, 0x00, 0x13],
+        ));
+        mock.push_input_response(make_reply(
+            1,
+            0x03,
+            1,
+            &[0x00, b'M', b'P', b'K', 0x25, 0x01, 0x00, 0x18],
+        ));
+        // Remaining feature probes absent
+        for _ in 0..(6 + feature::KEYBOARD_PROBE_ORDER.len()) {
+            mock.push_input_response(make_reply(1, 0x00, 0, &[0x00]));
+        }
+
+        let dev = LogitechHidppDevice::open(mock, Some(1), false, None).unwrap();
+        assert_eq!(dev.info().model_name, "PRO X Wireless");
+        assert_eq!(
+            dev.info().firmware_version.as_deref(),
+            Some("MPK 25.01.0018")
+        );
+    }
+
+    #[test]
+    fn host_mode_switches_to_onboard_mode_before_selecting_profile() {
+        let mut mock = sample_lightspeed_mock();
+        // read_profile_state: Host mode (2), active sector 0x0000, writeable directory has slots 1 & 2 enabled
+        mock.push_input_response(make_reply(1, 0x07, 2, &[0x02]));
+        mock.push_input_response(make_reply(1, 0x07, 4, &[0x00, 0x00]));
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[
+                0x00, 0x01, 0x01, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04,
+                0x00, 0x00,
+            ],
+        ));
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[0x00, 0x05, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00],
+        ));
+
+        // set_active_profile(slot 1 = Profile 2):
+        // 1. GetMode -> Host (2)
+        mock.push_input_response(make_reply(1, 0x07, 2, &[0x02]));
+        // 2. SetMode(1 = Onboard) -> ok
+        mock.push_input_response(make_reply(1, 0x07, 1, &[]));
+        // 3. GetCurrentProfile -> 0x0001 (confirms writeable bank is active)
+        mock.push_input_response(make_reply(1, 0x07, 4, &[0x00, 0x01]));
+        // 4. Refresh writeable directory
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[
+                0x00, 0x01, 0x01, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04,
+                0x00, 0x00,
+            ],
+        ));
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[0x00, 0x05, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00],
+        ));
+        // 5. SetCurrentProfile(0x0002) -> ok
+        mock.push_input_response(make_reply(1, 0x07, 3, &[]));
+
+        // Attempting disabled Profile 3 (slot 2) only reads GetMode and rejects before any write
+        mock.push_input_response(make_reply(1, 0x07, 2, &[0x01]));
+
+        let mut dev = LogitechHidppDevice::open(mock, Some(1), false, None).unwrap();
+        let snap = dev.as_profiles_mut().unwrap().read_profile_state().unwrap();
+        assert_eq!(snap.mode, ProfileMode::HostControlled);
+        assert_eq!(snap.active_slot, ProfileSlot::new(0));
+        let enabled: Vec<bool> = snap.profiles.iter().map(ProfileInfo::is_enabled).collect();
+        assert_eq!(enabled, vec![true, true, false, false, false]);
+
+        dev.as_profiles_mut()
+            .unwrap()
+            .set_active_profile(ProfileSlot::new(1))
+            .unwrap();
+
+        let writes = dev.transport().inner().recorded_writes();
+        let set_mode = writes
+            .iter()
+            .find(|w| w.bytes[2] == 0x07 && w.bytes[3] == 0x1C)
+            .expect("must switch to Onboard mode before SetCurrentProfile");
+        assert_eq!(set_mode.bytes[4], 0x01);
+        let set_prof = writes.last().unwrap();
+        assert_eq!(set_prof.bytes[2], 0x07);
+        assert_eq!(set_prof.bytes[3], 0x3C);
+        assert_eq!(&set_prof.bytes[4..6], &[0x00, 0x02]);
+
+        let writes_before = dev.transport().inner().recorded_writes().len();
+        let err = dev
+            .as_profiles_mut()
+            .unwrap()
+            .set_active_profile(ProfileSlot::new(2))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Validation(_)));
+        // Only the read-only GetMode ran; no SetCurrentProfile was transmitted.
+        let writes_after = dev.transport().inner().recorded_writes();
+        assert_eq!(writes_after.len(), writes_before + 1);
+        assert_eq!(writes_after.last().unwrap().bytes[3], 0x2C);
+    }
+
+    #[test]
+    fn rom_directory_fallback_resolves_and_switches_rom_sectors() {
+        let mut mock = sample_lightspeed_mock();
+        // Onboard mode, active profile is ROM sector 0x0102 (Profile 2)
+        mock.push_input_response(make_reply(1, 0x07, 2, &[0x01]));
+        mock.push_input_response(make_reply(1, 0x07, 4, &[0x01, 0x02]));
+        // Because active_sector high byte is 0x01 (ROM), driver reads ROM directory 0x0100 directly
+        mock.push_input_response(make_reply(
+            1,
+            0x07,
+            5,
+            &[
+                0x01, 0x01, 0x01, 0x00, 0x01, 0x02, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF,
+                0xFF, 0xFF,
+            ],
+        ));
+        // Switch to Profile 1 (ROM sector 0x0101): GetMode(1) + SetCurrentProfile(0x0101)
+        mock.push_input_response(make_reply(1, 0x07, 2, &[0x01]));
+        mock.push_input_response(make_reply(1, 0x07, 3, &[]));
+
+        let mut dev = LogitechHidppDevice::open(mock, Some(1), false, None).unwrap();
+        let snap = dev.as_profiles_mut().unwrap().read_profile_state().unwrap();
+        assert_eq!(snap.active_slot, ProfileSlot::new(1));
+        let enabled: Vec<bool> = snap.profiles.iter().map(ProfileInfo::is_enabled).collect();
+        assert_eq!(enabled, vec![true, true, false, false, false]);
+
+        dev.as_profiles_mut()
+            .unwrap()
+            .set_active_profile(ProfileSlot::new(0))
+            .unwrap();
+        let last = dev.transport().inner().recorded_writes().last().unwrap();
+        assert_eq!(last.bytes[2], 0x07);
+        assert_eq!(last.bytes[3], 0x3C);
+        assert_eq!(&last.bytes[4..6], &[0x01, 0x01]);
+    }
+
+    #[test]
+    fn drains_stale_reports_skips_notification_bursts_and_retries_busy() {
+        let mut mock = sample_lightspeed_mock();
+        // Queue 20 stale reports sitting in the OS input buffer before our request
+        for i in 0..20u8 {
+            mock.push_stale_input_report(make_notification(1, 0x04, 0, &[i]));
+        }
+        // First attempt: 12 mid-flight unsolicited notifications arrive before a BUSY (0x08) error
+        for i in 0..12u8 {
+            mock.push_input_response(make_notification(1, 0x07, 0, &[0x00, i]));
+        }
+        mock.push_input_response(make_hidpp20_error(1, 0x04, 1, HIDPP20_ERR_BUSY));
+        // Retry attempt succeeds with 85% battery
+        mock.push_input_response(make_reply(1, 0x04, 1, &[85, 0x00, 0x00, 0x00]));
+
+        let mut dev = LogitechHidppDevice::open(mock, Some(1), false, None).unwrap();
+        let battery = dev.as_battery_mut().unwrap().read_battery().unwrap();
+        assert_eq!(battery.percentage, Some(85));
     }
 }
