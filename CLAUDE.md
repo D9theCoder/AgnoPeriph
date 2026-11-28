@@ -9,10 +9,18 @@ This file is the authoritative project guideline for Claude. `GEMINI.md` is the 
 ## 1. Mission & Scope
 **AgnoPeriph** is a lightweight, unified, brand-agnostic Windows desktop peripheral manager written entirely in **Rust**, with a modular USB HID backend and a native GPU-accelerated frontend powered by **`gpui-kit`** (`0.11.0`).
 
-Target peripherals:
+Target peripherals (11 protocol driver crates):
 1. **Logitech** — HID++ 1.0 / 2.0 mice and keyboards (wired, Lightspeed, Bolt, Unifying).
-2. **Lamzu** — Atlantis series (CompX protocol), extensible to newer Aurora models.
-3. **ATK** — ATK RS7 Hall Effect keyboard (per-key actuation, Rapid Trigger, DKS, SOCD, calibration status) and ATK mice where applicable.
+2. **Lamzu** — Atlantis series (CompX Report-8) and Maya / Aurora codec.
+3. **ATK / VGN / VXE** — DuckBread (`0xFF60`) & GTech (`0xFF01`) Hall Effect keyboards (ATK RS7, ATK68/75, etc.) and `0xFF02` mice.
+4. **MCHOSE** — M-HUB V2 (`0x11`/`0x12`), V3 (`0x4D`), and A5 Gen1 (`0x2023`) mice.
+5. **Razer** — 90-byte HID Feature mice (Viper, DeathAdder, Basilisk V3, Naga, Orochi).
+6. **Pulsar** — Report-8 Flash & XS-1 mice (X2, Xlite, X3).
+7. **Finalmouse** — 64-byte Telemetry HID mice (UltralightX, Starlight X).
+8. **WLmouse** — CompX 64-byte Feature mice (Beast X, Sword X, Strider).
+9. **Endgame Gear** — `0xA0`/`0xA1` config-blob mice (OP1/XM2 8K & 4K Wireless).
+10. **Wooting** — ARM / Hall Effect keyboards (`VID 0x31E3`, 60HE/80HE/Two HE/UwU).
+11. **QMK / VIA** — VIA Raw HID keyboards (`0xFF60:0x0061`: Keychron, Lemokey, NuPhy, MonsGeek, Drop, etc.).
 
 ---
 
@@ -49,11 +57,19 @@ crates/cli           ──┼──▶ crates/drivers/* ──▶ crates/transp
 | --- | --- | --- | --- |
 | `crates/core` | `agnoperiph-core` | Brand-agnostic hardware traits (`Peripheral`, `PointerDevice`, `HallEffectKeyboard`, `RgbController`, `BatteryMonitor`, `ProfileManager`), strongly typed validated models, `DeviceRegistry`. | Pure Rust only (`serde`, `thiserror`). **Zero** `hidapi`, OS, or UI dependencies. `#![forbid(unsafe_code)]`. |
 | `crates/transport` | `agnoperiph-transport` | `HidTransport`, `HidEnumerator`, `GuardedTransport` (`--dry-run`, `PacketValidator`, `PacketSink`), `HidapiTransport`, deterministic `MockHidTransport`. | `agnoperiph-core`, `hidapi`, `thiserror`, `serde`, `tracing`, `hex`. |
-| `crates/drivers/driver-logitech` | `agnoperiph-driver-logitech` | Logitech HID++ 1.0 / 2.0 protocol implementation (Phase 2). | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
-| `crates/drivers/driver-lamzu` | `agnoperiph-driver-lamzu` | Lamzu Atlantis (CompX) & Aurora protocol implementation (Phase 2). | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
-| `crates/drivers/driver-atk` | `agnoperiph-driver-atk` | ATK HUB / RS7 Hall Effect keyboard protocol implementation (Phase 3). | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-logitech` | `agnoperiph-driver-logitech` | Logitech HID++ 1.0 / 2.0 mice & keyboards. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-lamzu` | `agnoperiph-driver-lamzu` | Lamzu Atlantis (CompX) & Aurora mice. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-atk` | `agnoperiph-driver-atk` | ATK / VGN / VXE Hall Effect keyboards (`0xFF60`, `0xFF01`) & mice (`0xFF02`). | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-mchose` | `agnoperiph-driver-mchose` | MCHOSE M-HUB V2/V3 & A5 Gen1 mice. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-razer` | `agnoperiph-driver-razer` | Razer 90-byte HID Feature mice & multi-zone RGB. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-pulsar` | `agnoperiph-driver-pulsar` | Pulsar Report-8 Flash & XS-1 mice. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-finalmouse` | `agnoperiph-driver-finalmouse` | Finalmouse UltralightX / Starlight X 64-byte HID mice. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-wlmouse` | `agnoperiph-driver-wlmouse` | WLmouse CompX 64-byte Feature mice. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-endgame-gear` | `agnoperiph-driver-endgame-gear` | Endgame Gear OP1/XM2 8K & 4K Wireless mice. | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-wooting` | `agnoperiph-driver-wooting` | Wooting Hall Effect keyboards (`VID 0x31E3`). | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
+| `crates/drivers/driver-via` | `agnoperiph-driver-via` | QMK / VIA Raw HID keyboards (`0xFF60:0x0061`). | `agnoperiph-core`, `agnoperiph-transport`, `thiserror`, `tracing`, `hex`. |
 | `crates/cli` | `agnoperiph-cli` | Headless CLI (`list`, `probe`, `get`, `set`, `--dry-run`, `--trace-hex`, `--json`). | `agnoperiph-core`, `agnoperiph-transport`, drivers, `clap`, `anyhow`, `serde_json`, `tracing-subscriber`. `#![forbid(unsafe_code)]`. |
-| `crates/ui` | `agnoperiph` | Native Windows GPU frontend (Phase 4). Deferred from workspace compilation during Phases 1–3 to keep driver builds fast. | **`gpui-kit = "0.11.0"`** (single UI dependency), `agnoperiph-core`, `agnoperiph-transport`, drivers. |
+| `crates/ui` | `agnoperiph` | Native Windows GPU frontend (active workspace member). | **`gpui-kit = "0.11.0"`** (single UI dependency), `agnoperiph-core`, `agnoperiph-transport`, drivers. |
 
 ---
 
