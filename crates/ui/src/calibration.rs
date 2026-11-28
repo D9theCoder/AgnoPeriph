@@ -260,7 +260,6 @@ impl Render for CalibrationModal {
                 KeyFace::new(KeyContent::Legend, tone)
             },
             Vec::new(),
-            cx,
         );
         let theme = cx.theme();
         v_flex()

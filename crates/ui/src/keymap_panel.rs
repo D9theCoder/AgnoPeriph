@@ -377,6 +377,7 @@ fn board_column(
     let matrix = key_matrix::render(
         "keymap-matrix",
         "keymap-key",
+        app.selected_device_id(),
         layout,
         BOARD_WIDTH,
         |cap| {

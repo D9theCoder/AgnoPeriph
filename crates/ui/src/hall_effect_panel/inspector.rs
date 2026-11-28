@@ -12,7 +12,6 @@ use gpui_kit::component::{
     h_flex,
     popover::Popover,
     radio::Radio,
-    switch::Switch,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -28,8 +27,7 @@ use crate::design::{dp, tokens};
 use crate::icons::advanced_svg;
 use crate::keycodes::hid_name;
 use crate::keymap::KeyLayout;
-use crate::motion::Entrance;
-use crate::widgets::{mini_keycap, panel, panel_title, stepper};
+use crate::widgets::{MarkedSwitch, block, mini_keycap, panel, panel_title, stepper};
 
 const SOCD_CHOICES: [(SocdMode, &str); 4] = [
     (SocdMode::LastInputPriority, "last"),
@@ -131,10 +129,7 @@ pub(super) fn render(
                 .id("paired-body")
                 .min_h_0()
                 .when(height.is_some(), |this| this.flex_1().overflow_y_scroll())
-                .child(Entrance::new(
-                    SharedString::from(format!("paired-{}-{is_adding}", mode.id())),
-                    body,
-                )),
+                .child(block(body)),
         )
         .children(footer)
         .into_any_element()
@@ -510,7 +505,7 @@ fn socd_entry(
             .on_click(cx.listener(move |this, _, _, cx| this.step_socd_travel(pair, 1, cx))),
         cx,
     );
-    let rapid = Switch::new(pair_element_id("socd-rt", a, b, "sw"))
+    let rapid = MarkedSwitch::new(pair_element_id("socd-rt", a, b, "sw"))
         .accessibility_label(format!("Rapid Trigger for {first} and {second}"))
         .checked(pair.rapid_trigger)
         .disabled(busy)
@@ -556,7 +551,7 @@ fn rs_entry(
             .on_click(cx.listener(move |this, _, _, cx| this.step_rs_travel(pair, 1, cx))),
         cx,
     );
-    let rapid = Switch::new(pair_element_id("rs-rt", a, b, "sw"))
+    let rapid = MarkedSwitch::new(pair_element_id("rs-rt", a, b, "sw"))
         .accessibility_label(format!(
             "Rapid Trigger for {} and {}",
             layout.label(a),
@@ -834,7 +829,7 @@ fn pair_options(
             .on_click(cx.listener(|this, _, _, cx| this.step_pair_trigger_point(1, cx))),
         cx,
     );
-    let rapid = Switch::new("paired-rt")
+    let rapid = MarkedSwitch::new("paired-rt")
         .accessibility_label("Rapid Trigger for the new pair")
         .checked(ui.pair_rapid_trigger)
         .disabled(busy)

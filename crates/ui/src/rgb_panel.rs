@@ -12,7 +12,6 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent},
     slider::{Slider, SliderState},
-    switch::Switch,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,7 +25,7 @@ use crate::draft::{ChangeId, EditKey, ZoneDraft};
 use crate::icons::effect_icon_path;
 use crate::key_matrix::{self, BOARD_WIDTH, KeyContent, KeyFace, KeyTone};
 use crate::keymap::KeyLayout;
-use crate::widgets::{panel, panel_head, panel_title, segment, segmented};
+use crate::widgets::{MarkedSwitch, panel, panel_head, panel_title, segment, segmented};
 
 /// Preset colors, three to a row. LED colors are data, not theme.
 mod mouse_art;
@@ -756,7 +755,6 @@ fn lit_board(
             KeyFace::new(content, KeyTone::Normal)
         },
         lip,
-        cx,
     );
     v_flex().flex_shrink_0().child(board).into_any_element()
 }
@@ -1174,7 +1172,7 @@ fn color_panel(
     };
 
     let colorful = support.offers_colorful.then(|| {
-        Switch::new("rgb-colorful")
+        MarkedSwitch::new("rgb-colorful")
             .label("Full color mode")
             .checked(support.is_colorful)
             .disabled(busy || !support.colorful)

@@ -2,16 +2,14 @@
 //! polling rate. Changes are staged as unsaved edits and sent with Apply.
 
 use agnoperiph_core::{KeyboardConfigSnapshot, PollingRateHz};
-use gpui_kit::component::{
-    ActiveTheme, Disableable, button::Button, h_flex, switch::Switch, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Disableable, button::Button, h_flex, v_flex};
 use gpui_kit::*;
 
 use crate::app::AgnoPeriphApp;
 use crate::backend::DeviceSnapshot;
 use crate::design::dp;
 use crate::draft::{ChangeId, EditKey};
-use crate::widgets::{device_setting_row, panel, panel_head, segment, segmented};
+use crate::widgets::{MarkedSwitch, device_setting_row, panel, panel_head, segment, segmented};
 
 const GAP: f32 = 16.0;
 const MIN_COLUMN_WIDTH: f32 = 340.0;
@@ -130,11 +128,11 @@ fn toggle_row(
     } else {
         "Not supported by this keyboard."
     };
-    let switch = Switch::new(id)
+    let switch = MarkedSwitch::new(id)
         .checked(kind.get(config.staged))
         .disabled(config.busy || !is_supported)
         .accessibility_label(title)
-        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
             let checked = *checked;
             this.write_keyboard_config(|c| kind.set(c, checked), cx);
         }));

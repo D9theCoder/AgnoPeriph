@@ -8,23 +8,26 @@ use std::time::Duration;
 use agnoperiph::backend::{
     ApplyError, DeviceSnapshot, MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID,
     MOCK_VIA_ID, MOCK_WOOTING_ID, MockPeripheralService, PeripheralService, PointerChange,
-    SettingChange,
+    SettingChange, UnavailableDevice,
 };
+use agnoperiph::device_watch::DEVICE_SCAN_INTERVAL;
 use agnoperiph::draft::ChangeId;
 use agnoperiph::game_profiles::{DetectedGame, GameSource};
 use agnoperiph::key_tester::{LIVE_POLL_INTERVAL, LIVE_RETRY_INTERVAL};
 use agnoperiph::quick_presets::QuickPreset;
-use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, Route, device_element_id};
+use agnoperiph::{
+    AgnoPeriphApp, AppOptions, KeyboardTab, Route, device_element_id, unavailable_element_id,
+};
 use agnoperiph_core::{
-    BatteryStatus, ChargingState, CoreError, CoreResult, DeviceId, KeyCode, KeyIndex,
-    KeyTravelSample, LiftOffDistance, MacroActionKind, ModTapBinding, PollingRateHz, ProfileSlot,
-    RapidSwitchPair, RgbColor, RgbEffect, ToggleKeyBinding, TravelHundredthsMm,
+    BatteryStatus, ChargingState, ConnectionKind, CoreError, CoreResult, DeviceId, KeyCode,
+    KeyIndex, KeyTravelSample, LiftOffDistance, MacroActionKind, ModTapBinding, PollingRateHz,
+    ProfileSlot, RapidSwitchPair, RgbColor, RgbEffect, ToggleKeyBinding, TravelHundredthsMm,
 };
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
-    AnyWindowHandle, AppContext, Bounds, ElementId, Entity, Point, TestAppContext, WindowBounds,
-    WindowOptions, px, size,
+    AnyWindowHandle, AppContext, Bounds, ElementId, Entity, Pixels, Point, TestAppContext,
+    WindowBounds, WindowOptions, px, size,
 };
 
 /// W on the RS7 matrix (row 2, column 2): owned by the fixture's Rapid Switch pair (W + S).
@@ -48,8 +51,16 @@ fn open_app_with(
     service: impl PeripheralService + 'static,
     options: AppOptions,
 ) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
+    open_shared_app(cx, Arc::new(service), options)
+}
+
+/// Like [`open_app_with`], for tests that keep driving the service behind the app.
+fn open_shared_app(
+    cx: &mut TestAppContext,
+    service: Arc<dyn PeripheralService>,
+    options: AppOptions,
+) -> (AnyWindowHandle, Entity<AgnoPeriphApp>) {
     cx.update(gpui_kit::init);
-    let service: Arc<dyn PeripheralService> = Arc::new(service);
     let opened = cx.update(|cx| {
         gpui_kit::open_window(
             WindowOptions {
@@ -3295,4 +3306,244 @@ fn copy_diagnostics_writes_device_state_error_and_hid_trace_to_clipboard(cx: &mu
     assert!(copied.contains("### Recent HID Packet Trace"));
     assert!(copied.contains("TX OUTPUT"));
     assert!(!copied.contains("SN-"));
+}
+
+/// One background scan; a change only counts on its second sighting.
+fn scan_twice(cx: &mut TestAppContext, handle: AnyWindowHandle, app: &Entity<AgnoPeriphApp>) {
+    for _ in 0..2 {
+        app.update(cx, AgnoPeriphApp::scan_devices_now);
+        settle(cx, handle);
+    }
+}
+
+fn device_count(cx: &mut TestAppContext, app: &Entity<AgnoPeriphApp>) -> usize {
+    cx.update(|cx| app.read(cx).devices().len())
+}
+
+#[gpui_kit::test]
+fn plugging_and_unplugging_updates_the_list_without_refresh(cx: &mut TestAppContext) {
+    let service = Arc::new(MockPeripheralService::new());
+    let (handle, app) = open_shared_app(cx, service.clone(), AppOptions::default());
+
+    service.unplug(&mouse());
+    // A single sighting could be a USB reset, so nothing changes yet.
+    app.update(cx, AgnoPeriphApp::scan_devices_now);
+    settle(cx, handle);
+    assert_eq!(device_count(cx, &app), 2);
+
+    app.update(cx, AgnoPeriphApp::scan_devices_now);
+    settle(cx, handle);
+    assert_eq!(device_count(cx, &app), 1);
+    assert!(!exists(cx, handle, device_element_id(&mouse())));
+    cx.update(|cx| assert_eq!(app.read(cx).selected_device_id(), Some(&keyboard())));
+
+    service.plug_in(&mouse());
+    scan_twice(cx, handle, &app);
+    assert!(exists(cx, handle, device_element_id(&mouse())));
+    cx.update(|cx| assert_eq!(app.read(cx).selected_device_id(), Some(&keyboard())));
+}
+
+#[gpui_kit::test]
+fn background_rescans_keep_unfinished_edits(cx: &mut TestAppContext) {
+    let service = Arc::new(MockPeripheralService::new());
+    let (handle, app) = open_shared_app(cx, service.clone(), AppOptions::default());
+    let unsaved = |cx: &mut TestAppContext| cx.update(|cx| app.read(cx).pending_changes().len());
+
+    // A half-made key pair survives another device leaving.
+    click(cx, handle, device_element_id(&keyboard()));
+    pick_paired_type(cx, handle, "paired-mode-rs");
+    click(cx, handle, "paired-pick-first");
+    service.unplug(&mouse());
+    scan_twice(cx, handle, &app);
+    assert_eq!(device_count(cx, &app), 1);
+    assert!(exists(cx, handle, "paired-pick-hint"));
+
+    // Staged edits survive their own device being unplugged and plugged back in.
+    service.plug_in(&mouse());
+    scan_twice(cx, handle, &app);
+    click(cx, handle, device_element_id(&mouse()));
+    click(cx, handle, ("polling-rate", 500u64));
+    assert_eq!(unsaved(cx), 1);
+    service.unplug(&mouse());
+    scan_twice(cx, handle, &app);
+    service.plug_in(&mouse());
+    scan_twice(cx, handle, &app);
+    click(cx, handle, device_element_id(&mouse()));
+    assert_eq!(unsaved(cx), 1);
+}
+
+#[gpui_kit::test]
+fn battery_poll_updates_the_level_and_alerts_once(cx: &mut TestAppContext) {
+    let service = Arc::new(MockPeripheralService::new());
+    let system = Arc::new(RecordingSystem::new());
+    let options = AppOptions::default().with_system(system.clone());
+    let (handle, app) = open_shared_app(cx, service.clone(), options);
+    click(cx, handle, ("polling-rate", 500u64));
+    system.take();
+
+    service.set_battery(
+        &mouse(),
+        BatteryStatus::new(Some(9), None, ChargingState::Discharging, true),
+    );
+    for _ in 0..2 {
+        app.update(cx, AgnoPeriphApp::poll_batteries_now);
+        settle(cx, handle);
+    }
+
+    cx.update(|cx| {
+        let app = app.read(cx);
+        let device = app.device(&mouse()).unwrap();
+        assert_eq!(device.battery.and_then(|b| b.percentage), Some(9));
+        assert_eq!(app.pending_changes().len(), 1, "a poll must not drop edits");
+    });
+    let sent = system.take();
+    assert_eq!(sent.len(), 1, "expected one low battery alert: {sent:?}");
+}
+
+#[gpui_kit::test]
+fn a_device_that_will_not_open_is_listed_and_retried(cx: &mut TestAppContext) {
+    let service = Arc::new(MockPeripheralService::new());
+    service.set_unavailable(vec![UnavailableDevice::new(
+        "1532-00c0",
+        "Razer Viper V3 Pro",
+        ConnectionKind::WirelessDongle24Ghz,
+    )]);
+    let (handle, app) = open_shared_app(cx, service.clone(), AppOptions::default());
+    assert!(exists(cx, handle, unavailable_element_id("1532-00c0")));
+    assert!(exists(cx, handle, "unavailable-note"));
+
+    app.update(cx, AgnoPeriphApp::retry_unavailable_now);
+    settle(cx, handle);
+    assert!(exists(cx, handle, unavailable_element_id("1532-00c0")));
+
+    service.release_unavailable();
+    app.update(cx, AgnoPeriphApp::retry_unavailable_now);
+    settle(cx, handle);
+    assert!(!exists(cx, handle, unavailable_element_id("1532-00c0")));
+    assert!(!exists(cx, handle, "unavailable-note"));
+}
+
+#[gpui_kit::test]
+fn the_watcher_notices_an_unplugged_device_by_itself(cx: &mut TestAppContext) {
+    let service = Arc::new(MockPeripheralService::new());
+    let options = AppOptions::default().with_hardware_watcher(true);
+    let (handle, app) = open_shared_app(cx, service.clone(), options);
+
+    service.unplug(&mouse());
+    for _ in 0..2 {
+        cx.executor().advance_clock(DEVICE_SCAN_INTERVAL);
+        settle(cx, handle);
+    }
+    assert_eq!(device_count(cx, &app), 1);
+}
+
+#[gpui_kit::test]
+fn a_background_rescan_leaves_a_hand_picked_preset_alone_during_a_game(cx: &mut TestAppContext) {
+    let service = Arc::new(MockPeripheralService::new());
+    // A rescan reads back what the device stores, which dry run never changes.
+    service.set_dry_run(false);
+    let system = Arc::new(RecordingSystem::new());
+    let options = AppOptions::default().with_system(system.clone());
+    let (handle, app) = open_shared_app(cx, service.clone(), options);
+
+    click(cx, handle, "nav-game-profiles");
+    type_into(cx, handle, "manual-game-name", "VALORANT");
+    type_into(cx, handle, "manual-game-exe", "VALORANT-Win64-Shipping.exe");
+    click(cx, handle, "add-manual-game");
+    click(cx, handle, format!("target-{}-1", mouse()));
+
+    let running = HashSet::from(["valorant-win64-shipping.exe".to_owned()]);
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+    assert_eq!(active_slot(cx, &app, &mouse()), Some(1));
+    request_switch(cx, handle, &app, &mouse(), 2);
+    assert_eq!(active_slot(cx, &app, &mouse()), Some(2));
+    system.take();
+
+    service.unplug(&keyboard());
+    scan_twice(cx, handle, &app);
+    app.update(cx, |app, cx| app.handle_running_exes(&running, cx));
+    settle(cx, handle);
+
+    assert_eq!(active_slot(cx, &app, &mouse()), Some(2));
+    assert_eq!(system.take(), Vec::<(String, String)>::new());
+}
+
+/// How far the face of a keycap sits below the top of its footprint.
+fn cap_depth(cx: &mut TestAppContext, handle: AnyWindowHandle, key: u16) -> Pixels {
+    cx.update_window(handle, |_, window, _| {
+        let footprint = window.find(key_id(key)).bounds().origin.y;
+        window
+            .within(key_id(key))
+            .find("cap-face")
+            .bounds()
+            .origin
+            .y
+            - footprint
+    })
+    .unwrap()
+}
+
+fn wait(cx: &mut TestAppContext, handle: AnyWindowHandle, millis: u64) {
+    cx.executor().advance_clock(Duration::from_millis(millis));
+    settle(cx, handle);
+}
+
+#[gpui_kit::test]
+fn a_keycap_travels_down_and_back_up(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, MockPeripheralService::new());
+    click(cx, handle, device_element_id(&keyboard()));
+    let up = cap_depth(cx, handle, KEY_Q);
+
+    click(cx, handle, key_id(KEY_Q));
+    wait(cx, handle, 20);
+    let on_the_way = cap_depth(cx, handle, KEY_Q);
+    wait(cx, handle, 100);
+    let down = cap_depth(cx, handle, KEY_Q);
+    assert!(
+        up < on_the_way && on_the_way < down,
+        "{up:?} {on_the_way:?} {down:?}"
+    );
+
+    // Coming back to the tab shows the key already down.
+    open_tab(cx, handle, &app, KeyboardTab::Lighting);
+    open_tab(cx, handle, &app, KeyboardTab::Triggers);
+    assert_eq!(cap_depth(cx, handle, KEY_Q), down);
+
+    click(cx, handle, key_id(KEY_Q));
+    wait(cx, handle, 20);
+    assert!(cap_depth(cx, handle, KEY_Q) > up, "release takes time too");
+    wait(cx, handle, 150);
+    assert_eq!(cap_depth(cx, handle, KEY_Q), up);
+}
+
+#[gpui_kit::test]
+fn keycaps_jump_under_reduced_motion(cx: &mut TestAppContext) {
+    let (handle, _app) = open_app(cx, MockPeripheralService::new());
+    cx.update(|cx| cx.set_reduce_motion(true));
+    click(cx, handle, device_element_id(&keyboard()));
+    let up = cap_depth(cx, handle, KEY_Q);
+
+    click(cx, handle, key_id(KEY_Q));
+    let at_once = cap_depth(cx, handle, KEY_Q);
+    wait(cx, handle, 200);
+    assert!(at_once > up);
+    assert_eq!(cap_depth(cx, handle, KEY_Q), at_once);
+}
+
+#[gpui_kit::test]
+fn switching_keyboards_does_not_replay_the_old_selection(cx: &mut TestAppContext) {
+    let (handle, _app) = open_app(cx, MockPeripheralService::multi_brand());
+    click(cx, handle, device_element_id(&keyboard()));
+    let up = cap_depth(cx, handle, KEY_Q);
+    click(cx, handle, key_id(KEY_Q));
+    wait(cx, handle, 200);
+
+    click(
+        cx,
+        handle,
+        device_element_id(&DeviceId::new(MOCK_WOOTING_ID)),
+    );
+    // The same matrix position on another keyboard starts at rest, not on its way up.
+    assert_eq!(cap_depth(cx, handle, KEY_Q), up);
 }

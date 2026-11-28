@@ -3,9 +3,7 @@
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, ThemeMode,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
-    h_flex,
-    switch::Switch,
-    v_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -13,7 +11,9 @@ use gpui_kit::*;
 use crate::app::AgnoPeriphApp;
 use crate::design::{Accent, dp};
 use crate::updates::CURRENT_VERSION;
-use crate::widgets::{page_title, panel, panel_head, segment, segmented, setting_row};
+use crate::widgets::{
+    MarkedSwitch, page_title, panel, panel_head, segment, segmented, setting_row,
+};
 
 pub(crate) fn render(
     app: &AgnoPeriphApp,
@@ -31,19 +31,19 @@ pub(crate) fn render(
 
 fn app_panel(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl IntoElement + use<> {
     let config = app.config();
-    let close_to_tray = Switch::new("pref-close-to-tray")
+    let close_to_tray = MarkedSwitch::new("pref-close-to-tray")
         .accessibility_label("Close to tray")
         .checked(config.close_to_tray)
         .on_change(cx.listener(|this, checked: &bool, _, cx| {
             this.set_close_to_tray(*checked, cx);
         }));
-    let start_with_windows = Switch::new("pref-start-with-windows")
+    let start_with_windows = MarkedSwitch::new("pref-start-with-windows")
         .accessibility_label("Start with Windows")
         .checked(config.start_with_windows)
         .on_change(cx.listener(|this, checked: &bool, _, cx| {
             this.set_start_with_windows(*checked, cx);
         }));
-    let low_battery = Switch::new("pref-low-battery")
+    let low_battery = MarkedSwitch::new("pref-low-battery")
         .accessibility_label("Low-battery alerts")
         .checked(config.low_battery_alerts)
         .on_change(cx.listener(|this, checked: &bool, _, cx| {

@@ -9,7 +9,6 @@ use gpui_kit::component::{
     h_flex,
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
-    switch::Switch,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -18,12 +17,15 @@ use gpui_kit::*;
 use crate::app::{AgnoPeriphApp, muted_note};
 use crate::backend::DeviceSnapshot;
 use crate::controls::{InputRole, sync_input};
-use crate::design::{DISPLAY_FONT, dp};
+use crate::design::dp;
 use crate::game_profiles::{
     DEFAULT_SOFTWARE_PROFILE_SLOTS, DetectedGame, GameProfile, normalize_exe_name,
 };
 use crate::keycodes::matches_search;
-use crate::widgets::{page_title, panel, panel_head, segment, segmented, setting_row};
+use crate::widgets::{
+    MarkedSwitch, head_row, page_title, panel, panel_head, panel_title, segment, segmented,
+    setting_row,
+};
 
 /// Scan results shown at once; the search narrows the rest.
 const MAX_SCAN_RESULTS: usize = 200;
@@ -535,17 +537,17 @@ fn render_status(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> impl I
     let enabled = app.config.auto_switch_enabled;
     let notify = app.config.notify_on_game_switch;
     let line = app.auto_switch_status();
-    let automatic = Switch::new("auto-switch")
+    let automatic = MarkedSwitch::new("auto-switch")
         .accessibility_label("Switch automatically")
         .checked(enabled)
-        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+        .on_change(cx.listener(|this, checked: &bool, _, cx| {
             this.set_auto_switch(*checked, cx);
         }));
-    let notifications = Switch::new("notify-on-switch")
+    let notifications = MarkedSwitch::new("notify-on-switch")
         .accessibility_label("Notify on switch")
         .checked(notify)
         .disabled(!enabled)
-        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+        .on_change(cx.listener(|this, checked: &bool, _, cx| {
             this.set_notify_on_game_switch(*checked, cx);
         }));
     let note = app.auto_switch_note.clone();
@@ -671,7 +673,13 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
     };
     let id = profile.id.clone();
     let exe_input = app.controls.as_ref().map(|c| c.profile_exe.clone());
-    let head = panel_head("Game")
+    // User-typed names can be long, so the title gives way before the actions do.
+    let title = panel_title(&profile.name)
+        .flex_shrink(1.)
+        .min_w_0()
+        .truncate();
+    let head = head_row()
+        .child(title)
         .child(div().flex_1())
         .child(
             Button::new("rename-game")
@@ -695,10 +703,10 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
                     move |this, _, window, cx| this.request_delete_game(id.clone(), window, cx)
                 })),
         );
-    let enabled = Switch::new("game-enabled")
+    let enabled = MarkedSwitch::new("game-enabled")
         .accessibility_label("Switch for this game")
         .checked(profile.enabled)
-        .on_click(cx.listener({
+        .on_change(cx.listener({
             let id = id.clone();
             move |this, checked: &bool, _, cx| this.set_game_enabled(&id, *checked, cx)
         }));
@@ -721,15 +729,6 @@ fn render_editor(app: &AgnoPeriphApp, cx: &mut Context<AgnoPeriphApp>) -> AnyEle
 
     panel(SharedString::from(format!("game-editor-{id}")), cx)
         .child(head)
-        .child(
-            div()
-                .pb(dp(10.))
-                .font_family(DISPLAY_FONT)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_size(dp(18.))
-                .truncate()
-                .child(profile.name.clone()),
-        )
         .child(setting_row("Switch for this game", None, enabled, true, cx))
         .child(setting_row("Executable", path, executable, false, cx))
         .when_some(error, |this, error| {

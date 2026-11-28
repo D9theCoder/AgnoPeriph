@@ -1,6 +1,6 @@
 # UI redesign mockup
 
-**Status:** final design direction for the `crates/ui` visual refresh. Approved on 2026-11-27. Implementation is deferred.
+**Status:** final design direction for the `crates/ui` visual refresh. Approved on 2026-11-27; implemented, merged into `main` (`85221bb`), and pushed the same day (verified against mock data).
 
 Open `mockup.html` in a browser. It is an interactive HTML prototype of the 1240×820 app window, built against mock data. It covers every tab of all six mock devices: three keyboards in their real layouts and three mice. It is not production code. It shows the target look and behaviour, not GPUI APIs.
 
@@ -45,9 +45,9 @@ The cyan accent comes from the glowing crossbar in the app logo.
 
 ## Type
 
-- **Saira:** device name, all-caps panel titles (for example KEY TESTER, RAPID TRIGGER), keycap legends, and large mm/DPI readouts with tabular figures.
+- **Saira:** device name, panel titles, keycap legends, and large mm/DPI readouts with tabular figures.
 - **Figtree:** everything else.
-- **Caps:** reserved for panel titles, not ordinary labels.
+- **Panel titles:** sentence case (for example "Key tester", "Rapid Trigger"), Saira SemiBold at 16 px with no extra letter spacing. This replaces the mockup's tracked all-caps titles.
 
 ## Layout and components
 
@@ -157,7 +157,7 @@ Checked against gpui-fast 0.1.19:
 
 - **Custom fonts:** `add_fonts` exists.
 - **Tabular figures:** `FontFeatures` exists.
-- **Letter spacing and font width:** no API was found. The tracked caps titles and the narrow keycap legends need static width cuts of Saira, or another workaround.
+- **Letter spacing and font width:** no API was found. The narrow keycap legends need a static width cut of Saira, or another workaround.
 - **Glow on the actuation line and the mouse underglow:** `BoxShadow` has `blur_radius`, so a blurred, coloured shadow on a thin bar gives the glow.
 - **Type icons on keycaps:** `advanced_svg()` in `icons.rs` already renders these SVGs tinted, so the keycap corner can reuse it.
 - **Mouse drawing:** needs a custom element or a bundled SVG per mouse shape, with hit areas per button.

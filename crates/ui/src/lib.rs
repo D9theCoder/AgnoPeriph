@@ -17,6 +17,7 @@ pub mod battery_alerts;
 mod calibration;
 mod controls;
 pub mod design;
+pub mod device_watch;
 mod dirty_bar;
 pub mod draft;
 pub mod game_profiles;
@@ -31,7 +32,6 @@ pub mod keycodes;
 pub mod keymap;
 mod keymap_panel;
 mod macro_panel;
-mod motion;
 mod pointer_panel;
 mod profile_bar;
 pub mod profile_io;
@@ -51,7 +51,7 @@ pub use design::Accent;
 pub use hall_effect_panel::snap_travel;
 pub use pointer_panel::snap_dpi;
 pub use rgb_panel::{hex_to_rgb, hsv_to_rgb, rgb_to_hex, rgb_to_hsv};
-pub use sidebar::device_element_id;
+pub use sidebar::{device_element_id, unavailable_element_id};
 
 /// Locks a mutex, recovering the data if a panicking thread poisoned it.
 pub(crate) fn backend_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

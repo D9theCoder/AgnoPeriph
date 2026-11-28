@@ -1205,6 +1205,7 @@ fn render_matrix(
     let matrix = key_matrix::render(
         "key-matrix",
         "key",
+        app.selected_device_id(),
         layout,
         board_width,
         |cap| {

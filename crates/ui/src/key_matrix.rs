@@ -5,7 +5,10 @@
 //! ~85 caps, and the component's extra layers made every matrix frame several times more
 //! expensive than the caps themselves. Click semantics belong to each view's handler.
 
-use agnoperiph_core::KeyIndex;
+use std::time::Duration;
+
+use agnoperiph_core::{DeviceId, KeyIndex};
+use gpui_kit::base::{Transition, transition};
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -23,6 +26,11 @@ const KEY_SPACING: f32 = 3.0;
 const CASE_PADDING: f32 = 8.0;
 const CASE_TOP_PADDING: f32 = 10.0;
 const LIP_HEIGHT: f32 = 30.0;
+/// How far a selected keycap sinks, taken from the lip under its face.
+const PRESS_TRAVEL: f32 = 2.5;
+/// A key goes down faster than it comes back, as a real switch does.
+const PRESS_IN: Duration = Duration::from_millis(90);
+const PRESS_OUT: Duration = Duration::from_millis(140);
 /// Width of the board column: a 16u board plus the case padding.
 pub(crate) const BOARD_WIDTH: f32 = 16.0 * UNIT + 2.0 * CASE_PADDING;
 
@@ -136,49 +144,111 @@ pub(crate) fn height(layout: &KeyLayout, board_width: f32) -> f32 {
     CASE_TOP_PADDING + plate + LIP_HEIGHT
 }
 
+/// A whole board as one component, which gives its keys a window to animate in without a
+/// layer per keycap.
+#[derive(IntoElement)]
+pub(crate) struct KeyBoard {
+    id: &'static str,
+    id_prefix: &'static str,
+    /// Scopes the press motion to one board of one device, so switching either never plays
+    /// it. `None` for read-only boards.
+    press_scope: Option<SharedString>,
+    layout: KeyLayout,
+    board_width: f32,
+    faces: Vec<KeyFace>,
+    handlers: Vec<ClickHandler>,
+    lip: Vec<AnyElement>,
+}
+
+impl RenderOnce for KeyBoard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (keys, width, height) = place(&self.layout, self.board_width);
+        let presses: Vec<f32> = keys
+            .iter()
+            .zip(&self.faces)
+            .map(|(placed, face)| {
+                let is_down = face.tone == KeyTone::Selected;
+                let target = if is_down { 1.0 } else { 0.0 };
+                let Some(scope) = &self.press_scope else {
+                    return target;
+                };
+                let duration = if is_down { PRESS_IN } else { PRESS_OUT };
+                transition(
+                    ElementId::NamedInteger(scope.clone(), u64::from(placed.cap.index.value())),
+                    target,
+                    Transition::new(duration),
+                    window,
+                    cx,
+                )
+            })
+            .collect();
+        let colors = tokens(cx);
+        let mut handlers = self.handlers.into_iter();
+        let caps: Vec<AnyElement> = keys
+            .iter()
+            .zip(&self.faces)
+            .zip(&presses)
+            .map(|((placed, face), &press)| {
+                keycap(
+                    self.id_prefix,
+                    placed,
+                    face,
+                    press,
+                    handlers.next(),
+                    &colors,
+                    cx,
+                )
+            })
+            .collect();
+        board(
+            self.id,
+            self.board_width,
+            &keys,
+            &self.faces,
+            &presses,
+            caps,
+            (width, height),
+            self.lip,
+            cx,
+        )
+    }
+}
+
 /// Renders `layout` as clickable keycaps with ids `(id_prefix, key)` over a legend lip.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render(
     id: &'static str,
     id_prefix: &'static str,
+    device: Option<&DeviceId>,
     layout: &KeyLayout,
     board_width: f32,
     face: impl Fn(&LayoutKey) -> KeyFace,
     on_select: OnSelect,
     lip: Vec<AnyElement>,
     cx: &mut Context<AgnoPeriphApp>,
-) -> Stateful<Div> {
+) -> KeyBoard {
     let handler = |key: KeyIndex, cx: &mut Context<AgnoPeriphApp>| -> ClickHandler {
         Box::new(cx.listener(move |this, event: &ClickEvent, window, cx| {
             let modifiers = event.modifiers();
             on_select(this, key, modifiers.shift || modifiers.control, window, cx);
         }))
     };
-    let (keys, width, height) = place(layout, board_width);
-    let faces: Vec<KeyFace> = keys.iter().map(|placed| face(placed.cap)).collect();
-    let handlers: Vec<ClickHandler> = keys
-        .iter()
-        .map(|placed| handler(placed.cap.index, cx))
-        .collect();
-    let colors = tokens(cx);
-    let caps: Vec<AnyElement> = keys
-        .iter()
-        .zip(&faces)
-        .zip(handlers)
-        .map(|((placed, face), on_click)| {
-            keycap(id_prefix, placed, face, Some(on_click), &colors, cx)
-        })
-        .collect();
-    board(
+    let device = device.map_or_else(String::new, DeviceId::to_string);
+    KeyBoard {
         id,
+        id_prefix,
+        press_scope: Some(format!("{id}-press-{device}").into()),
         board_width,
-        &keys,
-        &faces,
-        caps,
-        (width, height),
+        faces: layout.rows.iter().flatten().map(face).collect(),
+        handlers: layout
+            .rows
+            .iter()
+            .flatten()
+            .map(|cap| handler(cap.index, cx))
+            .collect(),
+        layout: layout.clone(),
         lip,
-        cx,
-    )
+    }
 }
 
 /// Renders `layout` as read-only keycaps with ids `(id_prefix, key)`.
@@ -188,26 +258,17 @@ pub(crate) fn render_static(
     layout: &KeyLayout,
     face: impl Fn(&LayoutKey) -> KeyFace,
     lip: Vec<AnyElement>,
-    cx: &App,
-) -> Stateful<Div> {
-    let (keys, width, height) = place(layout, BOARD_WIDTH);
-    let faces: Vec<KeyFace> = keys.iter().map(|placed| face(placed.cap)).collect();
-    let colors = tokens(cx);
-    let caps = keys
-        .iter()
-        .zip(&faces)
-        .map(|(placed, face)| keycap(id_prefix, placed, face, None, &colors, cx))
-        .collect();
-    board(
+) -> KeyBoard {
+    KeyBoard {
         id,
-        BOARD_WIDTH,
-        &keys,
-        &faces,
-        caps,
-        (width, height),
+        id_prefix,
+        press_scope: None,
+        board_width: BOARD_WIDTH,
+        faces: layout.rows.iter().flatten().map(face).collect(),
+        handlers: Vec::new(),
+        layout: layout.clone(),
         lip,
-        cx,
-    )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,6 +277,7 @@ fn board(
     board_width: f32,
     keys: &[Placed<'_>],
     faces: &[KeyFace],
+    presses: &[f32],
     caps: Vec<AnyElement>,
     (width, height): (f32, f32),
     lip: Vec<AnyElement>,
@@ -227,13 +289,14 @@ fn board(
     let overlays: Vec<AnyElement> = keys
         .iter()
         .zip(faces)
-        .flat_map(|(placed, face)| {
+        .zip(presses)
+        .flat_map(|((placed, face), &press)| {
             let ring = face
                 .is_outlined
                 .then(|| outline_ring(placed, cx).into_any_element());
             let badge = face
                 .badge
-                .map(|icon| type_badge(placed, icon, face.tone, &colors, cx).into_any_element());
+                .map(|icon| type_badge(placed, icon, press, &colors, cx).into_any_element());
             ring.into_iter().chain(badge)
         })
         .collect();
@@ -277,10 +340,34 @@ fn board(
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
+/// `from` and `to` themselves at the ends, so a settled cap is exactly its colour.
+fn blend(from: Hsla, to: Hsla, share: f32) -> Hsla {
+    if share <= 0.0 {
+        from
+    } else if share >= 1.0 {
+        to
+    } else {
+        mix(to, from, share)
+    }
+}
+
+/// Darker towards the top as the cap sinks, like a dished cap seen from above.
+fn face_fill(surface: Hsla, press: f32, colors: &Tokens) -> Background {
+    if press <= 0.0 {
+        return surface.into();
+    }
+    linear_gradient(
+        180.,
+        linear_color_stop(mix(colors.key_well, surface, 0.22 * press), 0.),
+        linear_color_stop(surface, 1.),
+    )
+}
+
 fn keycap(
     id_prefix: &'static str,
     placed: &Placed<'_>,
     face: &KeyFace,
+    press: f32,
     on_click: Option<ClickHandler>,
     colors: &Tokens,
     cx: &App,
@@ -289,25 +376,13 @@ fn keycap(
     let cap = placed.cap;
     let is_selected = face.tone == KeyTone::Selected;
 
-    let (mut skirt, mut surface, hover) = match (&face.content, face.tone) {
+    let (rest_skirt, rest_surface, rest_hover) = match (&face.content, face.tone) {
         (_, KeyTone::Done) => (
             mix(theme.success, colors.key_skirt, 0.55),
             mix(theme.success, colors.key_face, 0.24),
             None,
         ),
         (KeyContent::Lit(color), _) => (mix(*color, colors.key_skirt, 0.45), *color, None),
-        (content, KeyTone::Selected) => {
-            let share = if matches!(content, KeyContent::Remap(_)) {
-                0.30
-            } else {
-                0.24
-            };
-            (
-                mix(theme.primary, colors.key_skirt, 0.55),
-                mix(theme.primary, colors.key_face, share),
-                None,
-            )
-        }
         (KeyContent::Remap(_), _) => (
             colors.key_skirt,
             mix(theme.primary, colors.key_face, 0.16),
@@ -319,6 +394,26 @@ fn keycap(
             Some(colors.key_face_hover),
         ),
     };
+    let (down_skirt, down_surface) = match &face.content {
+        KeyContent::Lit(_) => (rest_skirt, rest_surface),
+        content => {
+            let share = if matches!(content, KeyContent::Remap(_)) {
+                0.40
+            } else {
+                0.34
+            };
+            (
+                mix(theme.primary, colors.key_skirt, 0.38),
+                mix(theme.primary, colors.key_face, share),
+            )
+        }
+    };
+    let mut skirt = blend(rest_skirt, down_skirt, press);
+    let mut surface = blend(rest_surface, down_surface, press);
+    // Hovering follows the cap down; a fully pressed one looks the same either way.
+    let hover = rest_hover
+        .filter(|_| press < 1.0)
+        .map(|hover| blend(hover, down_surface, press));
     if face.is_pending {
         skirt = theme.warning;
     }
@@ -326,13 +421,22 @@ fn keycap(
         surface = colors.key_face;
     }
 
-    let inner_shadow = if is_selected && !matches!(face.content, KeyContent::Lit(_)) {
-        BoxShadow::new(px(0.), px(0.), theme.primary)
-            .spread_radius(px(1.5))
-            .inset()
-    } else {
-        BoxShadow::new(px(0.), px(1.), colors.key_highlight).inset()
-    };
+    // A pressed cap sits below the plate: shaded under the recess's top edge, with light
+    // from underneath catching its lower edge.
+    let mut inner_shadows = Vec::new();
+    if press < 1.0 {
+        let highlight = colors.key_highlight.opacity(1.0 - press);
+        inner_shadows.push(BoxShadow::new(px(0.), px(1.), highlight).inset());
+    }
+    if press > 0.0 {
+        inner_shadows.push(
+            BoxShadow::new(px(0.), px(3.), colors.key_press_shade.opacity(press))
+                .blur_radius(px(5.))
+                .inset(),
+        );
+        inner_shadows
+            .push(BoxShadow::new(px(0.), px(-1.), theme.primary.opacity(0.75 * press)).inset());
+    }
     let name = SharedString::from(legend(&cap.label).to_owned());
     let spoken = match &face.description {
         Some(description) => format!("{} key, {description}", cap.label),
@@ -349,10 +453,11 @@ fn keycap(
         .size_full()
         .overflow_hidden()
         .rounded(radius)
-        .bg(surface)
-        .shadow(vec![inner_shadow])
+        .bg(face_fill(surface, press, colors))
+        .shadow(inner_shadows)
         .when_some(hover.filter(|_| on_click.is_some()), |this, hover| {
-            this.group_hover(HOVER_GROUP, move |style| style.bg(hover))
+            let fill = face_fill(hover, press, colors);
+            this.group_hover(HOVER_GROUP, move |style| style.bg(fill))
         })
         .map(|this| {
             if cap.is_knob {
@@ -371,12 +476,29 @@ fn keycap(
                 key_content(this, name.clone(), placed.width, face, colors, cx)
             }
         });
+    // Lets tests measure how far the face has travelled. The id costs a little every
+    // frame, so release builds go without.
+    #[cfg(debug_assertions)]
+    let top = top.id("cap-face").test_support();
 
     let width = if cap.is_knob {
         placed.height
     } else {
         placed.width
     };
+    let radius_outer = if cap.is_knob {
+        dp(placed.height)
+    } else {
+        dp(6.)
+    };
+    let body = div()
+        .size_full()
+        .pt(dp(1.))
+        .px(dp(2.))
+        .pb(dp(4. - PRESS_TRAVEL * press))
+        .rounded(radius_outer)
+        .bg(skirt)
+        .child(top);
     div()
         .id((id_prefix, u64::from(cap.index.value())))
         .aria_label(spoken)
@@ -386,34 +508,28 @@ fn keycap(
         .top(dp(placed.y))
         .w(dp(width))
         .h(dp(placed.height))
-        .pt(dp(1.))
-        .px(dp(2.))
-        .pb(dp(4.))
-        .rounded(if cap.is_knob {
-            dp(placed.height)
-        } else {
-            dp(6.)
+        .rounded(radius_outer)
+        .when(press > 0.0, |this| {
+            this.pt(dp(PRESS_TRAVEL * press))
+                .bg(colors.key_well.opacity(press))
+                .shadow(vec![
+                    // Light leaking from under the pressed cap.
+                    BoxShadow::new(px(0.), px(2.), theme.primary.opacity(0.55 * press))
+                        .blur_radius(px(7.))
+                        .spread_radius(px(-2.)),
+                ])
         })
-        .bg(skirt)
         .group(HOVER_GROUP)
         .when(face.tone == KeyTone::Locked, |this| this.opacity(0.45))
         .map(|this| match &face.content {
-            KeyContent::Lit(color) => {
-                let mut shadows = vec![glow(*color, 14.0).spread_radius(px(-5.))];
-                if is_selected {
-                    shadows.push(
-                        BoxShadow::new(px(0.), px(0.), theme.foreground).spread_radius(px(2.)),
-                    );
-                }
-                this.shadow(shadows)
-            }
+            KeyContent::Lit(color) => this.shadow(vec![glow(*color, 14.0).spread_radius(px(-5.))]),
             _ => this,
         })
         .when_some(on_click, |this, on_click| {
             this.when(face.tone != KeyTone::Locked, Styled::cursor_pointer)
                 .on_click(on_click)
         })
-        .child(top)
+        .child(body)
         .test_support()
         .into_any_element()
 }
@@ -514,20 +630,18 @@ fn key_content(
 fn type_badge(
     placed: &Placed<'_>,
     icon: AdvancedIcon,
-    tone: KeyTone,
+    press: f32,
     colors: &Tokens,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
-    let (background, foreground) = if tone == KeyTone::Selected {
-        (theme.primary, theme.primary_foreground)
-    } else {
-        (colors.key_face, colors.key_legend)
-    };
+    let background = blend(colors.key_face, theme.primary, press);
+    let foreground = blend(colors.key_legend, theme.primary_foreground, press);
+    let travel = PRESS_TRAVEL * press;
     div()
         .absolute()
         .left(dp(placed.x + placed.width - 13.0))
-        .top(dp(placed.y - 6.0))
+        .top(dp(placed.y - 6.0 + travel))
         .size(dp(19.))
         .flex()
         .items_center()

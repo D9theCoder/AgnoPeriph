@@ -15,7 +15,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{AgnoPeriphApp, Route};
-use crate::backend::DeviceSnapshot;
+use crate::backend::{DeviceSnapshot, UnavailableDevice};
 use crate::design::{dp, tokens};
 use crate::widgets::{battery_glyph, battery_label, connection_icon};
 
@@ -25,6 +25,11 @@ const LOW_BATTERY_PERCENT: u8 = 20;
 /// Stable element id for a device row, derived from its domain [`DeviceId`].
 pub fn device_element_id(device: &DeviceId) -> ElementId {
     ElementId::Name(format!("device-{device}").into())
+}
+
+/// Stable element id for the row of a device that wouldn't open.
+pub fn unavailable_element_id(key: &str) -> ElementId {
+    ElementId::Name(format!("unavailable-{key}").into())
 }
 
 pub(crate) fn render(
@@ -42,6 +47,16 @@ pub(crate) fn render(
             render_row(device, is_selected, unsaved, cx).into_any_element()
         })
         .collect();
+    let unavailable: Vec<AnyElement> = app
+        .unavailable_devices()
+        .iter()
+        .map(|device| unavailable_row(device, cx).into_any_element())
+        .collect();
+    let unavailable_note = match unavailable.len() {
+        0 => None,
+        1 => Some("It may be asleep or in use by another app. It opens on its own once free."),
+        _ => Some("They may be asleep or in use by another app. Each opens on its own once free."),
+    };
     let games_status: SharedString =
         match (app.active_game_name(), app.config().auto_switch_enabled) {
             (Some(name), true) => format!("Playing {name}").into(),
@@ -100,6 +115,20 @@ pub(crate) fn render(
                 .min_h_0()
                 .gap(dp(2.))
                 .children(rows)
+                .children(unavailable)
+                .when_some(unavailable_note, |this, note| {
+                    this.child(
+                        div()
+                            .id("unavailable-note")
+                            .flex_shrink_0()
+                            .px(dp(10.))
+                            .pt(dp(2.))
+                            .text_size(dp(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(note)
+                            .test_support(),
+                    )
+                })
                 .overflow_y_scrollbar(),
         )
         .child(
@@ -249,6 +278,63 @@ fn render_row(
         .on_click(cx.listener(move |this, _, _, cx| {
             this.select_device(id.clone(), cx);
         }))
+}
+
+/// A recognized device that wouldn't open. There is nothing to select, so not a button.
+fn unavailable_row(device: &UnavailableDevice, cx: &App) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    h_flex()
+        .id(unavailable_element_id(&device.key))
+        .aria_label(format!("{}, can’t open", device.name))
+        .flex_shrink_0()
+        .w_full()
+        .min_w_0()
+        .py(dp(8.))
+        .px(dp(10.))
+        .gap(dp(10.))
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .size(dp(32.))
+                .justify_center()
+                .rounded(theme.radius)
+                .border_1()
+                .border_dashed()
+                .border_color(theme.border)
+                .text_color(muted)
+                .child(Icon::new(LucideIcon::Unplug).size(dp(16.))),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(dp(1.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(dp(13.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(muted)
+                        .child(device.name.clone()),
+                )
+                .child(
+                    h_flex()
+                        .gap(dp(5.))
+                        .text_size(dp(12.))
+                        .text_color(muted)
+                        .child(connection_icon(device.connection).size(dp(13.)))
+                        .child(short_connection(device.connection))
+                        .child(
+                            div()
+                                .ml(dp(8.))
+                                .text_color(theme.warning)
+                                .child("Can’t open"),
+                        ),
+                ),
+        )
+        .test_support()
 }
 
 fn unsaved_dot(device: &DeviceId, count: usize, cx: &App) -> impl IntoElement + use<> {

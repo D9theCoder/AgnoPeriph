@@ -6,7 +6,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use agnoperiph_core::{
-    ConnectionKind, CoreError, CoreResult, DeviceId, KeyIndex, ProfileSlot, TravelHundredthsMm,
+    BatteryStatus, ConnectionKind, CoreError, CoreResult, DeviceId, KeyIndex, ProfileSlot,
+    TravelHundredthsMm,
 };
 use agnoperiph_transport::{PacketOutcome, PacketTraceEntry};
 use gpui_kit::assets::IconName as LucideIcon;
@@ -18,7 +19,6 @@ use gpui_kit::component::{
     h_flex,
     input::InputEvent,
     spinner::Spinner,
-    switch::Switch,
     tab::{Tab, TabBar},
     tag::Tag,
     tooltip::Tooltip,
@@ -27,20 +27,24 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::backend::{ApplyError, DeviceSnapshot, PeripheralService, SettingChange};
+use crate::backend::{
+    ApplyError, DeviceSnapshot, PeripheralService, SettingChange, UnavailableDevice,
+};
 use crate::battery_alerts::BatteryAlertTracker;
 use crate::controls::{Controls, InputRole, SliderRange, SliderRole};
 use crate::design::{Accent, DISPLAY_FONT, dp};
+use crate::device_watch::DeviceWatch;
 use crate::dirty_bar::ParkedDraft;
 use crate::draft::{ChangeId, DeviceDraft, DraftHistory};
 use crate::game_profiles::{ActiveProcessWatcher, AppConfig, DetectedGame};
 use crate::key_tester::{KeyTesterView, TesterUi};
-use crate::motion::Entrance;
 use crate::smooth_scroll::{ScrollIds, SmoothScroll};
 use crate::system::{DetachedSystem, SystemIntegration};
 use crate::tray_model::TrayChanged;
 use crate::updates::{GithubReleases, ReleaseSource, UpdateUi};
-use crate::widgets::{battery_glyph, battery_label, chip, connection_icon, page_title};
+use crate::widgets::{
+    MarkedSwitch, battery_glyph, battery_label, block, chip, connection_icon, page_title,
+};
 use crate::{
     calibration, game_profiles_view, hall_effect_panel, inspector_drawer, keyboard_config_panel,
     keymap_panel, macro_panel, pointer_panel, profile_bar, rgb_panel, settings_view, sidebar,
@@ -65,6 +69,27 @@ impl Banner {
 
     pub fn message(&self) -> &SharedString {
         &self.message
+    }
+}
+
+/// What a re-enumeration reports back from the background.
+struct RefreshReply {
+    devices: CoreResult<Vec<DeviceSnapshot>>,
+    unavailable: Vec<UnavailableDevice>,
+    packets: Vec<PacketTraceEntry>,
+    dry_run: bool,
+}
+
+impl RefreshReply {
+    fn read(service: &dyn PeripheralService) -> Self {
+        // The unavailable list is only current once `refresh` has returned.
+        let devices = service.refresh();
+        Self {
+            devices,
+            unavailable: service.unavailable_devices(),
+            packets: service.packet_log(),
+            dry_run: service.is_dry_run(),
+        }
     }
 }
 
@@ -334,6 +359,7 @@ pub struct AgnoPeriphApp {
     pub(crate) tester: TesterUi,
     pub(crate) tester_view: Entity<KeyTesterView>,
     pub(crate) battery_alerts: BatteryAlertTracker,
+    pub(crate) watch: DeviceWatch,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) keyboard_tab: KeyboardTab,
     pub(crate) paired: hall_effect_panel::PairedKeysUi,
@@ -360,6 +386,7 @@ pub struct AgnoPeriphApp {
     syncing_hardware: bool,
     watcher: Option<Task<()>>,
     hardware_watcher: Option<Task<()>>,
+    device_watcher: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     control_subscriptions: Vec<Subscription>,
 }
@@ -432,6 +459,7 @@ impl AgnoPeriphApp {
             tester: TesterUi::default(),
             tester_view,
             battery_alerts: BatteryAlertTracker::default(),
+            watch: DeviceWatch::default(),
             focus_handle: cx.focus_handle(),
             keyboard_tab: KeyboardTab::Triggers,
             paired: hall_effect_panel::PairedKeysUi::default(),
@@ -454,6 +482,7 @@ impl AgnoPeriphApp {
             syncing_hardware: false,
             watcher: None,
             hardware_watcher: None,
+            device_watcher: None,
             _subscriptions: vec![theme_subscription],
             control_subscriptions: Vec::new(),
         };
@@ -462,6 +491,7 @@ impl AgnoPeriphApp {
         }
         if options.watch_hardware {
             app.hardware_watcher = Some(Self::spawn_hardware_watcher(cx));
+            app.device_watcher = Some(Self::spawn_device_watcher(cx));
         }
         app.refresh(cx);
         if check_updates {
@@ -707,10 +737,28 @@ impl AgnoPeriphApp {
     /// Re-enumerates devices. Previous data stays visible until the reply lands.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let service = self.service.clone();
-        self.run_refresh(cx, move || {
-            let devices = service.refresh();
-            (devices, service.packet_log(), service.is_dry_run())
-        });
+        self.run_refresh(cx, false, move || RefreshReply::read(service.as_ref()));
+    }
+
+    /// A refresh the app starts on its own, so unfinished edits survive it.
+    pub(crate) fn refresh_keeping_work(&mut self, cx: &mut Context<Self>) {
+        let service = self.service.clone();
+        self.run_refresh(cx, true, move || RefreshReply::read(service.as_ref()));
+    }
+
+    pub(crate) fn has_loaded(&self) -> bool {
+        self.has_loaded
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn store_battery(&mut self, device: &DeviceId, battery: BatteryStatus) {
+        if let Some(slot) = self.devices.iter_mut().find(|d| d.id() == device) {
+            slot.battery = Some(battery);
+        }
+        self.sync_effective();
     }
 
     /// Switches dry-run mode. Device handles reopen in the new mode before any further write.
@@ -719,19 +767,17 @@ impl AgnoPeriphApp {
             return;
         }
         let service = self.service.clone();
-        self.run_refresh(cx, move || {
+        self.run_refresh(cx, false, move || {
             service.set_dry_run(dry_run);
-            let devices = service.refresh();
-            (devices, service.packet_log(), service.is_dry_run())
+            RefreshReply::read(service.as_ref())
         });
     }
 
     fn run_refresh(
         &mut self,
         cx: &mut Context<Self>,
-        work: impl FnOnce() -> (CoreResult<Vec<DeviceSnapshot>>, Vec<PacketTraceEntry>, bool)
-        + Send
-        + 'static,
+        keeps_work: bool,
+        work: impl FnOnce() -> RefreshReply + Send + 'static,
     ) {
         self.revision += 1;
         let revision = self.revision;
@@ -739,7 +785,9 @@ impl AgnoPeriphApp {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let reply = cx.background_spawn(async move { work() }).await;
-            let _ = this.update(cx, |this, cx| this.finish_refresh(revision, reply, cx));
+            let _ = this.update(cx, |this, cx| {
+                this.finish_refresh(revision, keeps_work, reply, cx);
+            });
         })
         .detach();
     }
@@ -777,23 +825,55 @@ impl AgnoPeriphApp {
     fn finish_refresh(
         &mut self,
         revision: u64,
-        (devices, packets, dry_run): (CoreResult<Vec<DeviceSnapshot>>, Vec<PacketTraceEntry>, bool),
+        keeps_work: bool,
+        reply: RefreshReply,
         cx: &mut Context<Self>,
     ) {
         if revision != self.revision {
             return;
         }
+        let RefreshReply {
+            devices,
+            unavailable,
+            packets,
+            dry_run,
+        } = reply;
         self.is_loading = false;
         self.has_loaded = true;
         self.dry_run = dry_run;
         self.set_packets(packets);
-        self.clear_drafts();
-        self.keymap_ui.clear_history();
-        self.apply_failure = None;
+        // A scan the user didn't ask for must not replace good data with an error.
+        if keeps_work && devices.is_err() {
+            self.pump_queue(cx);
+            cx.notify();
+            return;
+        }
+        self.watch.unavailable = unavailable;
+        let is_still_present = self.selected.as_ref().is_some_and(|id| {
+            devices
+                .as_ref()
+                .is_ok_and(|list| list.iter().any(|d| d.id() == id))
+        });
+        if !keeps_work || !is_still_present {
+            self.clear_drafts();
+            self.keymap_ui.clear_history();
+            self.apply_failure = None;
+        }
         self.after_apply = None;
         // Fresh handles hold whatever the device stores; the switcher re-checks every target.
-        self.applied_targets.clear();
-        self.auto_switch_retries.clear();
+        // An automatic scan only re-checks devices that left, or it would undo a preset the
+        // user picked by hand during a game.
+        let stayed: BTreeSet<String> = match &devices {
+            Ok(list) if keeps_work => list
+                .iter()
+                .map(|d| d.id().as_str().to_owned())
+                .filter(|id| self.devices.iter().any(|d| d.id().as_str() == id))
+                .collect(),
+            _ => BTreeSet::new(),
+        };
+        self.applied_targets.retain(|id, _| stayed.contains(id));
+        self.auto_switch_retries
+            .retain(|(id, _), _| stayed.contains(id));
         match devices {
             Ok(devices) => {
                 let previous = self.selected.clone();
@@ -802,26 +882,36 @@ impl AgnoPeriphApp {
                         .iter()
                         .any(|w| crate::backend::is_disconnect_message(&w.message))
                 });
+                // Unplugged mid-edit: set the edits aside until the device returns.
+                if keeps_work && !is_still_present {
+                    self.park_draft();
+                }
                 self.devices = devices;
-                self.banner = None;
-                let still_present = self
-                    .selected
-                    .as_ref()
-                    .is_some_and(|id| self.devices.iter().any(|d| d.id() == id));
-                if !still_present {
+                if !keeps_work {
+                    self.banner = None;
+                }
+                if !is_still_present {
                     self.selected = self.devices.first().map(|d| d.id().clone());
                 }
                 if self.selected != previous {
                     self.reset_key_selection();
                     self.keymap_ui = keymap_panel::KeymapUi::default();
+                    self.tester.reset();
                 }
                 for device in &self.devices {
                     if device.profiles.is_none() && device.capabilities.has_hall_effect() {
                         self.config.ensure_software_profiles(device.id());
                     }
                 }
-                // Unsaved edits survive a refresh while their device is still connected.
-                self.drop_parked_of_missing_devices();
+                // Unsaved edits survive a refresh while their device is still connected. An
+                // automatic scan also keeps those of a device that left.
+                if keeps_work {
+                    for snapshot in self.devices.clone() {
+                        self.renormalize_parked_draft(&snapshot);
+                    }
+                } else {
+                    self.drop_parked_of_missing_devices();
+                }
                 if self.draft_device.as_ref() != self.selected.as_ref() {
                     self.reset_draft();
                     self.restore_parked_draft();
@@ -829,7 +919,7 @@ impl AgnoPeriphApp {
                 self.renormalize_draft();
                 self.observe_batteries(cx);
                 if needs_reconnect {
-                    self.schedule_auto_reconnect(cx);
+                    self.schedule_auto_reconnect(keeps_work, cx);
                 } else {
                     self.reconnect_attempts = 0;
                 }
@@ -954,7 +1044,7 @@ impl AgnoPeriphApp {
             self.store_snapshot(snapshot);
             self.observe_batteries(cx);
             if needs_reconnect {
-                self.schedule_auto_reconnect(cx);
+                self.schedule_auto_reconnect(false, cx);
             } else {
                 self.reconnect_attempts = 0;
             }
@@ -987,7 +1077,7 @@ impl AgnoPeriphApp {
         cx.notify();
     }
 
-    fn schedule_auto_reconnect(&mut self, cx: &mut Context<Self>) {
+    fn schedule_auto_reconnect(&mut self, keeps_work: bool, cx: &mut Context<Self>) {
         if self.reconnect_attempts >= 4 || self.is_loading {
             return;
         }
@@ -999,7 +1089,11 @@ impl AgnoPeriphApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.revision == expected_rev && !this.has_pending_writes() && !this.is_loading {
-                    this.refresh(cx);
+                    if keeps_work {
+                        this.refresh_keeping_work(cx);
+                    } else {
+                        this.refresh(cx);
+                    }
                 }
             });
         })
@@ -1082,7 +1176,7 @@ impl AgnoPeriphApp {
             self.store_snapshot(*snapshot);
         }
         if disconnect_failed && !self.dry_run {
-            self.schedule_auto_reconnect(cx);
+            self.schedule_auto_reconnect(false, cx);
         }
         let device_name = self
             .device(device)
@@ -1934,7 +2028,13 @@ impl AgnoPeriphApp {
                             .ml(dp(3.))
                             .text_size(dp(12.5))
                             .text_color(theme.muted_foreground)
-                            .child(device_count_label(self.devices.len())),
+                            .child(
+                                if self.devices.is_empty() && !self.watch.unavailable.is_empty() {
+                                    "No devices open".to_owned()
+                                } else {
+                                    device_count_label(self.devices.len())
+                                },
+                            ),
                     ),
             )
             .child(
@@ -1946,7 +2046,7 @@ impl AgnoPeriphApp {
                     .pr_2()
                     .when(self.show_dev_tools, |this| {
                         this.child(
-                            Switch::new("dry-run")
+                            MarkedSwitch::new("dry-run")
                                 .label("Dry run")
                                 .checked(self.dry_run)
                                 .disabled(locked)
@@ -2072,20 +2172,14 @@ impl AgnoPeriphApp {
         let background = cx.theme().background;
         let notices = self.render_notices(cx);
         let body = match self.route {
-            Route::GameProfiles => Entrance::new(
-                "games-view",
-                game_profiles_view::render(self, workspace_width, cx),
-            )
-            .into_any_element(),
-            Route::Settings => {
-                Entrance::new("settings-view", settings_view::render(self, cx)).into_any_element()
+            Route::GameProfiles => {
+                block(game_profiles_view::render(self, workspace_width, cx)).into_any_element()
             }
+            Route::Settings => block(settings_view::render(self, cx)).into_any_element(),
             Route::Device => match self.selected_device() {
-                Some(device) => Entrance::new(
-                    format!("device-view-{}", device.id()),
-                    self.render_device(device, workspace_width, cx),
-                )
-                .into_any_element(),
+                Some(device) => {
+                    block(self.render_device(device, workspace_width, cx)).into_any_element()
+                }
                 None if !self.has_loaded => loading_state(cx.theme()).into_any_element(),
                 None => self.render_empty_state(cx).into_any_element(),
             },
@@ -2266,18 +2360,30 @@ impl AgnoPeriphApp {
                 keyboard_config_panel::render(self, device, workspace_width, cx)
             }
         };
-        let slot = self.current_slot(device.id()).unwrap_or_default();
-        // Replays on tab and preset changes, so it's clear the values below are new ones.
-        let panel = Entrance::new(format!("tab-{}-{slot}-{selected_ix}", device.id()), panel);
         v_flex()
             .gap_4()
             // A lone tab needs no bar.
             .when(tabs.len() > 1, |this| this.child(bar))
-            .child(panel)
+            .child(block(panel))
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
+        // Found but not opened is a different problem from nothing being connected.
+        let (title, body): (SharedString, &str) = match self.unavailable_devices() {
+            [] => (
+                "No supported peripherals found".into(),
+                "Connect a supported mouse or keyboard. Fully exit each vendor’s own software, including tray icons, then refresh.",
+            ),
+            [device] => (
+                format!("Couldn’t open {}", device.name).into(),
+                "It may be asleep or in use by another app. Wake it, or fully exit the vendor’s own software, including its tray icon. AgnoPeriph keeps trying.",
+            ),
+            _ => (
+                "Couldn’t open your peripherals".into(),
+                "They may be asleep or in use by another app. Wake them, or fully exit each vendor’s own software, including tray icons. AgnoPeriph keeps trying.",
+            ),
+        };
         v_flex()
             .id("empty-state")
             .flex_1()
@@ -2289,7 +2395,7 @@ impl AgnoPeriphApp {
                 div()
                     .text_lg()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("No supported peripherals found"),
+                    .child(title),
             )
             .child(
                 div()
@@ -2297,9 +2403,7 @@ impl AgnoPeriphApp {
                     .text_sm()
                     .text_center()
                     .text_color(theme.muted_foreground)
-                    .child(
-                        "Connect a supported mouse or keyboard. Fully exit each vendor’s own software, including tray icons, then refresh.",
-                    ),
+                    .child(body),
             )
             .child(
                 Button::new("empty-refresh")

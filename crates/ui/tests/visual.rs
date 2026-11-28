@@ -19,12 +19,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agnoperiph::backend::{
-    MOCK_KEYBOARD_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID,
-    MockPeripheralService, PeripheralService,
+    MOCK_KEYBOARD_ID, MOCK_MOUSE_ID, MOCK_PULSAR_ID, MOCK_RAZER_ID, MOCK_VIA_ID, MOCK_WOOTING_ID,
+    MockPeripheralService, PeripheralService, UnavailableDevice,
 };
 use agnoperiph::key_tester::LIVE_POLL_INTERVAL;
 use agnoperiph::{AgnoPeriphApp, AppOptions, KeyboardTab, device_element_id};
-use agnoperiph_core::{DeviceId, KeyIndex, KeyTravelSample, TravelHundredthsMm};
+use agnoperiph_core::{ConnectionKind, DeviceId, KeyIndex, KeyTravelSample, TravelHundredthsMm};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
@@ -313,6 +313,24 @@ fn capture_keyboard_screens() {
 
 #[test]
 #[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_every_key_selected() {
+    let mut cx = headless();
+    let (handle, app) = open(&mut cx);
+    click(
+        &mut cx,
+        handle,
+        device_element_id(&DeviceId::new(MOCK_KEYBOARD_ID)),
+    );
+    open_tab(&mut cx, handle, &app, KeyboardTab::Triggers);
+    click(&mut cx, handle, "select-all-keys");
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        set_theme(&mut cx, handle, mode);
+        save(&mut cx, handle, &format!("keys-all-selected-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
 fn capture_lighting_states() {
     let mut cx = headless();
     let (handle, app) = open(&mut cx);
@@ -403,6 +421,9 @@ fn capture_multi_brand_screens() {
         save(&mut cx, handle, &format!("via-keybinds-{suffix}"));
         click(&mut cx, handle, ("keymap-layer", 1u64));
         save(&mut cx, handle, &format!("via-keybinds-fn-{suffix}"));
+        // The knob is the one round cap, so its pressed shape is checked on its own.
+        click(&mut cx, handle, ("keymap-key", 15u64));
+        save(&mut cx, handle, &format!("via-keybinds-knob-{suffix}"));
         open_tab(&mut cx, handle, &app, KeyboardTab::Lighting);
         save(&mut cx, handle, &format!("via-lighting-{suffix}"));
 
@@ -680,7 +701,7 @@ fn capture_live_tester_socd_screens() {
     let mut cx = headless();
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
         // The mock pairs A (49) and D (51) for SOCD last-input priority. A is held first,
-        // then D is pressed shallower, so the tester shows A released.
+        // then D is pressed shallower and takes over, so the tester shows D pressed.
         let service = Arc::new(MockPeripheralService::new());
         let keyboard = DeviceId::new(MOCK_KEYBOARD_ID);
         let sample = |key, depth| {
@@ -781,5 +802,38 @@ fn capture_settings_screen() {
     for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
         set_theme(&mut cx, handle, mode);
         save(&mut cx, handle, &format!("settings-{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; run with --ignored to write PNGs"]
+fn capture_unavailable_devices() {
+    let mut cx = headless();
+    let busy = [
+        UnavailableDevice::new(
+            "1532-00c0",
+            "Razer Viper V3 Pro",
+            ConnectionKind::WirelessDongle24Ghz,
+        ),
+        UnavailableDevice::new("046d-c547", "Logitech G Pro X Superlight 2 DEX", {
+            ConnectionKind::WirelessDongle24Ghz
+        }),
+    ];
+    for (mode, suffix) in [(ThemeMode::Light, "light"), (ThemeMode::Dark, "dark")] {
+        for (name, count, has_open_devices) in [
+            ("unavailable-device", 1, true),
+            ("unavailable-only", 1, false),
+            ("unavailable-many", 2, false),
+        ] {
+            let service = MockPeripheralService::new();
+            service.set_unavailable(busy[..count].to_vec());
+            if !has_open_devices {
+                service.unplug(&DeviceId::new(MOCK_MOUSE_ID));
+                service.unplug(&DeviceId::new(MOCK_KEYBOARD_ID));
+            }
+            let (handle, _) = open_with(&mut cx, service, HEIGHT);
+            set_theme(&mut cx, handle, mode);
+            save(&mut cx, handle, &format!("{name}-{suffix}"));
+        }
     }
 }

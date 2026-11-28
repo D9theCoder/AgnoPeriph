@@ -6,9 +6,7 @@ use agnoperiph_core::{
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable,
     button::{Button, ButtonCustomVariant, ButtonVariants},
-    h_flex,
-    switch::Switch,
-    v_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,7 +15,9 @@ use crate::app::AgnoPeriphApp;
 use crate::backend::{DeviceSnapshot, PointerChange, PointerState, SettingChange};
 use crate::design::{DISPLAY_FONT, KEY_FONT, dp, tabular, tokens};
 use crate::draft::{ChangeId, EditKey};
-use crate::widgets::{device_setting_row, panel, panel_head, segment, segmented, stepper};
+use crate::widgets::{
+    MarkedSwitch, device_setting_row, panel, panel_head, segment, segmented, stepper,
+};
 
 const GAP: f32 = 16.0;
 const MIN_COLUMN_WIDTH: f32 = 340.0;
@@ -699,7 +699,7 @@ fn render_sensor_options(
     }
     let mut group = panel("pointer-sensor", cx).child(panel_head("Sensor"));
     for (ix, (kind, enabled)) in supported.into_iter().enumerate() {
-        let switch = Switch::new(kind.id())
+        let switch = MarkedSwitch::new(kind.id())
             .checked(enabled)
             .disabled(busy)
             .accessibility_label(kind.label())

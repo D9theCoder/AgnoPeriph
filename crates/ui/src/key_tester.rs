@@ -35,6 +35,8 @@ const TRACE_WINDOW: Duration = Duration::from_millis(2400);
 const TRACE_RETENTION: Duration = Duration::from_millis(2800);
 /// Upper bound on retained timestamped samples.
 const MAX_TRACE_SAMPLES: usize = 2048;
+/// Upper bound on held keys read on every poll, to keep the HID traffic per read small.
+const MAX_HELD_KEYS: usize = 8;
 
 /// The values that decide when a key is pressed, all in hundredths of a millimetre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +222,15 @@ impl PairState {
         self.output
     }
 
+    /// The only key of the pair reported down, if exactly one is.
+    fn winner(&self) -> Option<KeyIndex> {
+        match self.output {
+            (true, false) => Some(self.params.key_a),
+            (false, true) => Some(self.params.key_b),
+            _ => None,
+        }
+    }
+
     pub fn is_pressed(&self, key: KeyIndex) -> bool {
         if key == self.params.key_a {
             self.output.0
@@ -239,8 +250,12 @@ enum PollAction {
 #[derive(Default)]
 pub(crate) struct TesterUi {
     trace: VecDeque<(Instant, u16)>,
-    /// Key the live readings last moved; the tester follows it.
+    /// Key the tester is following.
     live_key: Option<KeyIndex>,
+    /// When the tester moved to `live_key`; older trace samples belong to another key.
+    followed_since: Option<Instant>,
+    /// Keys currently down past the top dead zone, in the order they were detected.
+    held: Vec<KeyIndex>,
     depth: u16,
     /// Pair that owns the tester key, advanced on every reading.
     pair: Option<PairState>,
@@ -289,6 +304,40 @@ impl TesterUi {
             .is_some_and(|last| now.saturating_duration_since(last) <= TRACE_WINDOW)
     }
 
+    /// Records which keys are held and returns the one to follow: the latest detected key
+    /// still held, otherwise the key already shown while it moves, otherwise the deepest.
+    fn latest_key(&mut self, samples: &[KeyTravelSample], top_deadzone: u16) -> Option<KeyIndex> {
+        self.held
+            .retain(|&key| depth_of(samples, key) > top_deadzone);
+        let mut detected: Vec<_> = samples
+            .iter()
+            .filter(|s| s.travel.as_hundredths() > top_deadzone && !self.held.contains(&s.key))
+            .collect();
+        // Keys first seen in the same reading: the deepest one counts as the latest.
+        detected.sort_by_key(|s| s.travel.as_hundredths());
+        self.held.extend(detected.iter().map(|s| s.key));
+        let excess = self.held.len().saturating_sub(MAX_HELD_KEYS);
+        self.held.drain(..excess);
+        self.held
+            .last()
+            .copied()
+            .or_else(|| self.live_key.filter(|&key| depth_of(samples, key) > 0))
+            .or_else(|| {
+                samples
+                    .iter()
+                    .max_by_key(|s| s.travel.as_hundredths())
+                    .map(|s| s.key)
+            })
+    }
+
+    /// Travel readings taken since the tester moved to the key it is following.
+    fn followed_trace(&self) -> impl Iterator<Item = u16> {
+        self.trace
+            .iter()
+            .filter(|&&(time, _)| self.followed_since.is_none_or(|since| time >= since))
+            .map(|&(_, depth)| depth)
+    }
+
     pub(crate) fn clear_error(&mut self) {
         self.live_error = None;
         self.consecutive_errors = 0;
@@ -298,6 +347,8 @@ impl TesterUi {
     pub(crate) fn reset(&mut self) {
         self.trace.clear();
         self.live_key = None;
+        self.followed_since = None;
+        self.held.clear();
         self.depth = 0;
         self.pair = None;
         self.last_depth_change = None;
@@ -349,7 +400,7 @@ impl Render for KeyTesterView {
         let pressed = if let Some(pressed) = app.tester_pair_pressed() {
             pressed
         } else if params.rapid_trigger.is_enabled() {
-            is_pressed(app.tester.trace.iter().map(|&(_, d)| d), &params)
+            is_pressed(app.tester.followed_trace(), &params)
         } else {
             is_pressed(
                 [app.tester.trace.back().map_or(0, |&(_, depth)| depth)],
@@ -496,7 +547,12 @@ impl AgnoPeriphApp {
             self.tester.last_read_elapsed = Duration::ZERO;
             return PollAction::Pause;
         };
-        // The partner is read on every poll too, so its absence means it is fully released.
+        PollAction::Read(self.service.clone(), device, self.live_focus_keys())
+    }
+
+    fn live_focus_keys(&self) -> Vec<KeyIndex> {
+        // The partner and every held key are read on each poll too, so absence from a reply
+        // means fully released.
         let key = self.tester_key();
         let mut focus_keys = vec![key];
         focus_keys.extend(
@@ -504,7 +560,12 @@ impl AgnoPeriphApp {
                 .and_then(|he| pair_params(he, key))
                 .and_then(|pair| pair.partner_of(key)),
         );
-        PollAction::Read(self.service.clone(), device, focus_keys)
+        for &held in &self.tester.held {
+            if !focus_keys.contains(&held) {
+                focus_keys.push(held);
+            }
+        }
+        focus_keys
     }
 
     fn finish_live_read(
@@ -531,12 +592,21 @@ impl AgnoPeriphApp {
                 self.tester.live_polls += 1;
                 self.tester.consecutive_errors = 0;
                 self.tester.live_error = None;
-                let deepest = samples.iter().max_by_key(|s| s.travel.as_hundredths());
-                if let Some(deepest) = deepest {
-                    self.tester.live_key = Some(deepest.key);
+                let top_deadzone = self
+                    .hall_effect_state()
+                    .map_or(0, |he| key_params(he, self.tester_key()).top_deadzone);
+                if let Some(latest) = self.tester.latest_key(&samples, top_deadzone) {
+                    self.tester.live_key = Some(latest);
                 }
-                self.tester.depth = deepest.map_or(0, |sample| sample.travel.as_hundredths());
                 self.step_pair(&samples);
+                // A SOCD or Rapid Switching rule can hand the output to the other key.
+                if let Some(winner) = self.tester.pair.and_then(|pair| pair.winner()) {
+                    self.tester.live_key = Some(winner);
+                }
+                if self.tester.live_key != was.0 {
+                    self.tester.followed_since = Some(now);
+                }
+                self.tester.depth = depth_of(&samples, self.tester_key());
                 let replay_start_changed = self.tester.push_trace(now, self.tester.depth);
                 trace_changed = (cx.reduce_motion() && self.tester.trace_is_moving(now))
                     || self.hall_effect_state().is_some_and(|he| {
@@ -560,6 +630,7 @@ impl AgnoPeriphApp {
                 // Keep polling with gentle backoff so a stale/suspended HID handle or brief
                 // USB reset (`0x0000048F`) recovers automatically without a manual refresh.
                 self.tester.depth = 0;
+                self.tester.held.clear();
                 self.tester.consecutive_errors = self.tester.consecutive_errors.saturating_add(1);
                 let note: SharedString = if self.tester.consecutive_errors <= 2 {
                     "Reconnecting to keyboard…".into()
@@ -594,17 +665,14 @@ impl AgnoPeriphApp {
             self.tester.pair = None;
             return;
         };
-        let depth_of = |key| {
-            samples
-                .iter()
-                .find(|s| s.key == key)
-                .map_or(0, |s| s.travel.as_hundredths())
-        };
         let state = match &mut self.tester.pair {
             Some(state) if state.params == params => state,
             slot => slot.insert(PairState::new(params)),
         };
-        state.step(depth_of(params.key_a), depth_of(params.key_b));
+        state.step(
+            depth_of(samples, params.key_a),
+            depth_of(samples, params.key_b),
+        );
     }
 
     /// Whether the tester key is down after its SOCD or Rapid Switching pair rule, when it
@@ -624,6 +692,14 @@ impl AgnoPeriphApp {
     pub fn tester_depth(&self) -> u16 {
         self.tester.depth
     }
+}
+
+/// The travel of `key` in a reading; a key missing from it is released.
+fn depth_of(samples: &[KeyTravelSample], key: KeyIndex) -> u16 {
+    samples
+        .iter()
+        .find(|s| s.key == key)
+        .map_or(0, |s| s.travel.as_hundredths())
 }
 
 /// The values that decide when `key` is pressed, taking a SOCD or Rapid Switching pair's
@@ -1273,32 +1349,81 @@ mod tests {
                 })
             })
         };
-        assert_eq!(
-            read(cx, Duration::ZERO, &[(KEY_A, 250)]),
-            (KeyIndex::new(KEY_A), Some(true))
-        );
+        let a = (KeyIndex::new(KEY_A), Some(true));
+        let d = (KeyIndex::new(KEY_D), Some(true));
+        assert_eq!(read(cx, Duration::ZERO, &[(KEY_A, 250)]), a);
+        // D takes over although it is shallower than A.
         assert_eq!(
             read(cx, LIVE_POLL_INTERVAL, &[(KEY_A, 250), (KEY_D, 180)]),
-            (KeyIndex::new(KEY_A), Some(false))
-        );
-        // D overtaking A moves the tester to D, which still holds the last input.
-        assert_eq!(
-            read(cx, LIVE_POLL_INTERVAL * 2, &[(KEY_A, 250), (KEY_D, 300)]),
-            (KeyIndex::new(KEY_D), Some(true))
+            d
         );
         assert_eq!(
-            read(cx, LIVE_POLL_INTERVAL * 3, &[(KEY_A, 250), (KEY_D, 200)]),
-            (KeyIndex::new(KEY_A), Some(false))
+            read(cx, LIVE_POLL_INTERVAL * 2, &[(KEY_A, 300), (KEY_D, 180)]),
+            d
         );
         let held = TRACE_RETENTION + Duration::from_secs(1);
-        assert_eq!(
-            read(cx, held, &[(KEY_A, 250), (KEY_D, 200)]),
-            (KeyIndex::new(KEY_A), Some(false))
-        );
-        assert_eq!(
-            read(cx, held + LIVE_POLL_INTERVAL, &[(KEY_A, 250)]),
-            (KeyIndex::new(KEY_A), Some(true))
-        );
+        assert_eq!(read(cx, held, &[(KEY_A, 250), (KEY_D, 200)]), d);
+        // Lifting D hands the output, and the tester, back to the held A.
+        assert_eq!(read(cx, held + LIVE_POLL_INTERVAL, &[(KEY_A, 250)]), a);
+    }
+
+    #[gpui_kit::test]
+    fn tester_follows_the_latest_key_and_falls_back_to_held_ones(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::backend::{MOCK_KEYBOARD_ID, MockPeripheralService};
+
+        use super::{AgnoPeriphApp, Arc, DeviceId, Duration, KeyTravelSample, LIVE_POLL_INTERVAL};
+
+        // E and R are unpaired; the mock RS7 pairs W (34) and S (50) for Rapid Switching.
+        const KEY_W: u16 = 34;
+        const KEY_E: u16 = 35;
+        const KEY_R: u16 = 36;
+        const KEY_S: u16 = 50;
+        cx.update(gpui_kit::init);
+        let app = cx.update(|cx| {
+            cx.new(|cx| AgnoPeriphApp::new(Arc::new(MockPeripheralService::new()), cx))
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.select_device(DeviceId::new(MOCK_KEYBOARD_ID), cx);
+            });
+        });
+        cx.run_until_parked();
+        let start = cx.executor().now();
+        let mut polls = 0;
+        let mut read = |cx: &mut gpui_kit::TestAppContext, keys: &[(u16, u16)]| {
+            polls += 1;
+            let samples = keys
+                .iter()
+                .map(|&(key, depth)| KeyTravelSample::new(KeyIndex::new(key), t(depth)))
+                .collect();
+            cx.update(|cx| {
+                app.update(cx, |app, cx| {
+                    let at = start + LIVE_POLL_INTERVAL * polls;
+                    app.finish_live_read(0, Ok(samples), at, Duration::ZERO, cx);
+                    (app.tester_key().value(), app.tester_depth())
+                })
+            })
+        };
+        assert_eq!(read(cx, &[(KEY_E, 300)]), (KEY_E, 300));
+        assert_eq!(read(cx, &[(KEY_E, 300), (KEY_R, 120)]), (KEY_R, 120));
+        // Every held key stays in the focused read, so its release is noticed.
+        cx.update(|cx| {
+            app.update(cx, |app, _| {
+                let focus = app.live_focus_keys();
+                assert!(focus.contains(&KeyIndex::new(KEY_E)));
+                assert!(focus.contains(&KeyIndex::new(KEY_R)));
+            });
+        });
+        assert_eq!(read(cx, &[(KEY_E, 300)]), (KEY_E, 300));
+        assert_eq!(read(cx, &[]), (KEY_E, 0));
+
+        // Rapid Switching: the tester moves once the other key is deeper and wins.
+        assert_eq!(read(cx, &[(KEY_W, 250)]), (KEY_W, 250));
+        assert_eq!(read(cx, &[(KEY_W, 250), (KEY_S, 200)]), (KEY_W, 250));
+        assert_eq!(read(cx, &[(KEY_W, 250), (KEY_S, 300)]), (KEY_S, 300));
     }
 
     #[test]

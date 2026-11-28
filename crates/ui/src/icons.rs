@@ -59,6 +59,7 @@ gpui_kit::assets::icon_assets!(
         Ellipsis,
         FileText,
         Plug,
+        Unplug,
         Wifi,
         Bluetooth,
         Mouse,

@@ -5,19 +5,20 @@
 //! outgoing frame through `GuardedTransport`, so validation, dry-run
 //! suppression and packet tracing behave identically.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agnoperiph_core::{
-    BatteryStatus, Brightness, Capabilities, CoreError, CoreResult, DebounceMs, DeviceId,
-    DeviceInfo, DeviceRegistry, DksBinding, DpiStage, HallEffectCapabilities, HallEffectSnapshot,
-    KeyCode, KeyHallEffectConfig, KeyIndex, KeyTravelSample, KeyboardConfigCapabilities,
-    KeyboardConfigSnapshot, KeymapCapabilities, KeymapSnapshot, LiftOffDistance, MacroCapabilities,
-    MacroSlot, ModTapBinding, Peripheral, PointerCapabilities, PointerSnapshot, PollingRateHz,
-    ProfileCapabilities, ProfileSlot, ProfileSnapshot, RapidSwitchPair, RapidTriggerConfig,
-    RgbCapabilities, RgbEffect, RgbSnapshot, RgbZoneId, SocdPair, ToggleKeyBinding,
-    TravelHundredthsMm,
+    BatteryStatus, Brightness, Capabilities, ConnectionKind, CoreError, CoreResult, DebounceMs,
+    DeviceId, DeviceInfo, DeviceRegistry, DksBinding, DpiStage, HallEffectCapabilities,
+    HallEffectSnapshot, KeyCode, KeyHallEffectConfig, KeyIndex, KeyTravelSample,
+    KeyboardConfigCapabilities, KeyboardConfigSnapshot, KeymapCapabilities, KeymapSnapshot,
+    LiftOffDistance, MacroCapabilities, MacroSlot, ModTapBinding, Peripheral, PointerCapabilities,
+    PointerSnapshot, PollingRateHz, ProfileCapabilities, ProfileSlot, ProfileSnapshot,
+    RapidSwitchPair, RapidTriggerConfig, RgbCapabilities, RgbEffect, RgbSnapshot, RgbZoneId,
+    SocdPair, ToggleKeyBinding, TravelHundredthsMm,
 };
 use agnoperiph_driver_atk::{AtkDevice, protocol as atk_protocol};
 use agnoperiph_driver_endgame_gear::EndgameGearDevice;
@@ -274,6 +275,31 @@ pub enum SettingChange {
     Profile(ProfileSlot),
 }
 
+/// A recognized peripheral that couldn't be opened, typically because it is asleep or
+/// another app holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UnavailableDevice {
+    /// Stable per physical device, for element identities.
+    pub key: String,
+    pub name: String,
+    pub connection: ConnectionKind,
+}
+
+impl UnavailableDevice {
+    pub fn new(
+        key: impl Into<String>,
+        name: impl Into<String>,
+        connection: ConnectionKind,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            name: name.into(),
+            connection,
+        }
+    }
+}
+
 /// Blocking peripheral backend used by the frontend.
 ///
 /// Implementations own the HID transports. Each call may block, so callers run it on
@@ -287,6 +313,28 @@ pub trait PeripheralService: Send + Sync {
 
     /// Re-enumerates devices and reads their current state with readonly queries.
     fn refresh(&self) -> CoreResult<Vec<DeviceSnapshot>>;
+
+    /// Recognized peripherals the last [`Self::refresh`] could not open.
+    fn unavailable_devices(&self) -> Vec<UnavailableDevice> {
+        Vec::new()
+    }
+
+    /// Lists the attached supported interfaces, without opening any, and returns them only
+    /// when they differ from what the last [`Self::refresh`] saw.
+    fn changed_interfaces(&self) -> CoreResult<Option<BTreeSet<String>>> {
+        Ok(None)
+    }
+
+    /// Whether any of [`Self::unavailable_devices`] opens now; follow with a refresh.
+    fn can_open_unavailable(&self) -> bool {
+        false
+    }
+
+    /// Readonly battery query for one device.
+    fn read_battery(&self, device: &DeviceId) -> CoreResult<BatteryStatus> {
+        let _ = device;
+        Err(CoreError::UnsupportedCapability("battery"))
+    }
 
     /// Validates and applies one change, returning the device's resulting snapshot.
     fn apply(&self, device: &DeviceId, change: SettingChange)
@@ -1115,6 +1163,49 @@ fn collect_snapshot(peripheral: &mut dyn Peripheral) -> DeviceSnapshot {
     }
 }
 
+/// Reads back what a successful write left on the device.
+///
+/// A full read of a mouse is dozens of round trips, most of them macro slots, which made
+/// every sensor change pause. A pointer write can't alter those, so only the pointer is
+/// read again, unless that isn't enough to trust the rest.
+fn read_back(
+    peripheral: &mut dyn Peripheral,
+    previous: &DeviceSnapshot,
+    is_pointer_only: bool,
+) -> DeviceSnapshot {
+    is_pointer_only
+        .then(|| reread_pointer(peripheral, previous))
+        .flatten()
+        .unwrap_or_else(|| collect_snapshot(peripheral))
+}
+
+/// `previous` with a fresh pointer state. `None` when something was already missing, a
+/// read fails, or the active profile moved (a button on the mouse), which changes more.
+fn reread_pointer(
+    peripheral: &mut dyn Peripheral,
+    previous: &DeviceSnapshot,
+) -> Option<DeviceSnapshot> {
+    if !previous.warnings.is_empty() {
+        return None;
+    }
+    let profiles = match peripheral.as_profiles_mut() {
+        Some(profiles) => Some(profiles.read_profile_state().ok()?),
+        None => None,
+    };
+    if profiles.as_ref() != previous.profiles.as_ref().map(|state| &state.snapshot) {
+        return None;
+    }
+    let pointer = peripheral.as_pointer_mut()?;
+    let state = PointerState {
+        capabilities: pointer.pointer_capabilities(),
+        snapshot: pointer.read_pointer_state().ok()?,
+    };
+    let mut next = previous.clone();
+    next.pointer = Some(state);
+    next.is_preview = false;
+    Some(next)
+}
+
 fn apply_to_peripheral(peripheral: &mut dyn Peripheral, change: &SettingChange) -> CoreResult<()> {
     match change {
         SettingChange::Pointer(change) => {
@@ -1316,6 +1407,16 @@ struct LiveDevice {
 struct LiveState {
     dry_run: bool,
     devices: Vec<LiveDevice>,
+    /// Supported interface paths attached at the last refresh.
+    attached: BTreeSet<String>,
+    unavailable: Vec<Unopened>,
+}
+
+/// A matched interface that failed to open, kept so it can be retried on its own.
+struct Unopened {
+    descriptor: HidDeviceDescriptor,
+    driver_id: String,
+    listing: UnavailableDevice,
 }
 
 /// Real Windows HID backend driving every registered peripheral driver through `hidapi`.
@@ -1367,6 +1468,8 @@ impl LiveHidService {
             state: Mutex::new(LiveState {
                 dry_run,
                 devices: Vec::new(),
+                attached: BTreeSet::new(),
+                unavailable: Vec::new(),
             }),
             sink: Arc::new(SequencedSink::new()),
         }
@@ -1505,6 +1608,17 @@ pub fn is_disconnect_message(text: &str) -> bool {
         || lower.contains("getoverlappedresult")
 }
 
+/// Whether a driver that failed to open may succeed later. A rejection means the interface
+/// was never a supported device, and a match without a product or usage ID is too broad to
+/// say it is one (any Logitech vendor collection, for example).
+fn is_temporary_open_failure(err: &CoreError, specificity: u8) -> bool {
+    specificity >= 4
+        && !matches!(
+            err,
+            CoreError::Validation(_) | CoreError::UnsupportedCapability(_)
+        )
+}
+
 fn is_recoverable_live_error(err: &CoreError) -> bool {
     matches!(err, CoreError::NotConnected(_)) || is_disconnect_message(&err.to_string())
 }
@@ -1525,29 +1639,51 @@ impl PeripheralService for LiveHidService {
         let mut state = lock(&self.state);
         state.dry_run = dry_run;
         state.devices.clear();
+        state.unavailable.clear();
     }
 
     fn refresh(&self) -> CoreResult<Vec<DeviceSnapshot>> {
         let mut state = lock(&self.state);
         state.devices.clear();
+        state.attached.clear();
+        state.unavailable.clear();
 
         let descriptors = self.enumerator.enumerate()?;
         let registry = build_registry();
         let sink: Arc<dyn PacketSink> = self.sink.clone();
+        let mut unopened = Vec::new();
 
         for descriptor in &descriptors {
             let Some(matched) = registry.match_interface(&descriptor.to_match_descriptor()) else {
                 continue;
             };
-            // A device that fails to open (busy, asleep, vendor app holding it) is skipped
-            // so one unresponsive interface does not hide every other device.
-            let Ok(transport) = self.enumerator.open_path(descriptor) else {
-                continue;
+            state.attached.insert(descriptor.path.clone());
+            // A device that fails to open (busy, asleep, vendor app holding it) is listed
+            // as unavailable so one unresponsive interface does not hide every other device.
+            let opened = match self.enumerator.open_path(descriptor) {
+                Ok(transport) => {
+                    open_driver(&matched.driver_id, transport, state.dry_run, sink.clone())
+                        .map_err(|err| is_temporary_open_failure(&err, matched.specificity))
+                }
+                Err(_) => Err(true),
             };
-            let Ok(mut peripheral) =
-                open_driver(&matched.driver_id, transport, state.dry_run, sink.clone())
-            else {
-                continue;
+            let mut peripheral = match opened {
+                Ok(peripheral) => peripheral,
+                Err(false) => continue,
+                Err(true) => {
+                    let name = descriptor
+                        .product
+                        .clone()
+                        .filter(|product| !product.trim().is_empty())
+                        .unwrap_or_else(|| matched.model_hint.clone());
+                    let key = format!("{:04x}-{:04x}", descriptor.vid, descriptor.pid);
+                    unopened.push(Unopened {
+                        descriptor: descriptor.clone(),
+                        driver_id: matched.driver_id.clone(),
+                        listing: UnavailableDevice::new(key, name, matched.connection),
+                    });
+                    continue;
+                }
             };
             if state
                 .devices
@@ -1563,7 +1699,80 @@ impl PeripheralService for LiveHidService {
             });
         }
 
+        // One device exposes several interfaces: a failed sibling of a working device is
+        // not a missing device.
+        unopened.retain(|failed| {
+            !state.devices.iter().any(|device| {
+                device.snapshot.info.vid == failed.descriptor.vid
+                    && device.snapshot.info.pid == failed.descriptor.pid
+            })
+        });
+        state.unavailable = unopened;
+
         Ok(state.devices.iter().map(|d| d.snapshot.clone()).collect())
+    }
+
+    fn unavailable_devices(&self) -> Vec<UnavailableDevice> {
+        let state = lock(&self.state);
+        let mut listed: Vec<UnavailableDevice> = Vec::new();
+        for failed in &state.unavailable {
+            if !listed.iter().any(|d| d.key == failed.listing.key) {
+                listed.push(failed.listing.clone());
+            }
+        }
+        listed
+    }
+
+    fn changed_interfaces(&self) -> CoreResult<Option<BTreeSet<String>>> {
+        let state = lock(&self.state);
+        let registry = build_registry();
+        let attached: BTreeSet<String> = self
+            .enumerator
+            .enumerate()?
+            .into_iter()
+            .filter(|d| registry.match_interface(&d.to_match_descriptor()).is_some())
+            .map(|d| d.path)
+            .collect();
+        Ok((attached != state.attached).then_some(attached))
+    }
+
+    fn can_open_unavailable(&self) -> bool {
+        let state = lock(&self.state);
+        let sink: Arc<dyn PacketSink> = self.sink.clone();
+        state.unavailable.iter().any(|failed| {
+            self.enumerator
+                .open_path(&failed.descriptor)
+                .ok()
+                .and_then(|transport| {
+                    open_driver(&failed.driver_id, transport, state.dry_run, sink.clone()).ok()
+                })
+                .is_some()
+        })
+    }
+
+    fn read_battery(&self, device: &DeviceId) -> CoreResult<BatteryStatus> {
+        let mut state = lock(&self.state);
+        let dry_run = state.dry_run;
+        let target_ix = state
+            .devices
+            .iter()
+            .position(|d| d.snapshot.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?;
+        if state.devices[target_ix].peripheral.is_none() {
+            state.devices[target_ix].peripheral = self.open_matching_peripheral(device, dry_run);
+        }
+        let target = &mut state.devices[target_ix];
+        let Some(peripheral) = target.peripheral.as_deref_mut() else {
+            return Err(CoreError::NotConnected(device.to_string()));
+        };
+        let reading = require(peripheral.as_battery_mut(), "battery")?.read_battery();
+        match &reading {
+            Ok(battery) => target.snapshot.battery = Some(*battery),
+            // Drop a stale handle so the next check reopens it.
+            Err(err) if is_recoverable_live_error(err) => target.peripheral = None,
+            Err(_) => {}
+        }
+        reading
     }
 
     fn apply(
@@ -1682,11 +1891,14 @@ impl PeripheralService for LiveHidService {
             return Ok(target.snapshot.clone());
         }
 
-        let snapshot = collect_snapshot(
-            state.devices[target_ix]
+        let target = &mut state.devices[target_ix];
+        let snapshot = read_back(
+            target
                 .peripheral
                 .as_deref_mut()
                 .expect("checked Some above"),
+            &target.snapshot,
+            matches!(change, SettingChange::Pointer(_)),
         );
         if is_polling_rate_change || has_disconnect_warning(&snapshot) {
             // Device briefly disconnected / re-enumerated (e.g. polling rate change): close the
@@ -1725,6 +1937,9 @@ impl PeripheralService for LiveHidService {
         }
 
         let total = changes.len();
+        let is_pointer_only = changes
+            .iter()
+            .all(|change| matches!(change, SettingChange::Pointer(_)));
         let mut state = lock(&self.state);
         let dry_run = state.dry_run;
         let Some(target_ix) = state
@@ -1933,11 +2148,14 @@ impl PeripheralService for LiveHidService {
             return (Some(state.devices[target_ix].snapshot.clone()), None);
         }
 
-        let snapshot = collect_snapshot(
-            state.devices[target_ix]
+        let target = &mut state.devices[target_ix];
+        let snapshot = read_back(
+            target
                 .peripheral
                 .as_deref_mut()
                 .expect("checked Some above"),
+            &target.snapshot,
+            is_pointer_only,
         );
         if polling_rate_changed || has_disconnect_warning(&snapshot) {
             state.devices[target_ix].peripheral = None;
@@ -2064,6 +2282,17 @@ impl PeripheralService for LiveHidService {
             }
         }
 
+        // Macros may be stored per profile, and a pointer write no longer reads them back.
+        if profile_changed && let Some(macros) = peripheral.as_macros_mut() {
+            let capabilities = macros.macro_capabilities();
+            if let Ok(slots) = macros.read_macros() {
+                next.macros = Some(MacroState {
+                    capabilities,
+                    slots,
+                });
+            }
+        }
+
         Ok(changed.then(|| next.clone()))
     }
 }
@@ -2072,9 +2301,10 @@ impl PeripheralService for LiveHidService {
 mod tests {
     use std::collections::VecDeque;
 
-    use agnoperiph_core::{RgbColor, TravelHundredthsMm};
+    use agnoperiph_core::{DpiValue, RgbColor, TravelHundredthsMm};
     use agnoperiph_driver_atk::protocol as atk;
-    use agnoperiph_transport::{MockHidTransport, PacketOutcome, TransportError};
+    use agnoperiph_driver_lamzu::{atlantis, crystall};
+    use agnoperiph_transport::{MockHidTransport, PacketDirection, PacketOutcome, TransportError};
 
     use super::*;
 
@@ -2673,5 +2903,395 @@ mod tests {
                 TravelHundredthsMm::from_hundredths(190),
             )]
         );
+    }
+    /// An enumerator whose attached interfaces and openable handles change during a test.
+    #[derive(Default)]
+    struct HotplugEnumerator {
+        attached: Mutex<Vec<HidDeviceDescriptor>>,
+        transports: Mutex<VecDeque<MockHidTransport>>,
+    }
+
+    impl HotplugEnumerator {
+        fn attach(&self, descriptors: &[&HidDeviceDescriptor]) {
+            *lock(&self.attached) = descriptors.iter().map(|d| (*d).clone()).collect();
+        }
+
+        fn push_handle(&self, transport: MockHidTransport) {
+            lock(&self.transports).push_back(transport);
+        }
+    }
+
+    impl HidEnumerator for HotplugEnumerator {
+        fn enumerate(&self) -> TransportResult<Vec<HidDeviceDescriptor>> {
+            Ok(lock(&self.attached).clone())
+        }
+
+        fn open_path(
+            &self,
+            descriptor: &HidDeviceDescriptor,
+        ) -> TransportResult<Box<dyn HidTransport>> {
+            lock(&self.transports)
+                .pop_front()
+                .map(|t| Box::new(t) as Box<dyn HidTransport>)
+                .ok_or_else(|| TransportError::OpenFailed {
+                    path: descriptor.path.clone(),
+                    reason: "held by another application".to_owned(),
+                })
+        }
+    }
+
+    fn lamzu_descriptor() -> HidDeviceDescriptor {
+        HidDeviceDescriptor::new(
+            atlantis::LAMZU_ATLANTIS_VID,
+            0xF50D,
+            atlantis::LAMZU_ATLANTIS_USAGE_PAGE,
+            atlantis::LAMZU_ATLANTIS_USAGE_ID,
+            1,
+            "mock://live/lamzu",
+        )
+        .with_strings(None, Some("LAMZU Atlantis".to_owned()), None)
+    }
+
+    #[test]
+    fn live_service_lists_a_device_that_will_not_open_and_retries_it() {
+        let desc = lamzu_descriptor();
+        let enumerator = Arc::new(HotplugEnumerator::default());
+        enumerator.attach(&[&desc]);
+        let service = LiveHidService::with_enumerator(enumerator.clone());
+
+        assert_eq!(service.refresh().unwrap().len(), 0);
+        let unavailable = service.unavailable_devices();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].name, "LAMZU Atlantis");
+        assert!(!service.can_open_unavailable());
+
+        enumerator.push_handle(MockHidTransport::new(desc.clone()));
+        assert!(service.can_open_unavailable());
+        enumerator.push_handle(MockHidTransport::new(desc));
+        assert_eq!(service.refresh().unwrap().len(), 1);
+        assert_eq!(service.unavailable_devices().len(), 0);
+    }
+
+    #[test]
+    fn live_service_does_not_list_interfaces_a_driver_rejects() {
+        // A Logitech webcam shares the vendor page the HID++ rule matches.
+        let webcam = HidDeviceDescriptor::new(0x046D, 0x085C, 0xFF00, 0x0001, 1, "mock://cam");
+        let enumerator = Arc::new(HotplugEnumerator::default());
+        enumerator.attach(&[&webcam]);
+        enumerator.push_handle(MockHidTransport::new(webcam.clone()));
+        let service = LiveHidService::with_enumerator(enumerator);
+
+        assert_eq!(service.refresh().unwrap().len(), 0);
+        assert_eq!(service.unavailable_devices().len(), 0);
+    }
+
+    #[test]
+    fn open_failures_are_listed_only_when_they_can_clear_up() {
+        let timeout = CoreError::NotConnected("timed out".to_owned());
+        let rejected = CoreError::Validation("not a mouse".to_owned());
+        assert!(is_temporary_open_failure(&timeout, 4));
+        assert!(!is_temporary_open_failure(&timeout, 3));
+        assert!(!is_temporary_open_failure(&rejected, 8));
+    }
+
+    #[test]
+    fn live_service_reports_only_supported_interface_changes() {
+        let desc = lamzu_descriptor();
+        let unsupported =
+            HidDeviceDescriptor::new(0x1234, 0x5678, 0x0001, 0x0006, 0, "mock://live/other");
+        let enumerator = Arc::new(HotplugEnumerator::default());
+        let service = LiveHidService::with_enumerator(enumerator.clone());
+        service.refresh().unwrap();
+
+        enumerator.attach(&[&unsupported]);
+        assert_eq!(service.changed_interfaces().unwrap(), None);
+
+        enumerator.attach(&[&unsupported, &desc]);
+        let changed = service.changed_interfaces().unwrap().unwrap();
+        assert_eq!(changed, BTreeSet::from([desc.path.clone()]));
+
+        enumerator.push_handle(MockHidTransport::new(desc));
+        service.refresh().unwrap();
+        assert_eq!(service.changed_interfaces().unwrap(), None);
+
+        enumerator.attach(&[]);
+        assert!(service.changed_interfaces().unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn live_service_battery_read_sends_only_the_readonly_query() {
+        let desc = lamzu_descriptor();
+        let enumerator = Arc::new(HotplugEnumerator::default());
+        enumerator.attach(&[&desc]);
+        enumerator.push_handle(MockHidTransport::new(desc.clone()));
+        let service = LiveHidService::with_enumerator(enumerator.clone());
+        service.set_dry_run(false);
+        let id = service.refresh().unwrap()[0].id().clone();
+        service.clear_packet_log();
+
+        // The handle stops answering, as a sleeping mouse does, so it is dropped.
+        assert!(service.read_battery(&id).is_err());
+
+        let mut awake = MockHidTransport::new(desc);
+        // Reopening asks for the firmware version before the battery is read again.
+        for (command, payload) in [
+            (atlantis::Command::ReadFirmwareVersion, [1, 0, 0, 0]),
+            (atlantis::Command::ReadBattery, [73, 0, 0x0F, 0xA0]),
+        ] {
+            let reply = atlantis::encode_request(command, 0, &payload).unwrap();
+            awake.push_input_response(reply.to_vec());
+        }
+        enumerator.push_handle(awake);
+        assert_eq!(service.read_battery(&id).unwrap().percentage, Some(73));
+
+        let sent: Vec<u8> = service
+            .packet_log()
+            .iter()
+            .filter(|e| e.direction == PacketDirection::HostToDevice)
+            .map(|e| e.bytes[1])
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                atlantis::Command::ReadBattery as u8,
+                atlantis::Command::ReadFirmwareVersion as u8,
+                atlantis::Command::ReadBattery as u8,
+            ]
+        );
+    }
+    /// Queues the replies of one `read_pointer_state` with two DPI stages.
+    fn push_lamzu_pointer(mock: &mut MockHidTransport, motion_sync: u8) {
+        let mut read = |address: u16, field: &[u8]| {
+            let reply = atlantis::encode_request(atlantis::Command::ReadFlash, address, field);
+            mock.push_input_response(reply.unwrap().to_vec());
+        };
+        let byte = |value: u8| atlantis::seal_field(&[value]);
+        read(atlantis::flash::POLL_RATE, &byte(1));
+        read(atlantis::flash::DPI_STAGE_COUNT, &byte(2));
+        read(atlantis::flash::ACTIVE_DPI_STAGE, &byte(0));
+        for (index, dpi) in [(0u8, 400), (1, 800)] {
+            let stage = DpiStage::new(index, DpiValue::new(dpi).unwrap());
+            let offset = u16::from(index) * atlantis::flash::DPI_STAGE_STRIDE;
+            read(
+                atlantis::flash::DPI_STAGES + offset,
+                &atlantis::encode_dpi_stage(&stage).unwrap(),
+            );
+            read(
+                atlantis::flash::DPI_COLORS + offset,
+                &atlantis::seal_field(&[255, 0, 0]),
+            );
+        }
+        read(atlantis::flash::LIFT_OFF_DISTANCE, &byte(1));
+        read(atlantis::flash::DEBOUNCE_MS, &byte(2));
+        read(atlantis::flash::MOTION_SYNC, &byte(motion_sync));
+        read(atlantis::flash::ANGLE_SNAPPING, &byte(0));
+        read(atlantis::flash::RIPPLE_CONTROL, &byte(0));
+    }
+
+    fn push_lamzu_reply(mock: &mut MockHidTransport, command: atlantis::Command, payload: &[u8]) {
+        let reply = atlantis::encode_request(command, 0, payload).unwrap();
+        mock.push_input_response(reply.to_vec());
+    }
+
+    /// Queues a full read of a mouse on macro-capable firmware with sixteen empty slots.
+    fn push_lamzu_full_read(mock: &mut MockHidTransport, profile: u8, motion_sync: u8) {
+        push_lamzu_reply(mock, atlantis::Command::ReadBattery, &[73, 0, 0x0F, 0xA0]);
+        push_lamzu_pointer(mock, motion_sync);
+        push_lamzu_reply(mock, atlantis::Command::ReadActiveProfile, &[profile]);
+        push_lamzu_empty_macros(mock);
+    }
+
+    fn push_lamzu_empty_macros(mock: &mut MockHidTransport) {
+        for slot in 0..crystall::layout::MACRO_SLOT_COUNT {
+            let binding = crystall::key_slot_address(slot).unwrap();
+            let record = crystall::macro_slot_address(slot).unwrap();
+            for (address, field) in [
+                (binding, atlantis::seal_field(&[0, 0, 0])),
+                (record, vec![0]),
+                (record + crystall::layout::CONTEXT_COUNT_OFFSET, vec![0]),
+            ] {
+                let reply = atlantis::encode_request(atlantis::Command::ReadFlash, address, &field);
+                mock.push_input_response(reply.unwrap().to_vec());
+            }
+        }
+    }
+
+    /// A live service on a Lamzu whose one handle answers the first read, then whatever
+    /// `script` queues.
+    fn lamzu_service(script: impl FnOnce(&mut MockHidTransport)) -> (LiveHidService, DeviceId) {
+        let desc = lamzu_descriptor();
+        let mut mock = MockHidTransport::new(desc.clone());
+        push_lamzu_reply(&mut mock, atlantis::Command::ReadFirmwareVersion, &[2, 0]);
+        push_lamzu_full_read(&mut mock, 0, 0);
+        script(&mut mock);
+
+        let enumerator = Arc::new(HotplugEnumerator::default());
+        enumerator.attach(&[&desc]);
+        enumerator.push_handle(mock);
+        let service = LiveHidService::with_enumerator(enumerator);
+        service.set_dry_run(false);
+        let devices = service.refresh().unwrap();
+        assert_eq!(
+            devices[0].warnings,
+            [],
+            "the scripted first read is complete"
+        );
+        assert_eq!(devices[0].macros.as_ref().unwrap().slots.len(), 16);
+        service.clear_packet_log();
+        (service, devices[0].id().clone())
+    }
+
+    /// The device's reply to a one-byte flash write.
+    fn push_lamzu_ack(mock: &mut MockHidTransport, address: u16, value: u8) {
+        let ack = atlantis::encode_request(
+            atlantis::Command::WriteFlash,
+            address,
+            &atlantis::seal_field(&[value]),
+        );
+        mock.push_input_response(ack.unwrap().to_vec());
+    }
+
+    /// `(command, address)` of every frame sent.
+    fn sent_frames(service: &LiveHidService) -> Vec<(u8, u16)> {
+        service
+            .packet_log()
+            .iter()
+            .filter(|e| e.direction == PacketDirection::HostToDevice)
+            .map(|e| (e.bytes[1], u16::from_be_bytes([e.bytes[3], e.bytes[4]])))
+            .collect()
+    }
+
+    fn macro_reads(service: &LiveHidService) -> usize {
+        sent_frames(service)
+            .iter()
+            .filter(|&&(_, address)| address >= crystall::layout::MACRO_SLOTS)
+            .count()
+    }
+
+    fn turn_on_motion_sync(service: &LiveHidService, id: &DeviceId) -> DeviceSnapshot {
+        service
+            .apply(id, SettingChange::Pointer(PointerChange::MotionSync(true)))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_pointer_write_reads_back_only_the_profile_and_pointer() {
+        let (service, id) = lamzu_service(|mock| {
+            push_lamzu_ack(mock, atlantis::flash::MOTION_SYNC, 1);
+            push_lamzu_reply(mock, atlantis::Command::ReadActiveProfile, &[0]);
+            push_lamzu_pointer(mock, 1);
+        });
+
+        let snapshot = turn_on_motion_sync(&service, &id);
+
+        assert_eq!(snapshot.pointer.unwrap().snapshot.motion_sync, Some(true));
+        assert_eq!(snapshot.macros.unwrap().slots.len(), 16);
+        assert_eq!(snapshot.battery.unwrap().percentage, Some(73));
+        assert_eq!(snapshot.warnings, []);
+        let sent = sent_frames(&service);
+        // One write, the profile number and twelve pointer fields.
+        assert_eq!(sent.len(), 14, "{sent:?}");
+        let key_map = crystall::layout::KEY_FUN_MAP..0xA0;
+        assert!(
+            sent.iter().all(|&(command, address)| {
+                command != atlantis::Command::ReadBattery as u8
+                    && !key_map.contains(&address)
+                    && address < crystall::layout::MACRO_SLOTS
+            }),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_profile_changed_on_the_mouse_still_reads_everything_back() {
+        let (service, id) = lamzu_service(|mock| {
+            push_lamzu_ack(mock, atlantis::flash::MOTION_SYNC, 1);
+            push_lamzu_reply(mock, atlantis::Command::ReadActiveProfile, &[1]);
+            push_lamzu_full_read(mock, 1, 1);
+        });
+
+        let snapshot = turn_on_motion_sync(&service, &id);
+
+        assert_eq!(snapshot.profiles.unwrap().snapshot.active_slot.index(), 1);
+        assert_eq!(macro_reads(&service), 32);
+    }
+
+    #[test]
+    fn a_batch_of_pointer_writes_skips_the_macros() {
+        let (service, id) = lamzu_service(|mock| {
+            push_lamzu_ack(mock, atlantis::flash::MOTION_SYNC, 1);
+            push_lamzu_ack(mock, atlantis::flash::ANGLE_SNAPPING, 1);
+            push_lamzu_reply(mock, atlantis::Command::ReadActiveProfile, &[0]);
+            push_lamzu_pointer(mock, 1);
+        });
+
+        let (snapshot, failure) = service.apply_batch(
+            &id,
+            vec![
+                SettingChange::Pointer(PointerChange::MotionSync(true)),
+                SettingChange::Pointer(PointerChange::AngleSnapping(true)),
+            ],
+        );
+
+        assert!(failure.is_none());
+        assert_eq!(snapshot.unwrap().warnings, []);
+        assert_eq!(macro_reads(&service), 0);
+    }
+
+    #[test]
+    fn a_batch_with_anything_else_reads_everything_back() {
+        let (service, id) = lamzu_service(|mock| {
+            push_lamzu_ack(mock, atlantis::flash::MOTION_SYNC, 1);
+            push_lamzu_reply(mock, atlantis::Command::WriteActiveProfile, &[1]);
+            push_lamzu_full_read(mock, 1, 1);
+        });
+
+        let (_, failure) = service.apply_batch(
+            &id,
+            vec![
+                SettingChange::Pointer(PointerChange::MotionSync(true)),
+                SettingChange::Profile(ProfileSlot::new(1)),
+            ],
+        );
+
+        assert!(failure.is_none());
+        assert_eq!(macro_reads(&service), 32);
+    }
+
+    #[test]
+    fn a_refused_pointer_write_reads_everything_back() {
+        let (service, id) = lamzu_service(|mock| {
+            let mut refusal = atlantis::encode_request(
+                atlantis::Command::WriteFlash,
+                atlantis::flash::MOTION_SYNC,
+                &atlantis::seal_field(&[1]),
+            )
+            .unwrap();
+            refusal[2] = 1;
+            refusal[16] = atlantis::compute_checksum(&refusal[..16]);
+            mock.push_input_response(refusal.to_vec());
+            push_lamzu_full_read(mock, 0, 0);
+        });
+
+        let failure = service
+            .apply(&id, SettingChange::Pointer(PointerChange::MotionSync(true)))
+            .unwrap_err();
+
+        assert!(failure.refreshed_snapshot.is_some());
+        assert_eq!(macro_reads(&service), 32);
+    }
+
+    #[test]
+    fn a_profile_changed_on_the_mouse_syncs_its_macros_too() {
+        let (service, id) = lamzu_service(|mock| {
+            push_lamzu_reply(mock, atlantis::Command::ReadActiveProfile, &[1]);
+            push_lamzu_pointer(mock, 0);
+            push_lamzu_empty_macros(mock);
+        });
+
+        let snapshot = service.sync_hardware_state(&id).unwrap().unwrap();
+
+        assert_eq!(snapshot.profiles.unwrap().snapshot.active_slot.index(), 1);
+        assert_eq!(macro_reads(&service), 32);
     }
 }

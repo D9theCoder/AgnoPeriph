@@ -25,12 +25,12 @@ use crate::draft::{
     ChangeId, DeviceDraft, DraftHistory, EditKey, PendingChange, rewrites_all_keys,
 };
 use crate::keymap::KeyLayout;
-use crate::motion::Entrance;
 use crate::shortcuts::{
     ApplyChanges, Dismiss, NextTab, PreviousTab, REFERENCE, SelectDevice1, SelectDevice2,
     SelectDevice3, SelectDevice4, SelectDevice5, SelectDevice6, SelectDevice7, SelectDevice8,
     SelectDevice9, ToggleShortcuts, UndoChange,
 };
+use crate::widgets::block;
 use crate::widgets::chip;
 
 /// How long the Discard notification offers Undo.
@@ -947,5 +947,5 @@ pub(crate) fn render(
                 )
                 .on_click(cx.listener(|this, _, window, cx| this.apply_draft(window, cx))),
         );
-    Entrance::new("dirty-bar-entrance", bar)
+    block(bar)
 }

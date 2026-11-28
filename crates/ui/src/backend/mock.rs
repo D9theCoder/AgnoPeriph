@@ -1,5 +1,6 @@
 //! Deterministic in-memory peripherals for offline UI work and headless UI tests.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 mod brands;
@@ -29,7 +30,8 @@ use agnoperiph_transport::{
 use super::{
     ActuationTarget, ApplyError, DeviceSnapshot, HallEffectState, KeyboardConfigState, KeymapState,
     MacroState, PeripheralService, PointerChange, PointerState, ProfileState, RgbState,
-    SequencedSink, SettingChange, apply_change_to_snapshot, lock, validate_change,
+    SequencedSink, SettingChange, UnavailableDevice, apply_change_to_snapshot, lock,
+    validate_change,
 };
 
 /// Stable id of the emulated Lamzu Atlantis 1K receiver.
@@ -514,6 +516,22 @@ impl MockDevice {
 struct MockState {
     dry_run: bool,
     devices: Vec<MockDevice>,
+    /// Devices unplugged by [`MockPeripheralService::unplug`], waiting to return.
+    unplugged: Vec<MockDevice>,
+    /// Interfaces attached at the last refresh.
+    attached: BTreeSet<String>,
+    unavailable: Vec<UnavailableDevice>,
+    /// Whether the unavailable devices would open now.
+    is_openable: bool,
+}
+
+impl MockState {
+    fn interfaces(&self) -> BTreeSet<String> {
+        self.devices
+            .iter()
+            .map(|d| d.descriptor.path.clone())
+            .collect()
+    }
 }
 
 /// Deterministic in-memory backend emulating a Lamzu Atlantis 1K receiver and an ATK RS7.
@@ -577,9 +595,56 @@ impl MockPeripheralService {
             state: Mutex::new(MockState {
                 dry_run: true,
                 devices: Vec::new(),
+                unplugged: Vec::new(),
+                attached: BTreeSet::new(),
+                unavailable: Vec::new(),
+                is_openable: false,
             }),
             sink: Arc::new(SequencedSink::new()),
         }
+    }
+
+    /// Detaches a device, as pulling its cable or receiver would.
+    pub fn unplug(&self, device: &DeviceId) {
+        let mut state = lock(&self.state);
+        if let Some(ix) = state
+            .devices
+            .iter()
+            .position(|d| d.presented.info.id == *device)
+        {
+            let removed = state.devices.remove(ix);
+            state.unplugged.push(removed);
+        }
+    }
+
+    /// Reattaches a device detached by [`Self::unplug`].
+    pub fn plug_in(&self, device: &DeviceId) {
+        let mut state = lock(&self.state);
+        if let Some(ix) = state
+            .unplugged
+            .iter()
+            .position(|d| d.presented.info.id == *device)
+        {
+            let returned = state.unplugged.remove(ix);
+            state.devices.push(returned);
+        }
+    }
+
+    /// Changes what a device's next battery read reports.
+    pub fn set_battery(&self, device: &DeviceId, battery: BatteryStatus) {
+        self.simulate_hardware_change(device, |stored| stored.battery = Some(battery));
+    }
+
+    /// Sets the peripherals that are attached but can't be opened.
+    pub fn set_unavailable(&self, unavailable: Vec<UnavailableDevice>) {
+        let mut state = lock(&self.state);
+        state.unavailable = unavailable;
+        state.is_openable = false;
+    }
+
+    /// Lets the unavailable peripherals open, as exiting a vendor app would.
+    pub fn release_unavailable(&self) {
+        lock(&self.state).is_openable = true;
     }
 
     /// Injects simulated live Hall Effect travel samples for a mock keyboard (for tests & `--mock`).
@@ -652,7 +717,39 @@ impl PeripheralService for MockPeripheralService {
             device.replay_status_query(&self.sink)?;
             device.presented = device.stored.clone();
         }
+        state.attached = state.interfaces();
+        if state.is_openable {
+            state.unavailable.clear();
+            state.is_openable = false;
+        }
         Ok(state.devices.iter().map(|d| d.presented.clone()).collect())
+    }
+
+    fn unavailable_devices(&self) -> Vec<UnavailableDevice> {
+        lock(&self.state).unavailable.clone()
+    }
+
+    fn changed_interfaces(&self) -> CoreResult<Option<BTreeSet<String>>> {
+        let state = lock(&self.state);
+        let attached = state.interfaces();
+        Ok((attached != state.attached).then_some(attached))
+    }
+
+    fn can_open_unavailable(&self) -> bool {
+        let state = lock(&self.state);
+        state.is_openable && !state.unavailable.is_empty()
+    }
+
+    fn read_battery(&self, device: &DeviceId) -> CoreResult<BatteryStatus> {
+        let state = lock(&self.state);
+        state
+            .devices
+            .iter()
+            .find(|d| d.presented.info.id == *device)
+            .ok_or_else(|| CoreError::DeviceNotFound(device.to_string()))?
+            .stored
+            .battery
+            .ok_or(CoreError::UnsupportedCapability("battery"))
     }
 
     fn apply(

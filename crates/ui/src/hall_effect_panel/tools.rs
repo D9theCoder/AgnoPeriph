@@ -7,7 +7,6 @@ use gpui_kit::component::{
     button::Button,
     h_flex,
     slider::{Slider, SliderState},
-    switch::Switch,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -17,8 +16,7 @@ use super::t;
 use crate::app::{AgnoPeriphApp, mm};
 use crate::backend::HallEffectState;
 use crate::design::{DISPLAY_FONT, KEY_FONT, dp, tabular, tokens};
-use crate::motion::Entrance;
-use crate::widgets::{idle, panel, panel_title, stepper, stepper_sized};
+use crate::widgets::{MarkedSwitch, block, idle, panel, panel_title, stepper, stepper_sized};
 
 /// The selected keys' values of one setting: the primary key's, and whether all agree.
 fn shared<T: PartialEq + Copy>(
@@ -109,10 +107,7 @@ pub(super) fn actuation_panel(
     panel("trigger-travel", cx)
         .size_full()
         .child(head("Actuation").children(use_for_all))
-        .child(Entrance::new(
-            SharedString::from(format!("actuation-{has_selection}")),
-            body,
-        ))
+        .child(block(body))
         .child(div().flex_1())
         .when_some(footer, |this, footer| {
             this.child(div().mt(dp(10.)).mb(dp(8.)).h_px().bg(line))
@@ -306,7 +301,7 @@ pub(super) fn rapid_trigger_panel(
             .child(format!("On for {on_count} of {count}"))
     });
     let switch = (count > 0).then(|| {
-        Switch::new("rapid-trigger")
+        MarkedSwitch::new("rapid-trigger")
             .accessibility_label("Rapid Trigger")
             .checked(is_on)
             .disabled(busy)
@@ -331,10 +326,7 @@ pub(super) fn rapid_trigger_panel(
     panel("rapid-trigger-group", cx)
         .size_full()
         .child(head("Rapid Trigger").children(partial).children(switch))
-        .child(Entrance::new(
-            SharedString::from(format!("rapid-{}", count > 0)),
-            body,
-        ))
+        .child(block(body))
         .into_any_element()
 }
 

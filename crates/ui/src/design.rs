@@ -13,14 +13,12 @@ use serde::{Deserialize, Serialize};
 
 /// Everything that isn't a title, a legend or a big number.
 pub(crate) const BODY_FONT: &str = "Figtree";
-/// Device names, readouts and numbers.
+/// Device names, panel titles, readouts and numbers.
 pub(crate) const DISPLAY_FONT: &str = "Saira";
-/// Panel titles. The wider cut and the tracking are part of the font file.
-pub(crate) const TITLE_FONT: &str = "Saira Title";
 /// Keycap legends and values: the narrow cut.
 pub(crate) const KEY_FONT: &str = "Saira Keys";
 
-const FONTS: [&[u8]; 9] = [
+const FONTS: [&[u8]; 8] = [
     include_bytes!("../assets/fonts/figtree-regular.ttf"),
     include_bytes!("../assets/fonts/figtree-medium.ttf"),
     include_bytes!("../assets/fonts/figtree-semibold.ttf"),
@@ -28,7 +26,6 @@ const FONTS: [&[u8]; 9] = [
     include_bytes!("../assets/fonts/saira-medium.ttf"),
     include_bytes!("../assets/fonts/saira-semibold.ttf"),
     include_bytes!("../assets/fonts/saira-bold.ttf"),
-    include_bytes!("../assets/fonts/saira-title.ttf"),
     include_bytes!("../assets/fonts/saira-keys.ttf"),
 ];
 
@@ -137,6 +134,8 @@ struct Palette {
     key_legend: u32,
     key_sub: u32,
     key_track: u32,
+    key_well: u32,
+    key_press_shade: u32,
     thumb: u32,
     switch_off: u32,
     attention: u32,
@@ -169,6 +168,8 @@ const DARK: Palette = Palette {
     key_legend: 0xe2e5_eaff,
     key_sub: 0x8a91_9dff,
     key_track: 0xffff_ff12,
+    key_well: 0x0507_09ff,
+    key_press_shade: 0x0000_0080,
     thumb: 0xeef0_f3ff,
     switch_off: 0x3a3f_48ff,
     attention: 0xff8a_3dff,
@@ -201,6 +202,8 @@ const LIGHT: Palette = Palette {
     key_legend: 0x1b1e_24ff,
     key_sub: 0x6b72_80ff,
     key_track: 0x0000_0012,
+    key_well: 0xaab1_bdff,
+    key_press_shade: 0x1e28_3c40,
     thumb: 0xffff_ffff,
     switch_off: 0xc5ca_d3ff,
     attention: 0xa84a_00ff,
@@ -237,6 +240,10 @@ pub(crate) struct Tokens {
     pub(crate) key_legend: Hsla,
     pub(crate) key_sub: Hsla,
     pub(crate) key_track: Hsla,
+    /// The recess a pressed keycap sinks into.
+    pub(crate) key_well: Hsla,
+    /// Shadow the recess casts onto the top of a pressed keycap.
+    pub(crate) key_press_shade: Hsla,
 }
 
 pub(crate) fn tokens(cx: &App) -> Tokens {
@@ -263,6 +270,8 @@ pub(crate) fn tokens(cx: &App) -> Tokens {
         key_legend: color(palette.key_legend),
         key_sub: color(palette.key_sub),
         key_track: color(palette.key_track),
+        key_well: color(palette.key_well),
+        key_press_shade: color(palette.key_press_shade),
     }
 }
 

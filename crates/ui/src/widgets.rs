@@ -5,14 +5,21 @@
 use agnoperiph_core::{BatteryStatus, ConnectionKind};
 use gpui_kit::assets::IconName as LucideIcon;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable, Icon, IconName, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    switch::Switch,
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::design::{DISPLAY_FONT, KEY_FONT, TITLE_FONT, dp, tabular, tokens};
+use crate::design::{DISPLAY_FONT, KEY_FONT, dp, tabular, tokens};
+
+/// A column that keeps its natural height, so a scrolling parent never squeezes it.
+pub(crate) fn block(child: impl IntoElement) -> Div {
+    v_flex().min_w_0().flex_shrink_0().child(child)
+}
 
 /// A borderless card on the panel surface.
 pub(crate) fn panel(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
@@ -26,23 +33,24 @@ pub(crate) fn panel(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .bg(tokens(cx).panel)
 }
 
-/// All-caps panel title. The wide cut and its tracking come with the font.
 pub(crate) fn panel_title(title: &str) -> Div {
     div()
         .flex_shrink_0()
-        .font_family(TITLE_FONT)
-        .text_size(dp(12.5))
+        .font_family(DISPLAY_FONT)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(dp(16.))
         .whitespace_nowrap()
-        .child(title.to_uppercase())
+        .child(SharedString::from(title.to_owned()))
 }
 
 /// The title line of a panel; add notes and actions as further children.
 pub(crate) fn panel_head(title: &str) -> Div {
-    h_flex()
-        .gap_2()
-        .min_h(dp(26.))
-        .mb(dp(10.))
-        .child(panel_title(title))
+    head_row().child(panel_title(title))
+}
+
+/// [`panel_head`] without its title, for a title that needs its own styling.
+pub(crate) fn head_row() -> Div {
+    h_flex().gap_2().min_h(dp(26.)).mb(dp(10.))
 }
 
 /// Heading of a top-level view or a device.
@@ -317,5 +325,100 @@ pub(crate) fn battery_label(battery: BatteryStatus) -> SharedString {
         (Some(pct), agnoperiph_core::ChargingState::Charging) => format!("{pct}% charging").into(),
         (Some(pct), _) => format!("{pct}%").into(),
         (None, state) => state.to_string().into(),
+    }
+}
+
+/// A [`Switch`] with a check or a cross in the half of the track its thumb leaves free.
+#[derive(IntoElement)]
+pub(crate) struct MarkedSwitch {
+    id: ElementId,
+    switch: Switch,
+    is_checked: bool,
+    is_disabled: bool,
+}
+
+impl MarkedSwitch {
+    pub(crate) fn new(id: impl Into<ElementId>) -> Self {
+        let id = id.into();
+        Self {
+            switch: Switch::new(id.clone()),
+            id,
+            is_checked: false,
+            is_disabled: false,
+        }
+    }
+
+    pub(crate) fn checked(mut self, checked: bool) -> Self {
+        self.is_checked = checked;
+        self.switch = self.switch.checked(checked);
+        self
+    }
+
+    pub(crate) fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.switch = self.switch.label(label.into());
+        self
+    }
+
+    pub(crate) fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.switch = self.switch.accessibility_label(label);
+        self
+    }
+
+    pub(crate) fn tooltip(mut self, tooltip: impl Into<SharedString>) -> Self {
+        self.switch = self.switch.tooltip(tooltip);
+        self
+    }
+
+    pub(crate) fn on_change(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.switch = self.switch.on_change(handler);
+        self
+    }
+}
+
+impl Disableable for MarkedSwitch {
+    fn disabled(mut self, disabled: bool) -> Self {
+        self.is_disabled = disabled;
+        self.switch = self.switch.disabled(disabled);
+        self
+    }
+}
+
+impl RenderOnce for MarkedSwitch {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        // The kit draws its medium track in fixed pixels (36 × 20, a 16 px thumb that
+        // travels 16 px), so the marks laid over it use pixels too.
+        let travel = px(16.);
+        // Same spring as the thumb, so a mark fades in as the thumb moves off its side.
+        let position = gpui_kit::base::spring(
+            (self.id, "mark"),
+            if self.is_checked { travel } else { px(0.) },
+            cx.theme().motion_tokens().spring_move,
+            window,
+            cx,
+        );
+        let progress = (position / travel).clamp(0.0, 1.0);
+        let strength = if self.is_disabled { 0.5 } else { 1.0 };
+        let mark = |icon: IconName, color: Hsla, opacity: f32| {
+            div()
+                .absolute()
+                .top(px(4.))
+                .opacity(opacity * strength)
+                .child(Icon::new(icon).with_size(px(12.)).text_color(color))
+        };
+        let theme = cx.theme();
+
+        div().relative().child(self.switch).child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(36.))
+                .h(px(20.))
+                .child(mark(IconName::Check, theme.primary_foreground, progress).left(px(4.)))
+                .child(mark(IconName::Close, theme.muted_foreground, 1.0 - progress).right(px(4.))),
+        )
     }
 }
